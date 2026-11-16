@@ -1,0 +1,180 @@
+{
+  "tool_version": "0.1.0",
+  "machine": {
+    "model": "Mac14,6",
+    "chip": "Apple M2 Max",
+    "macos": "27.2",
+    "build": "26B123"
+  },
+  "battery": {
+    "percent": 95,
+    "is_charging": true,
+    "external_connected": true,
+    "amperage_ma": 2871,
+    "temperature_c": null,
+    "cycle_count": 170,
+    "update_time": 1794866872
+  },
+  "reads": [
+    {
+      "key": "CH0B",
+      "status": "Missing"
+    },
+    {
+      "key": "CH0C",
+      "status": "Missing"
+    },
+    {
+      "key": "CH0I",
+      "status": "Missing"
+    },
+    {
+      "key": "CHTE",
+      "status": "Missing"
+    },
+    {
+      "key": "CHIE",
+      "status": {
+        "Present": {
+          "size": 1,
+          "data_type": "hex_",
+          "value_hex": "00"
+        }
+      }
+    },
+    {
+      "key": "CH0J",
+      "status": {
+        "Error": "SMC access not privileged (kIOReturnNotPrivileged)"
+      }
+    },
+    {
+      "key": "ACLC",
+      "status": {
+        "Present": {
+          "size": 1,
+          "data_type": "ui8 ",
+          "value_hex": "04"
+        }
+      }
+    },
+    {
+      "key": "bfD0",
+      "status": {
+        "Error": "SMC access not privileged (kIOReturnNotPrivileged)"
+      }
+    },
+    {
+      "key": "bfE0",
+      "status": {
+        "Error": "SMC access not privileged (kIOReturnNotPrivileged)"
+      }
+    },
+    {
+      "key": "bfF0",
+      "status": {
+        "Error": "SMC access not privileged (kIOReturnNotPrivileged)"
+      }
+    },
+    {
+      "key": "CHIB",
+      "status": {
+        "Present": {
+          "size": 1,
+          "data_type": "ui8 ",
+          "value_hex": "00"
+        }
+      }
+    }
+  ],
+  "writes": [
+    {
+      "backend": "legacy",
+      "key": "CH0B",
+      "role": "InhibitCharging",
+      "verdict": "Missing",
+      "before": null,
+      "after": null
+    },
+    {
+      "backend": "legacy",
+      "key": "CH0C",
+      "role": "InhibitCharging",
+      "verdict": "Missing",
+      "before": null,
+      "after": null
+    },
+    {
+      "backend": "legacy",
+      "key": "CH0I",
+      "role": "ForceDischarge",
+      "verdict": "Missing",
+      "before": null,
+      "after": null
+    },
+    {
+      "backend": "tahoe",
+      "key": "CHTE",
+      "role": "InhibitCharging",
+      "verdict": "Missing",
+      "before": null,
+      "after": null
+    },
+    {
+      "backend": "tahoe",
+      "key": "CHIE",
+      "role": "ForceDischarge",
+      "verdict": "Verified",
+      "before": {
+        "percent": 94,
+        "is_charging": true,
+        "external_connected": true,
+        "amperage_ma": 2732,
+        "temperature_c": null,
+        "cycle_count": 170,
+        "update_time": 1794866757
+      },
+      "after": {
+        "percent": 94,
+        "is_charging": false,
+        "external_connected": false,
+        "amperage_ma": -421,
+        "temperature_c": null,
+        "cycle_count": 170,
+        "update_time": 1794866829
+      }
+    },
+    {
+      "backend": "tahoe",
+      "key": "CH0J",
+      "role": "ForceDischarge",
+      "verdict": "Blocked",
+      "before": null,
+      "after": null
+    },
+    {
+      "backend": "magsafe",
+      "key": "ACLC",
+      "role": "Light",
+      "verdict": "WriteAccepted",
+      "before": {
+        "percent": 95,
+        "is_charging": true,
+        "external_connected": true,
+        "amperage_ma": 2871,
+        "temperature_c": null,
+        "cycle_count": 170,
+        "update_time": 1794866872
+      },
+      "after": {
+        "percent": 95,
+        "is_charging": true,
+        "external_connected": true,
+        "amperage_ma": 2871,
+        "temperature_c": null,
+        "cycle_count": 170,
+        "update_time": 1794866872
+      }
+    }
+  ]
+}
