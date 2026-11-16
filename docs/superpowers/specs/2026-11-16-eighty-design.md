@@ -8,7 +8,7 @@ Repo: https://github.com/mabujaber/eighty
 `eighty` is a free, open-source battery charge limiter for Apple Silicon Macs, written in Rust. It keeps the battery at or below a user-set limit (default 80%) to slow battery wear on Macs that live on the charger.
 
 **Why it exists:**
-- [actuallymentor/battery](https://github.com/actuallymentor/battery), the popular free option, has stopped working reliably on recent macOS. The legacy SMC keys it writes (`CH0B`, `CH0C`, `CH0I`) read `no data` on recent builds (issues #474, #482, #460, #461, #477, #487), and charging silently goes to 100%.
+- [actuallymentor/battery](https://github.com/actuallymentor/battery), the popular free option, has been unreliable across recent macOS updates. The legacy SMC keys it used to write (`CH0B`, `CH0C`, `CH0I`) read `no data` on recent builds (issues #474, #482, #460, #461, #477, #487), and charging silently went to 100%. *Correction (2026-11-16):* the version installed on the owner's M5 Pro (macOS 26.6.2) did hold the battery at 80% and set the MagSafe light green, through the Tahoe-era `CHTE` key. So `battery` can work on current macOS. Its remaining problems are polling (§5.4), broad passwordless sudo (§4), and an uninstall path that can leave a Mac unable to charge (§7).
 - [js4jiang5/BattOpt](https://github.com/js4jiang5/BattOpt) works on current macOS but puts some features (clamshell mode, zone awareness, smart resume calibration) behind a paid Pro tier.
 - The owner wants one tool, released publicly, that has all of these features for free and that keeps working across macOS updates.
 
@@ -88,11 +88,16 @@ This is the riskiest part and the reason the project exists. Which SMC keys cont
 - **If no backend works** (on the owner's Mac or any other): the project continues (owner's decision). eighty reports "unsupported on this firmware/macOS" through `doctor`, the CLI and the menu bar. It does nothing to charging, and it keeps probing on each launch and after OS updates so it picks up a working path when one appears (e.g. a new backend in a later release).
 - **MagSafe light:** the SMC key `ACLC` (seen still readable on newer builds in battery#482) controls the light. `battery` uses 0 = system control, 3 = green, 4 = orange. The probe spike confirms which values work on the owner's Mac. The helper exposes this as intent-level operations (`set_light(Green|Orange|System)`), never as raw key writes.
 - **First milestone is a probe spike on the owner's M5 Pro / macOS 26.6.2:** find which keys exist, which accept writes from a root process, and which actually change charging behavior. The backend order and the default key set come from that result, not from this document.
+- **Probe results:** see `docs/probe/README.md`. On the owner's M5 Pro / macOS 26.6.2 (2026-11-16): `CHTE` = `01000000` stops charging, `CHIE` = `08` makes the Mac run from the battery while plugged in, `ACLC` = `03` sets the light green and `04` orange. `CH0J` is blocked for root, and `CH0B`/`CH0C`/`CH0I` are missing. The Tahoe-era backend comes first in the probe order. On the owner's M2 Max / **macOS 27.2** (2026-11-17), there's **no key that stops charging**: `CHTE` and the legacy keys are missing, and `bfD0`/`bfE0`/`bfF0` are blocked for root. But `CHIE` = `08` is verified. So the helper needs a **`CHIE`-only mode**: turn it on at the upper limit and off at the lower limit, so the battery cycles gently between the two. `doctor` reports which mode is active. macOS 27 also doesn't report battery `Temperature` (§5.3).
 - Prior art to check against: `charlie0129/batt` (Go; reported working on Sequoia 15.8 in battery#482), `anarchy89/batterycharging`, and `battery`'s PRs #469 and #486.
 
 ### 5.3 Reading battery state
 
 Use IOKit's `AppleSmartBattery` registry entry (`CurrentCapacity`, `MaxCapacity`, `IsCharging`, `ExternalConnected`, `Temperature`, cycle count, etc.) and `IOPSCopyPowerSourcesInfo` for power-source changes. Don't shell out to `pmset` / `ioreg` / `smc` binaries.
+
+**Not every value is always present.** macOS 27.2 on an M2 Max doesn't report `Temperature`. Treat temperature and cycle count as optional, and find another temperature source for overheat protection on macOS 27.
+
+**macOS only refreshes these readings about once a minute.** `UpdateTime` (Unix seconds) says when the readings were last refreshed. Anything that checks the effect of a write, such as backend verification or "charging stopped" checks, must wait for a reading whose `UpdateTime` is after the write plus a settle time. Reading straight after a write returns stale data. That's how the first probe run wrongly reported `CHTE` as having no effect.
 
 ### 5.4 Events, not polling
 
@@ -102,9 +107,13 @@ Use IOKit's `AppleSmartBattery` registry entry (`CurrentCapacity`, `MaxCapacity`
 - Wi-Fi network changes (for zones)
 - a slow fallback timer as a safety net
 
-### 5.5 Coexistence with macOS's own features
+### 5.5 Coexistence with macOS's own features and other limiters
 
 Recent macOS (26.4+) has a native charge limit and Optimized Battery Charging. BattOpt tells users to set the native limit to 100% and turn off Optimized Charging. eighty's `doctor` and first-run flow detect a conflicting native setting and tell the user what to change. Whether eighty can set these itself is left to the builder.
+
+**Other charge limiters write the same keys.** On the owner's Mac, `battery`'s LaunchAgent (`com.battery.app`) kept running after `brew uninstall` and held `CHTE` at `01`, so the Mac stayed at 80% even with the native limit at 100%. eighty must:
+- detect other limiters at first run and in `doctor`: `battery` (`~/Library/LaunchAgents/battery.plist`, `/usr/local/co.palokaj.battery`, `/etc/sudoers.d/battery`), BattOpt, `batt`, and similar tools. It warns about them and doesn't start its policy loop until the user removes them or confirms.
+- read `CHTE`/`CHIE` before writing and not assume it's the only writer. If a value changes when eighty didn't write it, the helper reports a conflict and doesn't fight over the key.
 
 ## 6. Release bar (owner's decision)
 
@@ -116,7 +125,7 @@ v1 ships via Homebrew after it has been tested on **2–5 Apple Silicon Macs** t
 - **Hardware:** Apple Silicon only. The development machine is an M5 Pro on macOS 26.6.2.
 - **Distribution:** Homebrew cask in a tap the owner controls (e.g. `mabujaber/homebrew-tap`), pointing at a GitHub Release `.dmg` or `.zip`. The owner has an Apple Developer account. The app and helper must be signed with a Developer ID and notarized, because `SMAppService` daemons need a signed bundle. Release builds go through GitHub Actions with signing secrets.
 - **License:** MIT (matching the prior art). Builder's call, but confirm with the owner before release.
-- **Uninstall:** `eighty uninstall` and the cask's `uninstall`/`zap` stanzas must unregister the helper and **restore normal charging** (re-enable charging, clear inhibit/discharge keys, and return the MagSafe light to system control). Otherwise a removed tool could leave a Mac unable to charge.
+- **Uninstall:** `eighty uninstall` and the cask's `uninstall`/`zap` stanzas must unregister the helper and **restore normal charging** (re-enable charging, clear inhibit/discharge keys, and return the MagSafe light to system control). Otherwise a removed tool could leave a Mac unable to charge. A plain `brew uninstall` must do this too, not only `eighty uninstall`. The cask's `uninstall` stanza stops the helper and runs the restore step before files are deleted. `battery` got this wrong on the owner's Mac: `brew uninstall` removed the app but left its LaunchAgent running with charging switched off.
 
 ## 8. Safety requirements
 

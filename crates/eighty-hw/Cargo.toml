@@ -1,0 +1,14 @@
+[package]
+name = "eighty-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+fake = []
+
+[dependencies]
+thiserror.workspace = true
+mach2 = "0.4"
+serde.workspace = true
+core-foundation = "0.10"
