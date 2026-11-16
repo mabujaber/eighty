@@ -1,5 +1,5 @@
 //! Restores every SMC key the probe changed, even on error or panic.
-use eighty_hw::smc::{FourCC, SmcError, SmcIo};
+use eighty_hw::smc::{hex, FourCC, SmcError, SmcIo};
 
 pub struct RestoreGuard<'a> {
     smc: &'a mut dyn SmcIo,
@@ -24,19 +24,27 @@ impl<'a> RestoreGuard<'a> {
         Ok(())
     }
 
-    /// Writes originals back in reverse order and verifies each by read-back.
+    /// Writes originals back in reverse order, retrying up to 3 times, and
+    /// verifies each by read-back. Error messages include the original value.
     pub fn restore_all(&mut self) -> Vec<(String, Result<(), String>)> {
         let mut out = Vec::new();
         while let Some((key, original)) = self.pending.pop() {
-            let result = self
-                .smc
-                .write(key, &original)
-                .map_err(|e| e.to_string())
-                .and_then(|()| match self.smc.read(key) {
-                    Ok(v) if v == original => Ok(()),
-                    Ok(v) => Err(format!("read back {:?}, expected {:?}", v, original)),
-                    Err(e) => Err(e.to_string()),
-                });
+            let mut result = Err(String::new());
+            for _ in 0..3 {
+                result = self
+                    .smc
+                    .write(key, &original)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| match self.smc.read(key) {
+                        Ok(v) if v == original => Ok(()),
+                        Ok(v) => Err(format!("read back {}", hex(&v))),
+                        Err(e) => Err(e.to_string()),
+                    });
+                if result.is_ok() {
+                    break;
+                }
+            }
+            let result = result.map_err(|e| format!("{e} (original value {})", hex(&original)));
             out.push((key.as_str(), result));
         }
         out
@@ -47,7 +55,7 @@ impl Drop for RestoreGuard<'_> {
     fn drop(&mut self) {
         for (key, result) in self.restore_all() {
             if let Err(e) = result {
-                eprintln!("eighty-probe: FAILED to restore {key}: {e}");
+                eprintln!("eighty-probe: FAILED to restore {key}: {e}. Re-run eighty-probe, or reboot to reset the SMC.");
             }
         }
     }

@@ -18,12 +18,23 @@ pub struct ProbeReport {
     pub writes: Option<Vec<WriteResult>>,
 }
 
-fn first_working(writes: &[WriteResult], role: Role, ok: &Verdict) -> String {
-    writes
-        .iter()
-        .find(|w| w.role == role && &w.verdict == ok)
-        .map(|w| w.key.clone())
-        .unwrap_or_else(|| "none".into())
+/// Best outcome for a role: the working key, why it couldn't be tested,
+/// a key macOS blocked, or "none".
+fn role_summary(writes: &[WriteResult], role: Role, ok: &Verdict) -> String {
+    let of_role: Vec<_> = writes.iter().filter(|w| w.role == role).collect();
+    if let Some(w) = of_role.iter().find(|w| &w.verdict == ok) {
+        return w.key.clone();
+    }
+    if let Some((w, why)) = of_role.iter().find_map(|w| match &w.verdict {
+        Verdict::CannotVerify(why) => Some((w, why)),
+        _ => None,
+    }) {
+        return format!("untested ({}: {})", w.key, why);
+    }
+    if let Some(w) = of_role.iter().find(|w| w.verdict == Verdict::Blocked) {
+        return format!("blocked ({})", w.key);
+    }
+    "none".into()
 }
 
 pub fn render_text(r: &ProbeReport) -> String {
@@ -53,13 +64,16 @@ pub fn render_text(r: &ProbeReport) -> String {
     for w in writes {
         let _ = writeln!(t, "WRITE {}  {}/{:?}  {:?}", w.key, w.backend, w.role, w.verdict);
     }
-    let _ = writeln!(
-        t,
-        "Summary: inhibit={}, discharge={}, light={}",
-        first_working(writes, Role::InhibitCharging, &Verdict::Verified),
-        first_working(writes, Role::ForceDischarge, &Verdict::Verified),
-        first_working(writes, Role::Light, &Verdict::WriteAccepted),
-    );
+    let inhibit = role_summary(writes, Role::InhibitCharging, &Verdict::Verified);
+    let discharge = role_summary(writes, Role::ForceDischarge, &Verdict::Verified);
+    let light = role_summary(writes, Role::Light, &Verdict::WriteAccepted);
+    if [&inhibit, &discharge, &light].iter().any(|s| s.starts_with("untested")) {
+        t.push_str(
+            "Hint: some tests could not run. Set System Settings → Battery → Charge Limit to 100%, \
+             keep the Mac on MagSafe and charging between 20% and 95%, then re-run.\n",
+        );
+    }
+    let _ = writeln!(t, "Summary: inhibit={inhibit}, discharge={discharge}, light={light}");
     t
 }
 
@@ -114,5 +128,25 @@ mod tests {
             writes: Some(vec![w("CHTE", Role::InhibitCharging, Verdict::Missing), w("ACLC", Role::Light, Verdict::Missing)]),
         };
         assert!(render_text(&r).ends_with("Summary: inhibit=none, discharge=none, light=none\n"));
+    }
+
+    #[test]
+    fn summary_marks_untested_roles() {
+        let r = ProbeReport {
+            tool_version: "0.1.0".into(),
+            machine: machine(),
+            battery: None,
+            reads: vec![],
+            writes: Some(vec![
+                w("CHTE", Role::InhibitCharging, Verdict::CannotVerify("battery is not charging".into())),
+                w("CH0J", Role::ForceDischarge, Verdict::Blocked),
+                w("ACLC", Role::Light, Verdict::WriteAccepted),
+            ]),
+        };
+        let t = render_text(&r);
+        assert!(t.contains("Hint: "));
+        assert!(t.ends_with(
+            "Summary: inhibit=untested (CHTE: battery is not charging), discharge=blocked (CH0J), light=ACLC\n"
+        ));
     }
 }

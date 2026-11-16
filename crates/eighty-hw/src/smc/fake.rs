@@ -8,7 +8,12 @@ use super::{FourCC, KeyInfo, SmcError, SmcIo};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
     Accept,
+    /// Writes are rejected with kIOReturnNotPrivileged.
     NotPrivileged,
+    /// The first write succeeds; later writes fail (simulates a failed restore).
+    AcceptOnce,
+    /// Even key_info and read are rejected with kIOReturnNotPrivileged.
+    InfoNotPrivileged,
 }
 
 #[derive(Debug, Clone)]
@@ -16,6 +21,7 @@ struct FakeKey {
     data_type: String,
     value: Vec<u8>,
     mode: WriteMode,
+    written: bool,
 }
 
 #[derive(Debug, Default)]
@@ -38,7 +44,7 @@ impl FakeSmc {
     pub fn insert(&self, key: &str, data_type: &str, value: &[u8], mode: WriteMode) {
         self.state.borrow_mut().keys.insert(
             key.to_string(),
-            FakeKey { data_type: data_type.to_string(), value: value.to_vec(), mode },
+            FakeKey { data_type: data_type.to_string(), value: value.to_vec(), mode, written: false },
         );
     }
 
@@ -52,12 +58,17 @@ impl FakeSmc {
     }
 
     fn get(&self, key: FourCC) -> Result<FakeKey, SmcError> {
-        self.state
+        let k = self
+            .state
             .borrow()
             .keys
             .get(&key.as_str())
             .cloned()
-            .ok_or_else(|| SmcError::KeyNotFound(key.as_str()))
+            .ok_or_else(|| SmcError::KeyNotFound(key.as_str()))?;
+        if k.mode == WriteMode::InfoNotPrivileged {
+            return Err(SmcError::NotPrivileged);
+        }
+        Ok(k)
     }
 }
 
@@ -87,8 +98,13 @@ impl SmcIo for FakeSmc {
         if k.mode == WriteMode::NotPrivileged {
             return Err(SmcError::NotPrivileged);
         }
+        if k.mode == WriteMode::AcceptOnce && k.written {
+            return Err(SmcError::IoKit(-1));
+        }
         let mut st = self.state.borrow_mut();
-        st.keys.get_mut(&key.as_str()).unwrap().value = bytes.to_vec();
+        let entry = st.keys.get_mut(&key.as_str()).unwrap();
+        entry.value = bytes.to_vec();
+        entry.written = true;
         st.writes.push((key.as_str(), bytes.to_vec()));
         Ok(())
     }
@@ -130,5 +146,21 @@ mod tests {
         c.write(FourCC::new("ACLC").unwrap(), &[3]).unwrap();
         assert_eq!(s.value("ACLC"), Some(vec![3]));
         assert_eq!(s.writes(), vec![("ACLC".to_string(), vec![3])]);
+    }
+
+    #[test]
+    fn fake_accept_once_then_fails() {
+        let mut s = FakeSmc::new();
+        s.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::AcceptOnce);
+        let k = FourCC::new("CHTE").unwrap();
+        s.write(k, &[1, 0, 0, 0]).unwrap();
+        assert!(matches!(s.write(k, &[0, 0, 0, 0]), Err(SmcError::IoKit(_))));
+    }
+
+    #[test]
+    fn fake_info_not_privileged() {
+        let mut s = FakeSmc::new();
+        s.insert("CH0J", "ui8 ", &[0], WriteMode::InfoNotPrivileged);
+        assert!(matches!(s.key_info(FourCC::new("CH0J").unwrap()), Err(SmcError::NotPrivileged)));
     }
 }

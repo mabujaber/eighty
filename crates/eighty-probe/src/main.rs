@@ -13,7 +13,7 @@ use eighty_probe::catalog::CANDIDATES;
 use eighty_probe::machine::MachineInfo;
 use eighty_probe::reads::probe_reads;
 use eighty_probe::report::{render_text, ProbeReport};
-use eighty_probe::writes::{run_write_tests, WriteTestConfig};
+use eighty_probe::writes::{any_restore_failed, run_write_tests, WriteResult, WriteTestConfig};
 
 /// Report which SMC keys stop charging, force discharge and set the MagSafe
 /// light. Read-only unless --write-test is given (needs sudo).
@@ -39,14 +39,39 @@ fn check_write_permission(write_test: bool, euid: u32) -> Result<(), String> {
     }
 }
 
-fn run(args: Args) -> anyhow::Result<()> {
+/// Ctrl-C, closing the terminal (SIGHUP) and SIGTERM all stop the run
+/// safely so values get restored. Ctrl-\\ and Ctrl-Z are ignored, because they
+/// would kill or suspend the probe with a key still written.
+fn install_signal_handlers(cancel: Arc<AtomicBool>) -> anyhow::Result<()> {
+    ctrlc::set_handler(move || {
+        if !cancel.swap(true, Ordering::SeqCst) {
+            eprintln!("\neighty-probe: stopping — restoring SMC keys, please wait…");
+        }
+    })
+    .context("installing signal handler")?;
+    // SAFETY: setting the disposition of two signals to SIG_IGN.
+    unsafe {
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+    }
+    Ok(())
+}
+
+/// 3 when any key could not be restored, else 0.
+fn exit_code(writes: Option<&[WriteResult]>) -> u8 {
+    match writes {
+        Some(w) if any_restore_failed(w) => 3,
+        _ => 0,
+    }
+}
+
+fn run(args: Args) -> anyhow::Result<u8> {
     let mut smc = SmcConnection::open().context("opening AppleSMC")?;
     let mut battery = IoRegBattery;
     let reads = probe_reads(&mut smc);
     let writes = if args.write_test {
         let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).context("installing Ctrl-C handler")?;
+        install_signal_handlers(cancel.clone())?;
         let cfg = WriteTestConfig { settle: Duration::from_secs(args.settle_secs), ..Default::default() };
         eprintln!(
             "Testing {} keys, about {} s each. Ctrl-C stops safely and restores values.",
@@ -73,7 +98,15 @@ fn run(args: Args) -> anyhow::Result<()> {
         std::fs::write(&path, serde_json::to_string_pretty(&report)?)
             .with_context(|| format!("writing {}", path.display()))?;
     }
-    Ok(())
+    let code = exit_code(report.writes.as_deref());
+    if code == 3 {
+        eprintln!(
+            "\neighty-probe: WARNING — at least one SMC key could NOT be restored (see RestoreFailed above, \
+             which shows the original value). Charging may be affected. Re-run `sudo eighty-probe --write-test` \
+             or reboot to reset the SMC."
+        );
+    }
+    Ok(code)
 }
 
 fn main() -> ExitCode {
@@ -84,7 +117,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("eighty-probe: {e:#}");
             ExitCode::FAILURE
@@ -102,5 +135,34 @@ mod tests {
         assert!(e.contains("sudo eighty-probe --write-test"));
         assert!(check_write_permission(true, 0).is_ok());
         assert!(check_write_permission(false, 501).is_ok());
+    }
+
+    #[test]
+    fn termination_signals_cancel_and_stop_signals_are_ignored() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        install_signal_handlers(cancel.clone()).unwrap();
+        // SAFETY: raising signals in-process; handlers are installed above.
+        unsafe {
+            libc::raise(libc::SIGQUIT);
+            libc::raise(libc::SIGTSTP);
+            libc::raise(libc::SIGTERM);
+        }
+        for _ in 0..100 {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exit_code_3_on_restore_failure() {
+        use eighty_probe::catalog::Role;
+        use eighty_probe::writes::{Verdict, WriteResult};
+        let w = |v| WriteResult { backend: "tahoe".into(), key: "CHTE".into(), role: Role::InhibitCharging, verdict: v, before: None, after: None };
+        assert_eq!(exit_code(Some(&[w(Verdict::Verified)])), 0);
+        assert_eq!(exit_code(Some(&[w(Verdict::RestoreFailed("x".into()))])), 3);
+        assert_eq!(exit_code(None), 0);
     }
 }

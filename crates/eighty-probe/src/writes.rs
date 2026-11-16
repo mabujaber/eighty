@@ -70,6 +70,7 @@ fn precondition(c: &Candidate, b: &BatterySnapshot, cfg: &WriteTestConfig) -> Re
         Role::ForceDischarge if b.percent < cfg.min_discharge_percent => {
             Err(format!("charge {}% below {}% floor", b.percent, cfg.min_discharge_percent))
         }
+        Role::ForceDischarge if b.amperage_ma < 0 => Err("battery is already discharging".into()),
         _ => Ok(()),
     }
 }
@@ -78,7 +79,8 @@ struct Outcome {
     verdict: Verdict,
     before: Option<BatterySnapshot>,
     after: Option<BatterySnapshot>,
-    cancelled: bool,
+    /// Stop the run: cancelled, or a restore failed.
+    stop: bool,
 }
 
 fn test_one(
@@ -89,13 +91,14 @@ fn test_one(
     cancel: &AtomicBool,
     sleep: &mut dyn FnMut(Duration),
 ) -> Outcome {
-    let done = |verdict, before, after| Outcome { verdict, before, after, cancelled: false };
+    let done = |verdict, before, after| Outcome { verdict, before, after, stop: false };
     let key = match FourCC::new(c.key) {
         Ok(k) => k,
         Err(e) => return done(Verdict::WriteFailed(e.to_string()), None, None),
     };
     match smc.key_info(key) {
         Err(SmcError::KeyNotFound(_)) => return done(Verdict::Missing, None, None),
+        Err(SmcError::NotPrivileged) => return done(Verdict::Blocked, None, None),
         Err(e) => return done(Verdict::WriteFailed(e.to_string()), None, None),
         Ok(info) if info.size as usize != c.on.len() => {
             return done(Verdict::SizeMismatch { expected: info.size, got: c.on.len() }, None, None)
@@ -118,6 +121,7 @@ fn test_one(
     };
     let mut after = None;
     let mut cancelled = false;
+    let wrote = verdict.is_none();
     if verdict.is_none() {
         let mut ok = settle(cfg.settle, cancel, sleep);
         if ok && c.role == Role::Light {
@@ -153,14 +157,24 @@ fn test_one(
         .into_iter()
         .filter_map(|(k, r)| r.err().map(|e| format!("{k}: {e}")))
         .collect();
-    if !failures.is_empty() {
+    drop(guard);
+    let restore_failed = !failures.is_empty();
+    if restore_failed {
         verdict = Some(Verdict::RestoreFailed(failures.join("; ")));
+    } else if wrote && !cancelled {
+        // Let the battery return to its pre-test state before the next candidate.
+        settle(cfg.settle, cancel, sleep);
     }
-    Outcome { verdict: verdict.expect("verdict set"), before: Some(before), after, cancelled }
+    Outcome {
+        verdict: verdict.expect("verdict set"),
+        before: Some(before),
+        after,
+        stop: cancelled || restore_failed,
+    }
 }
 
 /// Runs every catalog candidate in order, restoring each before the next.
-/// Stops early when `cancel` is set.
+/// Stops early when `cancel` is set or a restore fails.
 pub fn run_write_tests(
     smc: &mut dyn SmcIo,
     battery: &mut dyn BatterySource,
@@ -182,11 +196,16 @@ pub fn run_write_tests(
             before: o.before,
             after: o.after,
         });
-        if o.cancelled {
+        if o.stop {
             break;
         }
     }
     results
+}
+
+/// True if any key could not be put back; the caller must alert the user.
+pub fn any_restore_failed(results: &[WriteResult]) -> bool {
+    results.iter().any(|r| matches!(r.verdict, Verdict::RestoreFailed(_)))
 }
 
 #[cfg(test)]
@@ -318,5 +337,49 @@ mod tests {
         assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
         assert_eq!(r.last().unwrap().key, "CHTE");
         assert!(smc.writes().iter().all(|(k, _)| k != "ACLC"));
+    }
+
+    #[test]
+    fn info_not_privileged_is_blocked() {
+        let smc = FakeSmc::new();
+        smc.insert("CH0J", "ui8 ", &[0], WriteMode::InfoNotPrivileged);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        assert_eq!(verdict(&run(&smc, &mut b), "CH0J"), &Verdict::Blocked);
+    }
+
+    #[test]
+    fn discharge_cannot_verify_when_already_discharging() {
+        let smc = FakeSmc::new();
+        smc.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, false, true, -500));
+        assert!(matches!(verdict(&run(&smc, &mut b), "CHIE"), Verdict::CannotVerify(_)));
+        assert!(smc.writes().is_empty());
+    }
+
+    #[test]
+    fn settles_after_restore_before_next_candidate() {
+        let smc = FakeSmc::new();
+        smc.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+        let s = smc.clone();
+        let mut b = FakeBattery::new(move || {
+            if s.value("CHIE") == Some(vec![8]) { snap(70, false, true, -900) } else { snap(70, true, true, 1500) }
+        });
+        let cancel = AtomicBool::new(false);
+        let mut total = Duration::ZERO;
+        run_write_tests(&mut smc.clone(), &mut b, &cfg(), &cancel, &mut |d| total += d);
+        assert_eq!(total, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn restore_failure_stops_run_and_names_original() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::AcceptOnce);
+        smc.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        let r = run(&smc, &mut b);
+        assert_eq!(r.last().unwrap().key, "CHTE");
+        assert!(matches!(&r.last().unwrap().verdict, Verdict::RestoreFailed(m) if m.contains("00000000")));
+        assert!(smc.writes().iter().all(|(k, _)| k != "ACLC"));
+        assert!(any_restore_failed(&r));
     }
 }
