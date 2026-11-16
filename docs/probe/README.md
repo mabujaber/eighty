@@ -48,7 +48,7 @@ All keys were back to `CHTE=00000000`, `CHIE=00` and `ACLC=04` after the run. Th
 
 Read-only keys: `CHIB` = `00`. `bfD0`/`bfE0`/`bfF0` exist but are **blocked even for root** (`kIOReturnNotPrivileged`). On the M5 they were empty or missing.
 
-After the run, the Mac was charging again at 2871 mA, with `CHIE` restored.
+After the run, the Mac was charging again at 2871 mA. A read-only run afterwards confirmed `CHIE=00` and `ACLC=04`, the same as before the test.
 
 ### Notes from this run
 

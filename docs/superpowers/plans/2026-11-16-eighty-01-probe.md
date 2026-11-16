@@ -426,7 +426,7 @@ Report file names use `<slug>` = `<chip>-macos<version>`, lowercase, no spaces, 
 - [x] **Step 1: Build a release binary on Mac A.** Run `cargo build --release -p eighty-probe`. Both Macs are arm64, so the same binary runs on Mac B. Copy `target/release/eighty-probe` to Mac B via AirDrop/scp, or clone the repo and build there if Rust is installed.
 - [x] **Step 2: On each Mac, read-only run.** Run `./eighty-probe --json docs/probe/2026-11-16-<slug>-read.json`.
 - [x] **Step 3: On each Mac, write test (owner).** With the Mac plugged into MagSafe, charge between 20% and 95% and actively charging, run `sudo ./eighty-probe --write-test --json docs/probe/2026-11-16-<slug>-write.json`. The owner notes whether the light turned green, then orange.
-- [ ] **Step 4: On each Mac, confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing. *(M5: done. M2: pending, its restore read hasn't been run yet.)*
+- [x] **Step 4: On each Mac, confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing. *(Both Macs confirmed: M5 on 2026-11-16, M2 on 2026-11-17 with CHIE=00 and ACLC=04.)*
 - [x] **Step 5: Bring Mac B's two JSON files into `docs/probe/` on Mac A.**
 - [x] **Step 6: Write up** `docs/probe/README.md` with a table of one row per Mac: chip, macOS version/build, summary line, light observation. Then add:
   - **Agreement:** whether the two Macs agree on the working inhibit, discharge and light keys. If they disagree, list the per-machine backend order Plan 2's probe-at-startup must handle.
