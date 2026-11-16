@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `eighty-probe`, a CLI that reports which SMC keys exist on this Mac and, run with sudo, which of them actually stop charging, force discharge, and change the MagSafe light. Then run it on the owner's M5 Pro (macOS 26.6.2) and commit the report.
+**Goal:** Build `eighty-probe`, a CLI that reports which SMC keys exist on this Mac and, run with sudo, which of them actually stop charging, force discharge, and change the MagSafe light. Then run it on both of the owner's Macs (M5 Pro on macOS 26.6.2, and an M4 Pro/Max) and commit the reports.
 
 **Architecture:** A Cargo workspace with two crates. `eighty-hw` is the hardware library: raw SMC access over IOKit, battery state from the `AppleSmartBattery` IORegistry entry, and fakes for tests. Later plans reuse it in the helper. `eighty-probe` (lib + bin) holds the candidate-key catalog, a read-only probe, a write-test engine that always restores original values, and a text/JSON report. All probe logic runs against the traits `SmcIo` and `BatterySource`, so it is unit-tested with fakes. Only thin FFI layers touch hardware.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Apple Silicon only. Development machine: Apple M5 Pro, macOS 26.6.2 (build 25G83).
+- Apple Silicon only. Development machine: Apple M5 Pro, macOS 26.6.2 (build 25G83). Second probe machine: the owner's M4 Pro/Max.
 - Never perform an SMC write unless running as root **and** `--write-test` was passed. The default run is read-only.
 - Every value written is restored to the value read before the write. That holds on success, on error, on Ctrl-C and on panic.
 - Forced-discharge tests only run when charge ≥ 20%.
@@ -413,13 +413,23 @@ fn no_sleep() -> impl FnMut(Duration) { |_| {} }
 
 ---
 
-### Task 7: Run the probe on the owner's Mac and record findings
+### Task 7: Run the probe on both of the owner's Macs and record findings
 
-The owner runs the sudo steps (suggest `! <command>` in the Claude Code prompt). Keep the Mac on MagSafe for the whole run.
+Two machines are in scope:
+- **Mac A:** M5 Pro, macOS 26.6.2 (this machine)
+- **Mac B:** the owner's M4 Pro/Max at home. Its chip and macOS version are captured automatically in the report.
 
-- [ ] **Step 1: Build.** Run `cargo build --release -p eighty-probe`.
-- [ ] **Step 2: Read-only run.** Run `./target/release/eighty-probe --json docs/probe/2026-11-16-m5pro-macos26.6.2-read.json`.
-- [ ] **Step 3: Write test (owner).** With the Mac plugged into MagSafe, charge between 20% and 95% and actively charging, run `sudo ./target/release/eighty-probe --write-test --json docs/probe/2026-11-16-m5pro-macos26.6.2-write.json`. The owner notes whether the light turned green, then orange.
-- [ ] **Step 4: Confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing.
-- [ ] **Step 5: Write up** `docs/probe/README.md`: machine, date, the summary line, the owner's light observation, and which spec §5.2 backend this implies for Plan 2. If the summary is `inhibit=none`, record that, per spec §5.2 ("If no backend works… the project continues"). Plan 2 then covers investigating `bfD0`/`bfE0`/`bfF0` and the other routes.
-- [ ] **Step 6: Commit** `docs(probe): record M5 Pro / macOS 26.6.2 probe results`
+Comparing them shows whether the working keys differ across M-series generations (spec §10 risk). The owner runs the sudo steps (suggest `! <command>` in the Claude Code prompt). Each Mac stays on MagSafe for its whole run.
+
+Report file names use `<slug>` = `<chip>-macos<version>`, lowercase, no spaces, e.g. `m5pro-macos26.6.2`.
+
+- [ ] **Step 1: Build a release binary on Mac A.** Run `cargo build --release -p eighty-probe`. Both Macs are arm64, so the same binary runs on Mac B. Copy `target/release/eighty-probe` to Mac B via AirDrop/scp, or clone the repo and build there if Rust is installed.
+- [ ] **Step 2: On each Mac, read-only run.** Run `./eighty-probe --json docs/probe/2026-11-16-<slug>-read.json`.
+- [ ] **Step 3: On each Mac, write test (owner).** With the Mac plugged into MagSafe, charge between 20% and 95% and actively charging, run `sudo ./eighty-probe --write-test --json docs/probe/2026-11-16-<slug>-write.json`. The owner notes whether the light turned green, then orange.
+- [ ] **Step 4: On each Mac, confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing.
+- [ ] **Step 5: Bring Mac B's two JSON files into `docs/probe/` on Mac A.**
+- [ ] **Step 6: Write up** `docs/probe/README.md` with a table of one row per Mac: chip, macOS version/build, summary line, light observation. Then add:
+  - **Agreement:** whether the two Macs agree on the working inhibit, discharge and light keys. If they disagree, list the per-machine backend order Plan 2's probe-at-startup must handle.
+  - **Plan 2 backend:** which spec §5.2 backend(s) this implies for Plan 2.
+  - **If either Mac shows `inhibit=none`:** record it, per spec §5.2 ("If no backend works… the project continues"). Plan 2 then covers investigating `bfD0`/`bfE0`/`bfF0` and the other routes on that machine.
+- [ ] **Step 7: Commit** `docs(probe): record M5 Pro and M4 probe results`
