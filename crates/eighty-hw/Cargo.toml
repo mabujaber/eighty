@@ -9,3 +9,4 @@ fake = []
 
 [dependencies]
 thiserror.workspace = true
+mach2 = "0.4"

@@ -1,8 +1,11 @@
 //! System Management Controller access.
+mod conn;
+mod ffi;
 mod key;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 
+pub use conn::SmcConnection;
 pub use key::{hex, FourCC};
 
 /// Size, type and attributes of an SMC key.
