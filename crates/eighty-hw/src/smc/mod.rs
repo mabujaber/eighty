@@ -22,7 +22,7 @@ pub enum SmcError {
     InvalidKey(String),
     #[error("SMC key {0} not found")]
     KeyNotFound(String),
-    #[error("SMC write not privileged (kIOReturnNotPrivileged)")]
+    #[error("SMC access not privileged (kIOReturnNotPrivileged)")]
     NotPrivileged,
     #[error("SMC key {key} is {expected} bytes, got {got}")]
     SizeMismatch { key: String, expected: u32, got: usize },
