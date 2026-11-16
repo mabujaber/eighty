@@ -10,7 +10,7 @@
 | Mac | macOS | Stop charging | Run from battery on AC | MagSafe light | Files |
 |---|---|---|---|---|---|
 | M5 Pro (Mac17,8) | 26.6.2 (25G83) | `CHTE` ✅ | `CHIE` ✅ | `ACLC` ✅ | `2026-11-16-m5pro-macos26.6.2-*.json` |
-| M2 Max (Mac14,6) | 27.2 (26B123) | ❌ none | `CHIE` ✅ | `ACLC` ❓ | `2026-11-17-m2max-macos27.2-*.json` |
+| M2 Max (Mac14,6) | 27.2 (26B123) | ❌ none | `CHIE` ✅ | `ACLC` ✅ | `2026-11-17-m2max-macos27.2-*.json` |
 
 ## M5 Pro, macOS 26.6.2 (2026-11-16)
 
@@ -44,7 +44,7 @@ All keys were back to `CHTE=00000000`, `CHIE=00` and `ACLC=04` after the run. Th
 | `CHTE` | tahoe | stop charging | — | missing | key doesn't exist |
 | `CHIE` | tahoe | run from battery | `08` (off: `00`) | **Verified** | charging at 2732 mA → discharging at −421 mA (fresh reading, 72 s after the write) |
 | `CH0J` | tahoe | run from battery | — | blocked | `kIOReturnNotPrivileged` even as root |
-| `ACLC` | magsafe | light | `03` green, `04` orange | write accepted | owner's visual check pending |
+| `ACLC` | magsafe | light | `03` green, `04` orange | **Works** | owner saw green, then orange |
 
 Read-only keys: `CHIB` = `00`. `bfD0`/`bfE0`/`bfF0` exist but are **blocked even for root** (`kIOReturnNotPrivileged`). On the M5 they were empty or missing.
 
@@ -62,7 +62,7 @@ After the run, the Mac was charging again at 2871 mA, with `CHIE` restored.
 |---|---|---|
 | Stop charging | `CHTE` | — |
 | Run from battery on AC | `CHIE` | `CHIE` |
-| MagSafe light | `ACLC` | `ACLC` (pending visual check) |
+| MagSafe light | `ACLC` | `ACLC` |
 | Firmware limit keys (`bf*`) | empty or missing | blocked for root |
 | Battery temperature | reported | **not reported** |
 
