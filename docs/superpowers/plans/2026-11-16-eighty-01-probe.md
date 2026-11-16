@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `eighty-probe`, a CLI that reports which SMC keys exist on this Mac and, run with sudo, which of them actually stop charging, force discharge, and change the MagSafe light. Then run it on both of the owner's Macs (M5 Pro on macOS 26.6.2, and an M4 Pro/Max) and commit the reports.
+**Goal:** Build `eighty-probe`, a CLI that reports which SMC keys exist on this Mac and, run with sudo, which of them actually stop charging, force discharge, and change the MagSafe light. Then run it on both of the owner's Macs (M5 Pro on macOS 26.6.2, and an M2 Pro/Max) and commit the reports.
 
 **Architecture:** A Cargo workspace with two crates. `eighty-hw` is the hardware library: raw SMC access over IOKit, battery state from the `AppleSmartBattery` IORegistry entry, and fakes for tests. Later plans reuse it in the helper. `eighty-probe` (lib + bin) holds the candidate-key catalog, a read-only probe, a write-test engine that always restores original values, and a text/JSON report. All probe logic runs against the traits `SmcIo` and `BatterySource`, so it is unit-tested with fakes. Only thin FFI layers touch hardware.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Apple Silicon only. Development machine: Apple M5 Pro, macOS 26.6.2 (build 25G83). Second probe machine: the owner's M4 Pro/Max.
+- Apple Silicon only. Development machine: Apple M5 Pro, macOS 26.6.2 (build 25G83). Second probe machine: the owner's M2 Pro/Max.
 - Never perform an SMC write unless running as root **and** `--write-test` was passed. The default run is read-only.
 - Every value written is restored to the value read before the write. That holds on success, on error, on Ctrl-C and on panic.
 - Forced-discharge tests only run when charge ≥ 20%.
@@ -417,7 +417,7 @@ fn no_sleep() -> impl FnMut(Duration) { |_| {} }
 
 Two machines are in scope:
 - **Mac A:** M5 Pro, macOS 26.6.2 (this machine)
-- **Mac B:** the owner's M4 Pro/Max at home. Its chip and macOS version are captured automatically in the report.
+- **Mac B:** the owner's M2 Pro/Max at home. Its chip and macOS version are captured automatically in the report.
 
 Comparing them shows whether the working keys differ across M-series generations (spec §10 risk). The owner runs the sudo steps (suggest `! <command>` in the Claude Code prompt). Each Mac stays on MagSafe for its whole run.
 
@@ -432,4 +432,4 @@ Report file names use `<slug>` = `<chip>-macos<version>`, lowercase, no spaces, 
   - **Agreement:** whether the two Macs agree on the working inhibit, discharge and light keys. If they disagree, list the per-machine backend order Plan 2's probe-at-startup must handle.
   - **Plan 2 backend:** which spec §5.2 backend(s) this implies for Plan 2.
   - **If either Mac shows `inhibit=none`:** record it, per spec §5.2 ("If no backend works… the project continues"). Plan 2 then covers investigating `bfD0`/`bfE0`/`bfF0` and the other routes on that machine.
-- [ ] **Step 7: Commit** `docs(probe): record M5 Pro and M4 probe results`
+- [ ] **Step 7: Commit** `docs(probe): record M5 Pro and M2 probe results`

@@ -10,7 +10,7 @@
 | Mac | macOS | Stop charging | Run from battery on AC | MagSafe light | Files |
 |---|---|---|---|---|---|
 | M5 Pro (Mac17,8) | 26.6.2 (25G83) | `CHTE` ✅ | `CHIE` ✅ | `ACLC` ✅ | `2026-11-16-m5pro-macos26.6.2-*.json` |
-| M4 Pro Max | — | pending | pending | pending | — |
+| M2 Pro/Max | — | pending | pending | pending | — |
 
 ## M5 Pro, macOS 26.6.2 (2026-11-16)
 
