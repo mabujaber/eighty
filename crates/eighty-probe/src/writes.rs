@@ -1,0 +1,322 @@
+//! Write tests: does each candidate key actually change charging?
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use eighty_hw::battery::{BatterySnapshot, BatterySource};
+use eighty_hw::smc::{FourCC, SmcError, SmcIo};
+use serde::Serialize;
+
+use crate::catalog::{Candidate, Role, CANDIDATES};
+use crate::guard::RestoreGuard;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum Verdict {
+    Verified,
+    NoEffect,
+    WriteAccepted,
+    Blocked,
+    Missing,
+    SizeMismatch { expected: u32, got: usize },
+    CannotVerify(String),
+    WriteFailed(String),
+    RestoreFailed(String),
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteResult {
+    pub backend: String,
+    pub key: String,
+    pub role: Role,
+    pub verdict: Verdict,
+    pub before: Option<BatterySnapshot>,
+    pub after: Option<BatterySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteTestConfig {
+    pub settle: Duration,
+    pub min_discharge_percent: u8,
+}
+
+impl Default for WriteTestConfig {
+    fn default() -> Self {
+        WriteTestConfig { settle: Duration::from_secs(15), min_discharge_percent: 20 }
+    }
+}
+
+const CHUNK: Duration = Duration::from_millis(250);
+
+/// Waits `total` in chunks; returns false if cancelled.
+fn settle(total: Duration, cancel: &AtomicBool, sleep: &mut dyn FnMut(Duration)) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        let d = left.min(CHUNK);
+        sleep(d);
+        left -= d;
+    }
+    !cancel.load(Ordering::SeqCst)
+}
+
+fn precondition(c: &Candidate, b: &BatterySnapshot, cfg: &WriteTestConfig) -> Result<(), String> {
+    if !b.external_connected {
+        return Err("not plugged in".into());
+    }
+    match c.role {
+        Role::InhibitCharging if !b.is_charging => Err("battery is not charging".into()),
+        Role::InhibitCharging if b.percent >= 100 => Err("battery is full".into()),
+        Role::ForceDischarge if b.percent < cfg.min_discharge_percent => {
+            Err(format!("charge {}% below {}% floor", b.percent, cfg.min_discharge_percent))
+        }
+        _ => Ok(()),
+    }
+}
+
+struct Outcome {
+    verdict: Verdict,
+    before: Option<BatterySnapshot>,
+    after: Option<BatterySnapshot>,
+    cancelled: bool,
+}
+
+fn test_one(
+    c: &Candidate,
+    smc: &mut dyn SmcIo,
+    battery: &mut dyn BatterySource,
+    cfg: &WriteTestConfig,
+    cancel: &AtomicBool,
+    sleep: &mut dyn FnMut(Duration),
+) -> Outcome {
+    let done = |verdict, before, after| Outcome { verdict, before, after, cancelled: false };
+    let key = match FourCC::new(c.key) {
+        Ok(k) => k,
+        Err(e) => return done(Verdict::WriteFailed(e.to_string()), None, None),
+    };
+    match smc.key_info(key) {
+        Err(SmcError::KeyNotFound(_)) => return done(Verdict::Missing, None, None),
+        Err(e) => return done(Verdict::WriteFailed(e.to_string()), None, None),
+        Ok(info) if info.size as usize != c.on.len() => {
+            return done(Verdict::SizeMismatch { expected: info.size, got: c.on.len() }, None, None)
+        }
+        Ok(_) => {}
+    }
+    let before = match battery.snapshot() {
+        Ok(b) => b,
+        Err(e) => return done(Verdict::CannotVerify(format!("battery: {e}")), None, None),
+    };
+    if let Err(reason) = precondition(c, &before, cfg) {
+        return done(Verdict::CannotVerify(reason), Some(before), None);
+    }
+
+    let mut guard = RestoreGuard::new(smc);
+    let mut verdict = match guard.write_tracked(key, c.on) {
+        Err(SmcError::NotPrivileged) => Some(Verdict::Blocked),
+        Err(e) => Some(Verdict::WriteFailed(e.to_string())),
+        Ok(()) => None,
+    };
+    let mut after = None;
+    let mut cancelled = false;
+    if verdict.is_none() {
+        let mut ok = settle(cfg.settle, cancel, sleep);
+        if ok && c.role == Role::Light {
+            ok = match guard.write_tracked(key, c.off) {
+                Ok(()) => settle(cfg.settle, cancel, sleep),
+                Err(e) => {
+                    verdict = Some(Verdict::WriteFailed(e.to_string()));
+                    true
+                }
+            };
+        }
+        if !ok {
+            cancelled = true;
+            verdict = Some(Verdict::CannotVerify("cancelled".into()));
+        }
+    }
+    if verdict.is_none() {
+        match battery.snapshot() {
+            Ok(a) => {
+                verdict = Some(match c.role {
+                    Role::InhibitCharging if !a.is_charging => Verdict::Verified,
+                    Role::ForceDischarge if a.amperage_ma < 0 => Verdict::Verified,
+                    Role::Light => Verdict::WriteAccepted,
+                    _ => Verdict::NoEffect,
+                });
+                after = Some(a);
+            }
+            Err(e) => verdict = Some(Verdict::CannotVerify(format!("battery: {e}"))),
+        }
+    }
+    let failures: Vec<String> = guard
+        .restore_all()
+        .into_iter()
+        .filter_map(|(k, r)| r.err().map(|e| format!("{k}: {e}")))
+        .collect();
+    if !failures.is_empty() {
+        verdict = Some(Verdict::RestoreFailed(failures.join("; ")));
+    }
+    Outcome { verdict: verdict.expect("verdict set"), before: Some(before), after, cancelled }
+}
+
+/// Runs every catalog candidate in order, restoring each before the next.
+/// Stops early when `cancel` is set.
+pub fn run_write_tests(
+    smc: &mut dyn SmcIo,
+    battery: &mut dyn BatterySource,
+    cfg: &WriteTestConfig,
+    cancel: &AtomicBool,
+    sleep: &mut dyn FnMut(Duration),
+) -> Vec<WriteResult> {
+    let mut results = Vec::new();
+    for c in CANDIDATES {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let o = test_one(c, smc, battery, cfg, cancel, sleep);
+        results.push(WriteResult {
+            backend: c.backend.to_string(),
+            key: c.key.to_string(),
+            role: c.role,
+            verdict: o.verdict,
+            before: o.before,
+            after: o.after,
+        });
+        if o.cancelled {
+            break;
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eighty_hw::battery::fake::FakeBattery;
+    use eighty_hw::battery::BatterySnapshot;
+    use eighty_hw::smc::fake::{FakeSmc, WriteMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn snap(percent: u8, charging: bool, ext: bool, amp: i32) -> BatterySnapshot {
+        BatterySnapshot {
+            percent,
+            is_charging: charging,
+            external_connected: ext,
+            amperage_ma: amp,
+            temperature_c: 30.0,
+            cycle_count: 1,
+        }
+    }
+
+    fn cfg() -> WriteTestConfig {
+        WriteTestConfig { settle: Duration::from_secs(1), min_discharge_percent: 20 }
+    }
+
+    fn run(smc: &FakeSmc, battery: &mut FakeBattery) -> Vec<WriteResult> {
+        let cancel = AtomicBool::new(false);
+        run_write_tests(&mut smc.clone(), battery, &cfg(), &cancel, &mut |_| {})
+    }
+
+    fn verdict<'a>(r: &'a [WriteResult], key: &str) -> &'a Verdict {
+        &r.iter().find(|w| w.key == key).unwrap().verdict
+    }
+
+    #[test]
+    fn inhibit_verified_when_charging_stops() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let s = smc.clone();
+        let mut b = FakeBattery::new(move || {
+            if s.value("CHTE") == Some(vec![1, 0, 0, 0]) { snap(70, false, true, 0) } else { snap(70, true, true, 1500) }
+        });
+        let r = run(&smc, &mut b);
+        assert_eq!(verdict(&r, "CHTE"), &Verdict::Verified);
+        assert_eq!(verdict(&r, "CH0B"), &Verdict::Missing);
+        assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn inhibit_no_effect_when_battery_unchanged() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        assert_eq!(verdict(&run(&smc, &mut b), "CHTE"), &Verdict::NoEffect);
+    }
+
+    #[test]
+    fn inhibit_cannot_verify_when_not_charging() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(100, false, true, 0));
+        assert!(matches!(verdict(&run(&smc, &mut b), "CHTE"), Verdict::CannotVerify(_)));
+        assert!(smc.writes().iter().all(|(k, _)| k != "CHTE"));
+    }
+
+    #[test]
+    fn discharge_skipped_below_floor() {
+        let smc = FakeSmc::new();
+        smc.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(15, true, true, 1000));
+        assert!(matches!(verdict(&run(&smc, &mut b), "CHIE"), Verdict::CannotVerify(_)));
+        assert!(smc.writes().is_empty());
+    }
+
+    #[test]
+    fn discharge_verified_on_negative_amperage() {
+        let smc = FakeSmc::new();
+        smc.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+        let s = smc.clone();
+        let mut b = FakeBattery::new(move || {
+            if s.value("CHIE") == Some(vec![8]) { snap(70, false, true, -900) } else { snap(70, true, true, 1500) }
+        });
+        assert_eq!(verdict(&run(&smc, &mut b), "CHIE"), &Verdict::Verified);
+        assert_eq!(smc.value("CHIE"), Some(vec![0]));
+    }
+
+    #[test]
+    fn size_mismatch_skips_write() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        assert_eq!(verdict(&run(&smc, &mut b), "CHTE"), &Verdict::SizeMismatch { expected: 1, got: 4 });
+        assert!(smc.writes().is_empty());
+    }
+
+    #[test]
+    fn not_privileged_is_blocked() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::NotPrivileged);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        assert_eq!(verdict(&run(&smc, &mut b), "CHTE"), &Verdict::Blocked);
+        assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn light_writes_green_then_orange_then_restores() {
+        let smc = FakeSmc::new();
+        smc.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        let r = run(&smc, &mut b);
+        assert_eq!(verdict(&r, "ACLC"), &Verdict::WriteAccepted);
+        assert_eq!(
+            smc.writes(),
+            vec![("ACLC".to_string(), vec![3]), ("ACLC".to_string(), vec![4]), ("ACLC".to_string(), vec![0])]
+        );
+    }
+
+    #[test]
+    fn cancel_mid_settle_restores() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        smc.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(70, true, true, 1500));
+        let cancel = AtomicBool::new(false);
+        let r = run_write_tests(&mut smc.clone(), &mut b, &cfg(), &cancel, &mut |_| {
+            cancel.store(true, Ordering::SeqCst)
+        });
+        assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
+        assert_eq!(r.last().unwrap().key, "CHTE");
+        assert!(smc.writes().iter().all(|(k, _)| k != "ACLC"));
+    }
+}
