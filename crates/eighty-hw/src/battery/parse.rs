@@ -36,8 +36,11 @@ pub fn parse_snapshot(props: &HashMap<String, Prop>) -> Result<BatterySnapshot, 
         is_charging: boolean(props, "IsCharging")?,
         external_connected: boolean(props, "ExternalConnected")?,
         amperage_ma: int(props, "Amperage")? as i32,
-        temperature_c: int(props, "Temperature")? as f32 / 100.0,
-        cycle_count: int(props, "CycleCount")? as u32,
+        temperature_c: ["Temperature", "VirtualTemperature"]
+            .into_iter()
+            .find_map(|k| int(props, k).ok())
+            .map(|t| t as f32 / 100.0),
+        cycle_count: int(props, "CycleCount").ok().map(|c| c as u32),
         update_time: int(props, "UpdateTime").ok().and_then(|t| u64::try_from(t).ok()),
     })
 }
@@ -74,8 +77,8 @@ mod tests {
                 is_charging: false,
                 external_connected: true,
                 amperage_ma: -100,
-                temperature_c: 30.5,
-                cycle_count: 42,
+                temperature_c: Some(30.5),
+                cycle_count: Some(42),
                 update_time: None
             }
         );
@@ -96,6 +99,15 @@ mod tests {
         let mut p = base(81, 100, 0);
         p.insert("UpdateTime".into(), Prop::Int(1_794_840_390));
         assert_eq!(parse_snapshot(&p).unwrap().update_time, Some(1_794_840_390));
+    }
+
+    #[test]
+    fn temperature_is_optional() {
+        let mut p = base(81, 100, 0);
+        p.remove("Temperature");
+        assert_eq!(parse_snapshot(&p).unwrap().temperature_c, None);
+        p.insert("VirtualTemperature".into(), Prop::Int(2990));
+        assert_eq!(parse_snapshot(&p).unwrap().temperature_c, Some(29.9));
     }
 
     #[test]

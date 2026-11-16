@@ -13,8 +13,9 @@ pub struct BatterySnapshot {
     pub is_charging: bool,
     pub external_connected: bool,
     pub amperage_ma: i32,
-    pub temperature_c: f32,
-    pub cycle_count: u32,
+    /// macOS 27 no longer reports `Temperature` on some Macs (seen on an M2 Max).
+    pub temperature_c: Option<f32>,
+    pub cycle_count: Option<u32>,
     /// When macOS last refreshed these readings (Unix seconds, `UpdateTime`).
     /// macOS refreshes about once a minute, so a reading can be up to ~60 s old.
     pub update_time: Option<u64>,

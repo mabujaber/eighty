@@ -70,6 +70,6 @@ mod tests {
     #[ignore = "hardware"]
     fn reads_real_battery() {
         let s = IoRegBattery.snapshot().unwrap();
-        assert!(s.percent <= 100 && s.temperature_c > 0.0 && s.temperature_c < 80.0);
+        assert!(s.percent <= 100 && s.temperature_c.is_none_or(|t| t > 0.0 && t < 80.0));
     }
 }

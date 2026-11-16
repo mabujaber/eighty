@@ -46,10 +46,11 @@ pub fn render_text(r: &ProbeReport) -> String {
     let _ = writeln!(t, "eighty-probe {} — {}, macOS {} ({}), {}", r.tool_version, m.chip, m.macos, m.build, m.model);
     match &r.battery {
         Some(b) => {
+            let temp = b.temperature_c.map_or("temp n/a".into(), |c| format!("{c:.1} °C"));
             let _ = writeln!(
                 t,
-                "Battery: {}% charging={} plugged={} {} mA {:.1} °C",
-                b.percent, b.is_charging, b.external_connected, b.amperage_ma, b.temperature_c
+                "Battery: {}% charging={} plugged={} {} mA {}",
+                b.percent, b.is_charging, b.external_connected, b.amperage_ma, temp
             );
         }
         None => {

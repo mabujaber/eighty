@@ -292,8 +292,8 @@ mod tests {
             is_charging: charging,
             external_connected: ext,
             amperage_ma: amp,
-            temperature_c: 30.0,
-            cycle_count: 1,
+            temperature_c: Some(30.0),
+            cycle_count: Some(1),
             update_time: None,
         }
     }
