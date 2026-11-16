@@ -1,6 +1,6 @@
 //! System Management Controller access.
 mod conn;
-mod ffi;
+pub(crate) mod ffi;
 mod key;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;

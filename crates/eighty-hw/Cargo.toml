@@ -10,3 +10,5 @@ fake = []
 [dependencies]
 thiserror.workspace = true
 mach2 = "0.4"
+serde.workspace = true
+core-foundation = "0.10"
