@@ -27,6 +27,13 @@ Repo: https://github.com/mabujaber/eighty
      - **Shutdown:** accepted that eighty can't act while the Mac is off. The Mac may charge past the limit. At boot (before login) the helper re-applies the limit. If the charge went over while off, it discharges down to the limit (per the discharge rule) and the status shows what happened, so it isn't silent.
    - **Clamshell mode support:** limits keep working with the lid closed on an external display, including on wake events where the helper might otherwise miss the transition.
    - **Zones:** named profiles (Home / Work / Travel, user-editable) with their own limits, picked by the current Wi-Fi network name (up to 4 per zone, as in BattOpt). Travel can mean "charge to 100%".
+   - **MagSafe charging light** (owner's requirement): the light on the MagSafe connector shows eighty's state, not macOS's guess.
+     - **Green** when the battery has reached the limit (80% or whatever the user set) and is being held there.
+     - **Orange** while charging toward the limit, as normal.
+     - While discharging down to the limit, the light shows green, since the limit is already reached. *Claude's call.*
+     - During calibration's charge-to-100% step, the light is left to macOS.
+     - Uninstalling, or the helper stopping, hands the light back to macOS (system control).
+     - Only Macs with a MagSafe 3 port have this light. Charging over USB-C has no light, and that isn't treated as an error.
 4. Release publicly through **Homebrew**: a cask for the signed and notarized app, which also installs the CLI.
 5. **Fail loudly.** If eighty can't control charging on a machine (unknown firmware, keys missing, write rejected), it says so in the CLI, the menu bar and a notification. It never lets the battery quietly reach 100% while showing "limited".
 
@@ -79,6 +86,7 @@ This is the riskiest part and the reason the project exists. Which SMC keys cont
   - **Firmware charge-limit registers:** `bfD0`/`bfE0`/`bfF0` (upper limit / lower limit / enable), reported in battery#482.
   - **PowerUI / MCL** (private `PowerUISmartChargeClient`, `setMCLLimit:`), reported in battery#474 as the route on macOS 27, where direct SMC writes return `kIOReturnNotPrivileged`. It only supports fixed steps (80/85/90/95/100), so features that need arbitrary limits degrade, and that degradation must be shown to the user. *Claude's call:* macOS 27 isn't testable yet, so v1 reserves this backend's slot in the trait and probe order but doesn't implement it. Work on it starts once macOS 27 betas can be tested.
 - **If no backend works** (on the owner's Mac or any other): the project continues (owner's decision). eighty reports "unsupported on this firmware/macOS" through `doctor`, the CLI and the menu bar. It does nothing to charging, and it keeps probing on each launch and after OS updates so it picks up a working path when one appears (e.g. a new backend in a later release).
+- **MagSafe light:** the SMC key `ACLC` (seen still readable on newer builds in battery#482) controls the light. `battery` uses 0 = system control, 3 = green, 4 = orange. The probe spike confirms which values work on the owner's Mac. The helper exposes this as intent-level operations (`set_light(Green|Orange|System)`), never as raw key writes.
 - **First milestone is a probe spike on the owner's M5 Pro / macOS 26.6.2:** find which keys exist, which accept writes from a root process, and which actually change charging behavior. The backend order and the default key set come from that result, not from this document.
 - Prior art to check against: `charlie0129/batt` (Go; reported working on Sequoia 15.8 in battery#482), `anarchy89/batterycharging`, and `battery`'s PRs #469 and #486.
 
@@ -108,7 +116,7 @@ v1 ships via Homebrew after it has been tested on **2–5 Apple Silicon Macs** t
 - **Hardware:** Apple Silicon only. The development machine is an M5 Pro on macOS 26.6.2.
 - **Distribution:** Homebrew cask in a tap the owner controls (e.g. `mabujaber/homebrew-tap`), pointing at a GitHub Release `.dmg` or `.zip`. The owner has an Apple Developer account. The app and helper must be signed with a Developer ID and notarized, because `SMAppService` daemons need a signed bundle. Release builds go through GitHub Actions with signing secrets.
 - **License:** MIT (matching the prior art). Builder's call, but confirm with the owner before release.
-- **Uninstall:** `eighty uninstall` and the cask's `uninstall`/`zap` stanzas must unregister the helper and **restore normal charging** (re-enable charging and clear inhibit/discharge keys). Otherwise a removed tool could leave a Mac unable to charge.
+- **Uninstall:** `eighty uninstall` and the cask's `uninstall`/`zap` stanzas must unregister the helper and **restore normal charging** (re-enable charging, clear inhibit/discharge keys, and return the MagSafe light to system control). Otherwise a removed tool could leave a Mac unable to charge.
 
 ## 8. Safety requirements
 
