@@ -76,7 +76,7 @@ docs/probe/                        committed probe reports
   - `pub trait SmcIo { fn key_info(&mut self, key: FourCC) -> Result<KeyInfo, SmcError>; fn read(&mut self, key: FourCC) -> Result<Vec<u8>, SmcError>; fn write(&mut self, key: FourCC, bytes: &[u8]) -> Result<(), SmcError>; }` The `write` contract: if `bytes.len() != key_info.size`, return `SizeMismatch` without writing.
   - `FakeSmc` (behind `#[cfg(any(test, feature = "fake"))]`): `FakeSmc::new() -> FakeSmc`, `fn insert(&self, key: &str, data_type: &str, value: &[u8], mode: WriteMode)`, `fn value(&self, key: &str) -> Option<Vec<u8>>`, `fn writes(&self) -> Vec<(String, Vec<u8>)>`, `Clone` (state shared via `Rc<RefCell<…>>` so tests can observe it after handing a clone to the code under test). `pub enum WriteMode { Accept, NotPrivileged }`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 // key.rs
@@ -119,10 +119,10 @@ docs/probe/                        committed probe reports
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure (types not defined).
-- [ ] **Step 3: Implement** the workspace, the `fake` feature in `eighty-hw/Cargo.toml`, and the types above.
-- [ ] **Step 4: Run `cargo test -p eighty-hw`.** Expected: 7 tests pass.
-- [ ] **Step 5: Commit** `feat(hw): add SMC key types, SmcIo trait and fake`
+- [x] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure (types not defined).
+- [x] **Step 3: Implement** the workspace, the `fake` feature in `eighty-hw/Cargo.toml`, and the types above.
+- [x] **Step 4: Run `cargo test -p eighty-hw`.** Expected: 7 tests pass.
+- [x] **Step 5: Commit** `feat(hw): add SMC key types, SmcIo trait and fake`
 
 ---
 
@@ -145,7 +145,7 @@ FFI values the implementer must use:
 - `map_kern_return`: `0xE00002C1u32 as i32` → `NotPrivileged`, anything else → `IoKit(kr)`.
 - `#[link(name = "IOKit", kind = "framework")]`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 // ffi.rs
@@ -169,10 +169,10 @@ FFI values the implementer must use:
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure.
-- [ ] **Step 3: Implement** `ffi.rs` and `conn.rs` with the values above. `write` checks the length against `key_info.size` before calling IOKit (same contract as the fake).
-- [ ] **Step 4: Run `cargo test -p eighty-hw && cargo test -p eighty-hw -- --ignored`.** Expected: all pass on the owner's Mac, without sudo (reads don't need root).
-- [ ] **Step 5: Commit** `feat(hw): add IOKit SMC connection`
+- [x] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure.
+- [x] **Step 3: Implement** `ffi.rs` and `conn.rs` with the values above. `write` checks the length against `key_info.size` before calling IOKit (same contract as the fake).
+- [x] **Step 4: Run `cargo test -p eighty-hw && cargo test -p eighty-hw -- --ignored`.** Expected: all pass on the owner's Mac, without sudo (reads don't need root).
+- [x] **Step 5: Commit** `feat(hw): add IOKit SMC connection`
 
 ---
 
@@ -200,7 +200,7 @@ Parsing rules:
 - `CycleCount` → `u32`.
 - A missing required key → `MissingProp("<Name>")`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 fn props(pairs: &[(&str, Prop)]) -> HashMap<String, Prop> { /* build map */ }
@@ -223,10 +223,10 @@ fn props(pairs: &[(&str, Prop)]) -> HashMap<String, Prop> { /* build map */ }
 ```
 Add `amperage_wraps_u32`: `Prop::Int(4294967196)` parses to `amperage_ma == -100`.
 
-- [ ] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure.
-- [ ] **Step 3: Implement.** `ioreg.rs` uses `IOServiceGetMatchingService(0, IOServiceMatching("AppleSmartBattery"))` and `IORegistryEntryCreateCFProperties`. It converts the CFDictionary to `HashMap<String, Prop>` (CFNumber → `Int`, CFBoolean → `Bool`, other types skipped) and calls `parse_snapshot`.
-- [ ] **Step 4: Run `cargo test -p eighty-hw && cargo test -p eighty-hw -- --ignored`.** Expected: all pass.
-- [ ] **Step 5: Commit** `feat(hw): read battery snapshot from IORegistry`
+- [x] **Step 2: Run `cargo test -p eighty-hw`.** Expected: compile failure.
+- [x] **Step 3: Implement.** `ioreg.rs` uses `IOServiceGetMatchingService(0, IOServiceMatching("AppleSmartBattery"))` and `IORegistryEntryCreateCFProperties`. It converts the CFDictionary to `HashMap<String, Prop>` (CFNumber → `Int`, CFBoolean → `Bool`, other types skipped) and calls `parse_snapshot`.
+- [x] **Step 4: Run `cargo test -p eighty-hw && cargo test -p eighty-hw -- --ignored`.** Expected: all pass.
+- [x] **Step 5: Commit** `feat(hw): read battery snapshot from IORegistry`
 
 ---
 
@@ -259,7 +259,7 @@ Add `amperage_wraps_u32`: `Prop::Int(4294967196)` parses to `amperage_ma == -100
   - `#[derive(Serialize)] pub enum ReadStatus { Present { size: u32, data_type: String, value_hex: String }, Missing, Error(String) }`
   - `pub fn probe_reads(smc: &mut dyn SmcIo) -> Vec<KeyReading>` reads every catalog key, then every `READ_ONLY_KEYS` key, deduplicated, in that order.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 #[test] fn catalog_has_spec_keys() {
@@ -280,10 +280,10 @@ Add `amperage_wraps_u32`: `Prop::Int(4294967196)` parses to `amperage_ma == -100
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
-- [ ] **Step 3: Implement** `catalog.rs` and `reads.rs` (`KeyNotFound` → `Missing`, other errors → `Error(e.to_string())`).
-- [ ] **Step 4: Run `cargo test -p eighty-probe`.** Expected: pass.
-- [ ] **Step 5: Commit** `feat(probe): add candidate catalog and read-only probe`
+- [x] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
+- [x] **Step 3: Implement** `catalog.rs` and `reads.rs` (`KeyNotFound` → `Missing`, other errors → `Error(e.to_string())`).
+- [x] **Step 4: Run `cargo test -p eighty-probe`.** Expected: pass.
+- [x] **Step 5: Commit** `feat(probe): add candidate catalog and read-only probe`
 
 ---
 
@@ -319,7 +319,7 @@ Per-candidate algorithm. The tests pin it, but the order matters, so it is state
 
 Each candidate gets its own guard, so one candidate's change never overlaps the next.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 fn snap(pct: u8, charging: bool, ext: bool, amp: i32) -> BatterySnapshot { /* temp 30.0, cycles 1 */ }
@@ -353,10 +353,10 @@ fn no_sleep() -> impl FnMut(Duration) { |_| {} }
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
-- [ ] **Step 3: Implement** `guard.rs` and `writes.rs` using the interfaces and algorithm above.
-- [ ] **Step 4: Run `cargo test -p eighty-probe`.** Expected: all pass.
-- [ ] **Step 5: Commit** `feat(probe): add write-test engine with guaranteed restore`
+- [x] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
+- [x] **Step 3: Implement** `guard.rs` and `writes.rs` using the interfaces and algorithm above.
+- [x] **Step 4: Run `cargo test -p eighty-probe`.** Expected: all pass.
+- [x] **Step 5: Commit** `feat(probe): add write-test engine with guaranteed restore`
 
 ---
 
@@ -386,7 +386,7 @@ fn no_sleep() -> impl FnMut(Duration) { |_| {} }
 - writes: `WRITE <KEY>  <backend>/<role>  <Verdict>`
 - final line: `Summary: inhibit=<first Verified InhibitCharging key or "none">, discharge=<… or "none">, light=<ACLC if WriteAccepted else "none">`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 #[test] fn write_test_requires_root() {
@@ -405,11 +405,11 @@ fn no_sleep() -> impl FnMut(Duration) { |_| {} }
 #[test] fn summary_none_when_nothing_works() { /* all Missing → "Summary: inhibit=none, discharge=none, light=none" */ }
 ```
 
-- [ ] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
-- [ ] **Step 3: Implement** `machine.rs`, `report.rs` and `main.rs`. In `main`, call `check_write_permission(args.write_test, libc::geteuid())` **before** opening `SmcConnection`.
-- [ ] **Step 4: Run `cargo test --workspace && cargo clippy --workspace -- -D warnings`.** Expected: all pass, no warnings.
-- [ ] **Step 5: Run `cargo run -p eighty-probe` (no sudo).** Expected: a header, a battery line and 11 READ lines. No WRITE lines. Summary shows `none` for all three.
-- [ ] **Step 6: Commit** `feat(probe): add report and eighty-probe CLI`
+- [x] **Step 2: Run `cargo test -p eighty-probe`.** Expected: compile failure.
+- [x] **Step 3: Implement** `machine.rs`, `report.rs` and `main.rs`. In `main`, call `check_write_permission(args.write_test, libc::geteuid())` **before** opening `SmcConnection`.
+- [x] **Step 4: Run `cargo test --workspace && cargo clippy --workspace -- -D warnings`.** Expected: all pass, no warnings.
+- [x] **Step 5: Run `cargo run -p eighty-probe` (no sudo).** Expected: a header, a battery line and 11 READ lines. No WRITE lines. Summary shows `none` for all three.
+- [x] **Step 6: Commit** `feat(probe): add report and eighty-probe CLI`
 
 ---
 
@@ -423,13 +423,13 @@ Comparing them shows whether the working keys differ across M-series generations
 
 Report file names use `<slug>` = `<chip>-macos<version>`, lowercase, no spaces, e.g. `m5pro-macos26.6.2`.
 
-- [ ] **Step 1: Build a release binary on Mac A.** Run `cargo build --release -p eighty-probe`. Both Macs are arm64, so the same binary runs on Mac B. Copy `target/release/eighty-probe` to Mac B via AirDrop/scp, or clone the repo and build there if Rust is installed.
-- [ ] **Step 2: On each Mac, read-only run.** Run `./eighty-probe --json docs/probe/2026-11-16-<slug>-read.json`.
-- [ ] **Step 3: On each Mac, write test (owner).** With the Mac plugged into MagSafe, charge between 20% and 95% and actively charging, run `sudo ./eighty-probe --write-test --json docs/probe/2026-11-16-<slug>-write.json`. The owner notes whether the light turned green, then orange.
-- [ ] **Step 4: On each Mac, confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing.
-- [ ] **Step 5: Bring Mac B's two JSON files into `docs/probe/` on Mac A.**
-- [ ] **Step 6: Write up** `docs/probe/README.md` with a table of one row per Mac: chip, macOS version/build, summary line, light observation. Then add:
+- [x] **Step 1: Build a release binary on Mac A.** Run `cargo build --release -p eighty-probe`. Both Macs are arm64, so the same binary runs on Mac B. Copy `target/release/eighty-probe` to Mac B via AirDrop/scp, or clone the repo and build there if Rust is installed.
+- [x] **Step 2: On each Mac, read-only run.** Run `./eighty-probe --json docs/probe/2026-11-16-<slug>-read.json`.
+- [x] **Step 3: On each Mac, write test (owner).** With the Mac plugged into MagSafe, charge between 20% and 95% and actively charging, run `sudo ./eighty-probe --write-test --json docs/probe/2026-11-16-<slug>-write.json`. The owner notes whether the light turned green, then orange.
+- [ ] **Step 4: On each Mac, confirm the restore.** Re-run the read-only command. Every catalog key's value must match Step 2. If any differs, stop and fix the issue before continuing. *(M5: done. M2: pending, its restore read hasn't been run yet.)*
+- [x] **Step 5: Bring Mac B's two JSON files into `docs/probe/` on Mac A.**
+- [x] **Step 6: Write up** `docs/probe/README.md` with a table of one row per Mac: chip, macOS version/build, summary line, light observation. Then add:
   - **Agreement:** whether the two Macs agree on the working inhibit, discharge and light keys. If they disagree, list the per-machine backend order Plan 2's probe-at-startup must handle.
   - **Plan 2 backend:** which spec §5.2 backend(s) this implies for Plan 2.
   - **If either Mac shows `inhibit=none`:** record it, per spec §5.2 ("If no backend works… the project continues"). Plan 2 then covers investigating `bfD0`/`bfE0`/`bfF0` and the other routes on that machine.
-- [ ] **Step 7: Commit** `docs(probe): record M5 Pro and M2 probe results`
+- [x] **Step 7: Commit** `docs(probe): record M5 Pro and M2 probe results`

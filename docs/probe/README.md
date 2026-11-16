@@ -68,6 +68,10 @@ After the run, the Mac was charging again at 2871 mA, with `CHIE` restored.
 
 **For Plan 2:** `CHIE` works on both Macs, so it's the backbone that works on both. Where `CHTE` exists, use it to hold the battery still at the limit. Where it doesn't, alternate `CHIE` on and off between the upper and lower limits. `eighty doctor` should say which mode is active.
 
+**Agreement:** the two Macs agree on the run-from-battery key (`CHIE`) and the light (`ACLC`). They disagree on stopping charging: `CHTE` on the M5 / macOS 26, none on the M2 / macOS 27. The startup probe in Plan 2 tries `CHTE` first, then falls back to the `CHIE`-only mode.
+
+**`inhibit=none` on the M2 (spec §5.2):** the project continues. Plan 2 also investigates the other routes on macOS 27: whether `bfD0`/`bfE0`/`bfF0` can be reached another way, and Apple's own charge limit (PowerUI / MCL).
+
 ## How to run on another Mac
 
 1. Copy `target/release/eighty-probe` over (AirDrop is fine).
