@@ -91,10 +91,15 @@ fn run(args: Args) -> anyhow::Result<u8> {
     } else {
         None
     };
+    let (battery, battery_error) = match battery.snapshot() {
+        Ok(b) => (Some(b), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     let report = ProbeReport {
         tool_version: env!("CARGO_PKG_VERSION").into(),
         machine: MachineInfo::current(),
-        battery: battery.snapshot().ok(),
+        battery,
+        battery_error,
         reads,
         writes,
     };

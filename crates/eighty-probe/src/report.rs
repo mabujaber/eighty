@@ -14,6 +14,9 @@ pub struct ProbeReport {
     pub tool_version: String,
     pub machine: MachineInfo,
     pub battery: Option<BatterySnapshot>,
+    /// Why the battery couldn't be read, when `battery` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_error: Option<String>,
     pub reads: Vec<KeyReading>,
     pub writes: Option<Vec<WriteResult>>,
 }
@@ -49,7 +52,10 @@ pub fn render_text(r: &ProbeReport) -> String {
                 b.percent, b.is_charging, b.external_connected, b.amperage_ma, b.temperature_c
             );
         }
-        None => t.push_str("Battery: unavailable\n"),
+        None => {
+            let why = r.battery_error.as_deref().unwrap_or("unknown error");
+            let _ = writeln!(t, "Battery: unavailable ({why})");
+        }
     }
     for k in &r.reads {
         let _ = match &k.status {
@@ -94,11 +100,25 @@ mod tests {
     }
 
     #[test]
+    fn explains_missing_battery() {
+        let r = ProbeReport {
+            tool_version: "0.1.0".into(),
+            machine: machine(),
+            battery: None,
+            battery_error: Some("battery property Temperature missing".into()),
+            reads: vec![],
+            writes: None,
+        };
+        assert!(render_text(&r).contains("Battery: unavailable (battery property Temperature missing)\n"));
+    }
+
+    #[test]
     fn renders_summary_line() {
         let r = ProbeReport {
             tool_version: "0.1.0".into(),
             machine: machine(),
             battery: None,
+            battery_error: None,
             reads: vec![
                 KeyReading { key: "CHTE".into(), status: ReadStatus::Present { size: 4, data_type: "ui32".into(), value_hex: "00000000".into() } },
                 KeyReading { key: "CH0B".into(), status: ReadStatus::Missing },
@@ -124,6 +144,7 @@ mod tests {
             tool_version: "0.1.0".into(),
             machine: machine(),
             battery: None,
+            battery_error: None,
             reads: vec![],
             writes: Some(vec![w("CHTE", Role::InhibitCharging, Verdict::Missing), w("ACLC", Role::Light, Verdict::Missing)]),
         };
@@ -136,6 +157,7 @@ mod tests {
             tool_version: "0.1.0".into(),
             machine: machine(),
             battery: None,
+            battery_error: None,
             reads: vec![],
             writes: Some(vec![
                 w("CHTE", Role::InhibitCharging, Verdict::CannotVerify("battery is not charging".into())),
