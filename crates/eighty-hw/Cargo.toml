@@ -1,0 +1,11 @@
+[package]
+name = "eighty-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+fake = []
+
+[dependencies]
+thiserror.workspace = true
