@@ -38,6 +38,7 @@ pub fn parse_snapshot(props: &HashMap<String, Prop>) -> Result<BatterySnapshot, 
         amperage_ma: int(props, "Amperage")? as i32,
         temperature_c: int(props, "Temperature")? as f32 / 100.0,
         cycle_count: int(props, "CycleCount")? as u32,
+        update_time: int(props, "UpdateTime").ok().and_then(|t| u64::try_from(t).ok()),
     })
 }
 
@@ -74,7 +75,8 @@ mod tests {
                 external_connected: true,
                 amperage_ma: -100,
                 temperature_c: 30.5,
-                cycle_count: 42
+                cycle_count: 42,
+                update_time: None
             }
         );
     }
@@ -87,6 +89,13 @@ mod tests {
     #[test]
     fn computes_percent_from_mah() {
         assert_eq!(parse_snapshot(&base(4000, 5000, 0)).unwrap().percent, 80);
+    }
+
+    #[test]
+    fn reads_update_time() {
+        let mut p = base(81, 100, 0);
+        p.insert("UpdateTime".into(), Prop::Int(1_794_840_390));
+        assert_eq!(parse_snapshot(&p).unwrap().update_time, Some(1_794_840_390));
     }
 
     #[test]

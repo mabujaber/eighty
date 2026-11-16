@@ -23,7 +23,8 @@ struct Args {
     /// Try each candidate key (needs sudo). Every value is restored afterwards.
     #[arg(long)]
     write_test: bool,
-    /// Seconds to wait after each write before checking the battery.
+    /// Seconds after each write before a battery reading counts. macOS only
+    /// refreshes readings about once a minute, so each check may wait longer.
     #[arg(long, default_value_t = 15)]
     settle_secs: u64,
     /// Also write the report as JSON to this path.
@@ -57,6 +58,10 @@ fn install_signal_handlers(cancel: Arc<AtomicBool>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// 3 when any key could not be restored, else 0.
 fn exit_code(writes: Option<&[WriteResult]>) -> u8 {
     match writes {
@@ -74,15 +79,15 @@ fn run(args: Args) -> anyhow::Result<u8> {
         install_signal_handlers(cancel.clone())?;
         let cfg = WriteTestConfig { settle: Duration::from_secs(args.settle_secs), ..Default::default() };
         eprintln!(
-            "Testing {} keys, about {} s each. Ctrl-C stops safely and restores values.",
-            CANDIDATES.len(),
-            args.settle_secs
+            "Testing {} keys, up to ~3 min each (macOS refreshes battery readings once a minute). \
+             Ctrl-C stops safely and restores values.",
+            CANDIDATES.len()
         );
         eprintln!(
             "At the end, watch the MagSafe light: GREEN for {0} s, then ORANGE for {0} s.",
             args.settle_secs
         );
-        Some(run_write_tests(&mut smc, &mut battery, &cfg, &cancel, &mut std::thread::sleep))
+        Some(run_write_tests(&mut smc, &mut battery, &cfg, &cancel, &mut std::thread::sleep, &unix_now))
     } else {
         None
     };

@@ -15,6 +15,9 @@ pub struct BatterySnapshot {
     pub amperage_ma: i32,
     pub temperature_c: f32,
     pub cycle_count: u32,
+    /// When macOS last refreshed these readings (Unix seconds, `UpdateTime`).
+    /// macOS refreshes about once a minute, so a reading can be up to ~60 s old.
+    pub update_time: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]

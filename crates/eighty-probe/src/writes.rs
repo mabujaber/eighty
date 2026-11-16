@@ -34,17 +34,30 @@ pub struct WriteResult {
 
 #[derive(Debug, Clone)]
 pub struct WriteTestConfig {
+    /// How long after a write (or restore) a battery reading must be taken
+    /// before it counts.
     pub settle: Duration,
     pub min_discharge_percent: u8,
+    /// Above this, macOS slows charging itself, so "charging stopped" proves nothing.
+    pub max_inhibit_percent: u8,
+    /// Longest extra wait for macOS to publish a reading taken `settle` after
+    /// a write. macOS refreshes battery readings about once a minute.
+    pub refresh_timeout: Duration,
 }
 
 impl Default for WriteTestConfig {
     fn default() -> Self {
-        WriteTestConfig { settle: Duration::from_secs(15), min_discharge_percent: 20 }
+        WriteTestConfig {
+            settle: Duration::from_secs(15),
+            min_discharge_percent: 20,
+            max_inhibit_percent: 95,
+            refresh_timeout: Duration::from_secs(120),
+        }
     }
 }
 
 const CHUNK: Duration = Duration::from_millis(250);
+const POLL: Duration = Duration::from_secs(1);
 
 /// Waits `total` in chunks; returns false if cancelled.
 fn settle(total: Duration, cancel: &AtomicBool, sleep: &mut dyn FnMut(Duration)) -> bool {
@@ -66,12 +79,51 @@ fn precondition(c: &Candidate, b: &BatterySnapshot, cfg: &WriteTestConfig) -> Re
     }
     match c.role {
         Role::InhibitCharging if !b.is_charging => Err("battery is not charging".into()),
-        Role::InhibitCharging if b.percent >= 100 => Err("battery is full".into()),
+        Role::InhibitCharging if b.percent > cfg.max_inhibit_percent => Err(format!(
+            "charge {}% above {}% ceiling (macOS slows charging near full)",
+            b.percent, cfg.max_inhibit_percent
+        )),
         Role::ForceDischarge if b.percent < cfg.min_discharge_percent => {
             Err(format!("charge {}% below {}% floor", b.percent, cfg.min_discharge_percent))
         }
         Role::ForceDischarge if b.amperage_ma < 0 => Err("battery is already discharging".into()),
         _ => Ok(()),
+    }
+}
+
+enum Fresh {
+    Got(BatterySnapshot),
+    Stale,
+    Cancelled,
+    Failed(String),
+}
+
+/// Polls until macOS publishes a battery reading taken at least `cfg.settle`
+/// after `since` (Unix seconds). A reading without `UpdateTime` counts as fresh.
+fn fresh_snapshot(
+    battery: &mut dyn BatterySource,
+    since: u64,
+    cfg: &WriteTestConfig,
+    cancel: &AtomicBool,
+    sleep: &mut dyn FnMut(Duration),
+) -> Fresh {
+    let wanted = since + cfg.settle.as_secs();
+    let mut waited = Duration::ZERO;
+    loop {
+        let s = match battery.snapshot() {
+            Ok(s) => s,
+            Err(e) => return Fresh::Failed(format!("battery: {e}")),
+        };
+        if s.update_time.is_none_or(|t| t >= wanted) {
+            return Fresh::Got(s);
+        }
+        if waited >= cfg.refresh_timeout {
+            return Fresh::Stale;
+        }
+        if !settle(POLL, cancel, sleep) {
+            return Fresh::Cancelled;
+        }
+        waited += POLL;
     }
 }
 
@@ -90,6 +142,7 @@ fn test_one(
     cfg: &WriteTestConfig,
     cancel: &AtomicBool,
     sleep: &mut dyn FnMut(Duration),
+    now: &dyn Fn() -> u64,
 ) -> Outcome {
     let done = |verdict, before, after| Outcome { verdict, before, after, stop: false };
     let key = match FourCC::new(c.key) {
@@ -114,6 +167,7 @@ fn test_one(
     }
 
     let mut guard = RestoreGuard::new(smc);
+    let written_at = now();
     let mut verdict = match guard.write_tracked(key, c.on) {
         Err(SmcError::NotPrivileged) => Some(Verdict::Blocked),
         Err(e) => Some(Verdict::WriteFailed(e.to_string())),
@@ -138,19 +192,29 @@ fn test_one(
             verdict = Some(Verdict::CannotVerify("cancelled".into()));
         }
     }
+    if verdict.is_none() && c.role == Role::Light {
+        // Only the owner's eyes can verify the light.
+        verdict = Some(Verdict::WriteAccepted);
+        after = battery.snapshot().ok();
+    }
     if verdict.is_none() {
-        match battery.snapshot() {
-            Ok(a) => {
-                verdict = Some(match c.role {
+        verdict = Some(match fresh_snapshot(battery, written_at, cfg, cancel, sleep) {
+            Fresh::Got(a) => {
+                let v = match c.role {
                     Role::InhibitCharging if !a.is_charging => Verdict::Verified,
                     Role::ForceDischarge if a.amperage_ma < 0 => Verdict::Verified,
-                    Role::Light => Verdict::WriteAccepted,
                     _ => Verdict::NoEffect,
-                });
+                };
                 after = Some(a);
+                v
             }
-            Err(e) => verdict = Some(Verdict::CannotVerify(format!("battery: {e}"))),
-        }
+            Fresh::Stale => Verdict::CannotVerify("macOS did not refresh the battery reading".into()),
+            Fresh::Cancelled => {
+                cancelled = true;
+                Verdict::CannotVerify("cancelled".into())
+            }
+            Fresh::Failed(e) => Verdict::CannotVerify(e),
+        });
     }
     let failures: Vec<String> = guard
         .restore_all()
@@ -158,12 +222,16 @@ fn test_one(
         .filter_map(|(k, r)| r.err().map(|e| format!("{k}: {e}")))
         .collect();
     drop(guard);
+    let restored_at = now();
     let restore_failed = !failures.is_empty();
     if restore_failed {
         verdict = Some(Verdict::RestoreFailed(failures.join("; ")));
     } else if wrote && !cancelled {
-        // Let the battery return to its pre-test state before the next candidate.
-        settle(cfg.settle, cancel, sleep);
+        // Let the battery return to its pre-test state, and wait until macOS
+        // reports it, so the next candidate's "before" reading is accurate.
+        if settle(cfg.settle, cancel, sleep) && c.role != Role::Light {
+            let _ = fresh_snapshot(battery, restored_at, cfg, cancel, sleep);
+        }
     }
     Outcome {
         verdict: verdict.expect("verdict set"),
@@ -181,13 +249,14 @@ pub fn run_write_tests(
     cfg: &WriteTestConfig,
     cancel: &AtomicBool,
     sleep: &mut dyn FnMut(Duration),
+    now: &dyn Fn() -> u64,
 ) -> Vec<WriteResult> {
     let mut results = Vec::new();
     for c in CANDIDATES {
         if cancel.load(Ordering::SeqCst) {
             break;
         }
-        let o = test_one(c, smc, battery, cfg, cancel, sleep);
+        let o = test_one(c, smc, battery, cfg, cancel, sleep, now);
         results.push(WriteResult {
             backend: c.backend.to_string(),
             key: c.key.to_string(),
@@ -225,16 +294,17 @@ mod tests {
             amperage_ma: amp,
             temperature_c: 30.0,
             cycle_count: 1,
+            update_time: None,
         }
     }
 
     fn cfg() -> WriteTestConfig {
-        WriteTestConfig { settle: Duration::from_secs(1), min_discharge_percent: 20 }
+        WriteTestConfig { settle: Duration::from_secs(1), ..Default::default() }
     }
 
     fn run(smc: &FakeSmc, battery: &mut FakeBattery) -> Vec<WriteResult> {
         let cancel = AtomicBool::new(false);
-        run_write_tests(&mut smc.clone(), battery, &cfg(), &cancel, &mut |_| {})
+        run_write_tests(&mut smc.clone(), battery, &cfg(), &cancel, &mut |_| {}, &|| 0)
     }
 
     fn verdict<'a>(r: &'a [WriteResult], key: &str) -> &'a Verdict {
@@ -333,7 +403,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let r = run_write_tests(&mut smc.clone(), &mut b, &cfg(), &cancel, &mut |_| {
             cancel.store(true, Ordering::SeqCst)
-        });
+        }, &|| 0);
         assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
         assert_eq!(r.last().unwrap().key, "CHTE");
         assert!(smc.writes().iter().all(|(k, _)| k != "ACLC"));
@@ -366,7 +436,7 @@ mod tests {
         });
         let cancel = AtomicBool::new(false);
         let mut total = Duration::ZERO;
-        run_write_tests(&mut smc.clone(), &mut b, &cfg(), &cancel, &mut |d| total += d);
+        run_write_tests(&mut smc.clone(), &mut b, &cfg(), &cancel, &mut |d| total += d, &|| 0);
         assert_eq!(total, Duration::from_secs(2));
     }
 
@@ -381,5 +451,64 @@ mod tests {
         assert!(matches!(&r.last().unwrap().verdict, Verdict::RestoreFailed(m) if m.contains("00000000")));
         assert!(smc.writes().iter().all(|(k, _)| k != "ACLC"));
         assert!(any_restore_failed(&r));
+    }
+
+    /// A battery whose readings only refresh every 60 virtual seconds, driven
+    /// by a virtual millisecond clock that `sleep` advances.
+    fn slow_refresh(smc: &FakeSmc, clock: std::rc::Rc<std::cell::Cell<u64>>) -> FakeBattery {
+        let s = smc.clone();
+        let mut published = (0u64, snap(70, true, true, 1500));
+        FakeBattery::new(move || {
+            let t = clock.get() / 1000 / 60 * 60;
+            if t != published.0 {
+                let live = if s.value("CHTE") == Some(vec![1, 0, 0, 0]) {
+                    snap(70, false, true, 0)
+                } else {
+                    snap(70, true, true, 1500)
+                };
+                published = (t, live);
+            }
+            BatterySnapshot { update_time: Some(published.0), ..published.1.clone() }
+        })
+    }
+
+    #[test]
+    fn waits_for_fresh_reading_before_judging() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let clock = std::rc::Rc::new(std::cell::Cell::new(10_000u64));
+        let mut b = slow_refresh(&smc, clock.clone());
+        let cfg = WriteTestConfig { settle: Duration::from_secs(15), ..Default::default() };
+        let c2 = clock.clone();
+        let r = run_write_tests(
+            &mut smc.clone(),
+            &mut b,
+            &cfg,
+            &AtomicBool::new(false),
+            &mut |d| clock.set(clock.get() + d.as_millis() as u64),
+            &move || c2.get() / 1000,
+        );
+        assert_eq!(verdict(&r, "CHTE"), &Verdict::Verified);
+        assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn stale_reading_cannot_verify() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| BatterySnapshot { update_time: Some(0), ..snap(70, true, true, 1500) });
+        let cfg = WriteTestConfig { settle: Duration::from_secs(1), refresh_timeout: Duration::from_secs(3), ..Default::default() };
+        let r = run_write_tests(&mut smc.clone(), &mut b, &cfg, &AtomicBool::new(false), &mut |_| {}, &|| 100);
+        assert!(matches!(verdict(&r, "CHTE"), Verdict::CannotVerify(m) if m.contains("refresh")));
+        assert_eq!(smc.value("CHTE"), Some(vec![0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn inhibit_skipped_above_ceiling() {
+        let smc = FakeSmc::new();
+        smc.insert("CHTE", "ui32", &[0, 0, 0, 0], WriteMode::Accept);
+        let mut b = FakeBattery::new(|| snap(98, true, true, 1400));
+        assert!(matches!(verdict(&run(&smc, &mut b), "CHTE"), Verdict::CannotVerify(m) if m.contains("95%")));
+        assert!(smc.writes().is_empty());
     }
 }
