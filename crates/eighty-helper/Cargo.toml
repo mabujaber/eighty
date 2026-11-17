@@ -1,0 +1,12 @@
+[package]
+name = "eighty-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eighty-hw = { path = "../eighty-hw" }
+eighty-core = { path = "../eighty-core" }
+
+[dev-dependencies]
+eighty-hw = { path = "../eighty-hw", features = ["fake"] }

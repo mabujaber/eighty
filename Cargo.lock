@@ -182,6 +182,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eighty-helper"
+version = "0.1.0"
+dependencies = [
+ "eighty-core",
+ "eighty-hw",
+]
+
+[[package]]
 name = "eighty-hw"
 version = "0.1.0"
 dependencies = [
