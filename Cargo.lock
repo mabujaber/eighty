@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eighty-cli"
+version = "0.1.0"
+dependencies = [
+ "eighty-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "eighty-core"
 version = "0.1.0"
 dependencies = [
@@ -187,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "eighty-core",
  "eighty-hw",
+ "libc",
  "tempfile",
  "toml",
 ]

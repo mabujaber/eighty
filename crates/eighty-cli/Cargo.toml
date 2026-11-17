@@ -1,0 +1,19 @@
+[package]
+name = "eighty-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "eighty_cli"
+
+[[bin]]
+name = "eighty"
+path = "src/main.rs"
+
+[dependencies]
+eighty-core = { path = "../eighty-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
