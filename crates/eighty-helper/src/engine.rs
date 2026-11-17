@@ -2,10 +2,10 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use eighty_core::config::Config;
+use eighty_core::config::{Config, Settings};
 use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
-use eighty_core::proto::{Health, Request, Response, Status};
-use eighty_core::TICK_SECS;
+use eighty_core::proto::{DoctorReport, Health, Request, Response, Status};
+use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
 use eighty_hw::smc::SmcIo;
 
@@ -36,7 +36,6 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     smc: S,
     battery: B,
     system: Y,
-    #[allow(dead_code)] // used for saving config changes (Task 7)
     store: Store,
     clock: Box<dyn FnMut() -> u64>,
     config: Config,
@@ -53,21 +52,19 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     snapshot: Option<BatterySnapshot>,
     /// Outputs last applied successfully; the restore state after a restore.
     prev: Outputs,
-    /// When charging outputs last changed, and to what; judged by the watchdog (Task 7).
+    /// When charging outputs last changed, and to what; judged by the watchdog.
     pending: Option<(u64, Outputs)>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
     pub fn start(d: Deps<S, B, Y>) -> Engine<S, B, Y> {
-        let Deps { mut smc, battery, mut system, store, clock } = d;
+        let Deps { smc, battery, system, store, clock } = d;
         let (config, config_warning) = store.load();
         if let Some(w) = &config_warning {
             log(w);
         }
-        let limiters = if config.accept_other_limiters { Vec::new() } else { system.other_limiters() };
-        // With another limiter present, not even detect's write-back may happen.
-        let detection = if limiters.is_empty() { detect(&mut smc) } else { detect_read_only(&mut smc) };
-        log(&format!("mode {:?}, light {}, keys {:?}", detection.mode, detection.light, detection.keys));
+        // Placeholder until `bring_up` detects the keys; nothing reads it before then.
+        let detection = Detection { mode: ControlMode::Unsupported, light: false, keys: Vec::new() };
         let control = SmcControl::new(&detection);
         let mut e = Engine {
             smc,
@@ -88,16 +85,42 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             prev: Outputs::default(),
             pending: None,
         };
-        if !limiters.is_empty() {
-            e.set_health(Health::OtherLimiters(limiters));
-        } else if e.detection.mode == ControlMode::Unsupported {
-            e.set_health(Health::Unsupported);
-        } else {
-            // Crash recovery: a previous run may have left charging inhibited.
-            e.restore();
-        }
+        e.bring_up();
         e.tick();
         e
+    }
+
+    /// Check for other limiters, detect the keys, set health, and restore if the keys
+    /// are ours. Returns true if the restore ran and every key was written.
+    fn bring_up(&mut self) -> bool {
+        let limiters =
+            if self.config.accept_other_limiters { Vec::new() } else { self.system.other_limiters() };
+        // With another limiter present, not even detect's write-back may happen.
+        self.detection =
+            if limiters.is_empty() { detect(&mut self.smc) } else { detect_read_only(&mut self.smc) };
+        let d = &self.detection;
+        log(&format!("mode {:?}, light {}, keys {:?}", d.mode, d.light, d.keys));
+        self.control = SmcControl::new(&self.detection);
+        if !limiters.is_empty() {
+            self.set_health(Health::OtherLimiters(limiters));
+            false
+        } else if self.detection.mode == ControlMode::Unsupported {
+            self.set_health(Health::Unsupported);
+            false
+        } else {
+            self.set_health(Health::Ok);
+            // Crash recovery (or fault recovery): charging may have been left inhibited.
+            self.restore();
+            self.restore_failures.is_empty()
+        }
+    }
+
+    /// Re-run startup minus the config load; a clean restore also drops any override.
+    fn clear_fault(&mut self) {
+        if self.bring_up() {
+            self.override_ = Override::None;
+        }
+        self.tick();
     }
 
     /// Handle one event. Returns false once the engine has shut down.
@@ -163,8 +186,106 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         }
     }
 
-    fn request(&mut self, _uid: u32, _req: Request) -> Response {
-        Response::Error("not implemented".into())
+    fn request(&mut self, uid: u32, req: Request) -> Response {
+        if req.is_mutating() && uid != 0 && Some(uid) != self.system.console_uid() {
+            return Response::Error(
+                "permission denied: only an admin (sudo) or the logged-in user can change eighty".into(),
+            );
+        }
+        match req {
+            Request::Status => return Response::Status(self.status()),
+            Request::Doctor => {
+                return Response::Doctor(Box::new(DoctorReport {
+                    machine: self.system.machine(),
+                    keys: self.detection.keys.clone(),
+                    status: self.status(),
+                    other_limiters: self.system.other_limiters(),
+                }))
+            }
+            Request::SetLimits { upper, lower } => {
+                let settings = match self.config.settings.with_limits(upper, lower) {
+                    Ok(s) => s,
+                    Err(m) => return Response::Error(m),
+                };
+                if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
+                    return Response::Error(m);
+                }
+                self.tick();
+            }
+            Request::SetAutoDischarge { on } => {
+                let s = Settings { auto_discharge: on, ..self.config.settings };
+                let settings = match s.with_limits(s.upper, Some(s.lower)) {
+                    Ok(s) => s,
+                    Err(m) => return Response::Error(m),
+                };
+                if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
+                    return Response::Error(m);
+                }
+                self.tick();
+            }
+            Request::ChargeFull => {
+                self.override_ = Override::FullCharge;
+                self.tick();
+            }
+            Request::ChargeAuto => {
+                self.override_ = Override::None;
+                self.tick();
+            }
+            Request::DischargeTo { percent } => {
+                if !(HARD_FLOOR..=100).contains(&percent) {
+                    return Response::Error("discharge target must be between 10 and 100".into());
+                }
+                if self.detection.mode == ControlMode::Unsupported {
+                    return Response::Error(Health::Unsupported.message());
+                }
+                if !self.health.is_ok() {
+                    return Response::Error(self.health.message());
+                }
+                self.override_ = Override::DischargeTo(percent);
+                self.tick();
+            }
+            Request::ClearFault => self.clear_fault(),
+            Request::AcceptOtherLimiters => {
+                if let Err(m) = self.save(Config { accept_other_limiters: true, ..self.config.clone() }) {
+                    return Response::Error(m);
+                }
+                self.clear_fault();
+            }
+        }
+        Response::Status(self.status())
+    }
+
+    /// Persist `c` and adopt it; on failure nothing changes, so memory matches disk.
+    fn save(&mut self, c: Config) -> Result<(), String> {
+        self.store.save(&c).map_err(|e| format!("couldn't save config: {e}"))?;
+        // The file on disk is now valid, so a warning about ignoring it no longer applies.
+        self.config_warning = None;
+        self.config = c;
+        Ok(())
+    }
+
+    /// Judge whether the last charging change took effect, once a reading is fresh enough.
+    /// Returns the fault if it did not.
+    fn watchdog(&mut self, snap: &BatterySnapshot) -> Option<Health> {
+        let (t, o) = self.pending?;
+        // No timestamp, or a reading from before the change settled: wait for a newer one.
+        let fresh = snap.update_time.is_some_and(|u| u >= t + SETTLE_SECS);
+        if !fresh {
+            return None;
+        }
+        self.pending = None;
+        if !snap.external_connected {
+            // Unplugged: the battery discharges whatever we wrote, so there is nothing to judge.
+            return None;
+        }
+        let what = if o.discharge && snap.amperage_ma >= 0 {
+            "CHIE (run from battery)"
+        } else if o.inhibit && !o.discharge && snap.is_charging && snap.amperage_ma > 50 {
+            "CHTE (stop charging)"
+        } else {
+            return None;
+        };
+        Some(Health::NotEffective { what: what.into() })
     }
 
     /// Health states in which the engine keeps controlling the keys.
@@ -221,6 +342,14 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             if restore {
                 self.restore();
             }
+            self.set_activity(Activity::Paused);
+            return;
+        }
+
+        // Health is Ok here: may_control passed and BatteryUnreadable was just cleared.
+        if let Some(fault) = self.watchdog(&snap) {
+            self.set_health(fault);
+            self.restore();
             self.set_activity(Activity::Paused);
             return;
         }
@@ -341,7 +470,7 @@ mod tests {
     use super::*;
     use crate::system::FakeSystem;
     use eighty_core::policy::{Activity, ControlMode};
-    use eighty_core::proto::Health;
+    use eighty_core::proto::{Health, KeyState};
     use eighty_hw::battery::fake::FakeBattery;
     use eighty_hw::battery::{BatteryError, BatterySnapshot};
     use eighty_hw::smc::fake::{FakeSmc, WriteMode};
@@ -576,11 +705,108 @@ mod tests {
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
     }
-    #[test] fn requests_are_not_implemented_yet() {
-        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+
+    #[test] fn watchdog_flags_ineffective_inhibit() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();                                  // writes CHTE at t=1000
+        r.set(80, true, true, 1200, Some(1010)); e.handle(Event::Tick); // too fresh: no verdict
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
+        assert_eq!(r.smc.value("CHTE"), Some(vec![0; 4]));
+    }
+    #[test] fn watchdog_accepts_effective_discharge() {
+        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
         let mut e = r.engine();
-        let (tx, rx) = std::sync::mpsc::channel();
-        assert!(e.handle(Event::Request { uid: 0, req: eighty_core::proto::Request::Status, reply: tx }));
-        assert_eq!(rx.try_recv().unwrap(), Response::Error("not implemented".into()));
+        r.set(81, false, true, -410, Some(1030)); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+    }
+    #[test] fn watchdog_waits_on_missing_update_time() {
+        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, None);
+        let mut e = r.engine(); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+    }
+    fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
+        let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
+    }
+    #[test] fn non_console_user_cannot_change_but_can_read() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        assert!(matches!(req(&mut e, 502, Request::ChargeFull), Response::Error(m) if m.starts_with("permission denied")));
+        assert!(matches!(req(&mut e, 502, Request::Status), Response::Status(_)));
+        assert!(matches!(req(&mut e, 0, Request::ChargeFull), Response::Status(_)));
+    }
+    #[test] fn set_limits_persists_and_applies() {
+        let r = Rig::hold(); r.set(72, true, true, 1200, Some(900)); let mut e = r.engine();
+        let Response::Status(s) = req(&mut e, 501, Request::SetLimits { upper: 70, lower: None }) else { panic!() };
+        assert_eq!(s.settings.lower, 65);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        assert_eq!(r.store.load().0.settings.upper, 70);
+        assert!(matches!(req(&mut e, 501, Request::SetLimits { upper: 10, lower: None }), Response::Error(_)));
+    }
+    #[test] fn discharge_below_floor_rejected() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        assert!(matches!(req(&mut e, 501, Request::DischargeTo { percent: 9 }), Response::Error(_)));
+    }
+    #[test] fn clear_fault_retries() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900)); let mut e = r.engine();
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
+        req(&mut e, 501, Request::ClearFault);
+        assert_eq!(e.status().health, Health::Ok);
+    }
+    #[test] fn doctor_lists_keys_and_limiters() {
+        let r = Rig::cycle(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        let Response::Doctor(d) = req(&mut e, 502, Request::Doctor) else { panic!() };
+        assert!(d.keys.contains(&("CHTE".into(), KeyState::Missing)));
+    }
+
+    // Added beyond the brief (Task 7).
+
+    #[test] fn watchdog_flags_ineffective_discharge() {
+        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.set(81, true, true, 500, Some(1020)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHIE")));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(e.status().activity, Activity::Paused);
+    }
+    #[test] fn watchdog_does_not_judge_unplugged_reading() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();
+        r.set(80, true, false, 1200, Some(1030)); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+    }
+    #[test] fn clear_fault_drops_override_after_clean_restore() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900)); let mut e = r.engine();
+        req(&mut e, 501, Request::ChargeFull);
+        assert_eq!(e.status().override_, Override::FullCharge);
+        let Response::Status(s) = req(&mut e, 501, Request::ClearFault) else { panic!() };
+        assert_eq!(s.override_, Override::None);
+    }
+    #[test] fn accept_other_limiters_persists_and_unblocks() {
+        let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(80, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        assert!(r.smc.writes().is_empty());
+        let Response::Status(s) = req(&mut e, 0, Request::AcceptOtherLimiters) else { panic!() };
+        assert_eq!(s.health, Health::Ok);
+        assert!(r.store.load().0.accept_other_limiters);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        let Response::Doctor(d) = req(&mut e, 0, Request::Doctor) else { panic!() };
+        assert_eq!(d.other_limiters, vec!["battery".to_string()]);
+    }
+    #[test] fn discharge_refused_while_unhealthy() {
+        let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(80, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        assert!(matches!(req(&mut e, 501, Request::DischargeTo { percent: 50 }), Response::Error(m) if m.contains("another charge limiter")));
+        assert_eq!(e.status().override_, Override::None);
+    }
+    #[test] fn failed_save_changes_nothing() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        std::fs::create_dir(r._dir.path().join("config.toml.tmp")).unwrap(); // makes save fail
+        assert!(matches!(req(&mut e, 501, Request::SetAutoDischarge { on: false }), Response::Error(m) if m.starts_with("couldn't save config")));
+        assert!(e.status().settings.auto_discharge);
+        assert!(matches!(req(&mut e, 501, Request::SetLimits { upper: 60, lower: None }), Response::Error(_)));
+        assert_eq!(e.status().settings.upper, 80);
     }
 }
