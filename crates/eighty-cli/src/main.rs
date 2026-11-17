@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use eighty_cli::client::{call, ClientError};
 use eighty_cli::render::{render_doctor, render_status};
 use eighty_core::paths::{LOG_PATH, SOCKET_PATH};
-use eighty_core::proto::{Request, Response};
+use eighty_core::proto::{Request, Response, Status};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::ExitCode;
@@ -78,19 +78,39 @@ fn send(req: Request) -> Result<Response, ExitCode> {
     })
 }
 
-fn expect_status(req: Request, json: bool) -> ExitCode {
+fn print_json<T: serde::Serialize>(v: &T) -> Result<(), ExitCode> {
+    match serde_json::to_string_pretty(v) {
+        Ok(t) => {
+            println!("{t}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("eighty: can't encode JSON: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Send `req`, print the status reply, and exit with `code(status)` on success.
+fn run_status(req: Request, json: bool, code: fn(&Status) -> u8) -> ExitCode {
     match send(req) {
         Ok(Response::Status(s)) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+                if let Err(c) = print_json(&s) {
+                    return c;
+                }
             } else {
                 print!("{}", render_status(&s));
             }
-            ExitCode::SUCCESS
+            ExitCode::from(code(&s))
         }
         Ok(other) => unexpected(other),
         Err(c) => c,
     }
+}
+
+fn expect_status(req: Request) -> ExitCode {
+    run_status(req, false, |_| 0)
 }
 
 fn unexpected(r: Response) -> ExitCode {
@@ -102,22 +122,7 @@ fn unexpected(r: Response) -> ExitCode {
 }
 
 fn status(json: bool) -> ExitCode {
-    match send(Request::Status) {
-        Ok(Response::Status(s)) => {
-            if json {
-                println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
-            } else {
-                print!("{}", render_status(&s));
-            }
-            if s.health.is_ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(3)
-            }
-        }
-        Ok(other) => unexpected(other),
-        Err(c) => c,
-    }
+    run_status(Request::Status, json, |s| if s.health.is_ok() { 0 } else { 3 })
 }
 
 fn doctor(json: bool, retry: bool, accept: bool) -> ExitCode {
@@ -133,7 +138,9 @@ fn doctor(json: bool, retry: bool, accept: bool) -> ExitCode {
     match send(Request::Doctor) {
         Ok(Response::Doctor(d)) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
+                if let Err(c) = print_json(&d) {
+                    return c;
+                }
             } else {
                 print!("{}", render_doctor(&d));
             }
@@ -145,8 +152,9 @@ fn doctor(json: bool, retry: bool, accept: bool) -> ExitCode {
 }
 
 fn logs(n: usize) -> ExitCode {
-    match std::fs::read_to_string(LOG_PATH) {
-        Ok(text) => {
+    match std::fs::read(LOG_PATH) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
             let all: Vec<&str> = text.lines().collect();
             for l in &all[all.len().saturating_sub(n)..] {
                 println!("{l}");
@@ -172,13 +180,13 @@ fn not_implemented() -> ExitCode {
 fn main() -> ExitCode {
     match Cli::parse().cmd {
         Cmd::Status { json } => status(json),
-        Cmd::Limit { upper, lower } => expect_status(Request::SetLimits { upper, lower }, false),
+        Cmd::Limit { upper, lower } => expect_status(Request::SetLimits { upper, lower }),
         Cmd::AutoDischarge { state } => {
-            expect_status(Request::SetAutoDischarge { on: matches!(state, OnOff::On) }, false)
+            expect_status(Request::SetAutoDischarge { on: matches!(state, OnOff::On) })
         }
-        Cmd::Charge { mode: ChargeMode::Full } => expect_status(Request::ChargeFull, false),
-        Cmd::Charge { mode: ChargeMode::Auto } => expect_status(Request::ChargeAuto, false),
-        Cmd::Discharge { percent } => expect_status(Request::DischargeTo { percent }, false),
+        Cmd::Charge { mode: ChargeMode::Full } => expect_status(Request::ChargeFull),
+        Cmd::Charge { mode: ChargeMode::Auto } => expect_status(Request::ChargeAuto),
+        Cmd::Discharge { percent } => expect_status(Request::DischargeTo { percent }),
         Cmd::Doctor { json, retry, accept_other_limiters } => doctor(json, retry, accept_other_limiters),
         Cmd::Logs { lines } => logs(lines),
         Cmd::Install | Cmd::Uninstall { .. } => not_implemented(),

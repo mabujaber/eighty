@@ -184,6 +184,33 @@ mod tests {
             other_limiters: vec![],
         });
         assert!(out.contains("CHTE  missing") && out.contains("CHIE  usable") && out.contains("Mode      cycle"));
-        assert!(out.contains("Other limiters  none") || out.contains("none"));
+        assert!(out.contains("Limiters  none\n"));
+    }
+
+    #[test]
+    fn doctor_details() {
+        let out = render_doctor(&DoctorReport {
+            machine: MachineInfo {
+                model: "Mac14,2".into(),
+                chip: "Apple M2".into(),
+                macos: "26.1".into(),
+                build: "25B78".into(),
+            },
+            keys: vec![
+                ("CHTE".into(), KeyState::WrongSize { size: 2 }),
+                ("CHIE".into(), KeyState::Error("boom".into())),
+                ("ACLC".into(), KeyState::Blocked),
+            ],
+            status: Status { health: Health::Unsupported, ..st() },
+            other_limiters: vec!["AlDente".into(), "BCLM".into()],
+        });
+        assert!(out.contains("Machine   Mac14,2 · Apple M2\n"));
+        assert!(out.contains("macOS     26.1 (25B78)\n"));
+        assert!(out.contains("Helper    0.1.0\n"));
+        assert!(out.contains("  CHTE  wrong size (2 bytes)\n"));
+        assert!(out.contains("  CHIE  error: boom\n"));
+        assert!(out.contains("  ACLC  blocked\n"));
+        assert!(out.contains("Limiters  AlDente, BCLM\n"));
+        assert!(out.contains("Health    this Mac has no SMC key"));
     }
 }

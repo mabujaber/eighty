@@ -177,6 +177,7 @@ dependencies = [
  "clap",
  "eighty-core",
  "eighty-hw",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
