@@ -79,7 +79,9 @@ extern "C" fn system_power(refcon: *mut c_void, _service: IoObject, message_type
 }
 
 fn allow(root_port: IoConnect, id: isize) {
-    // SAFETY: plain IOKit call on the root port returned by IORegisterForSystemPower.
+    // SAFETY: `root_port` comes from `PowerCtx`, which `run` sets to the non-zero
+    // connection IORegisterForSystemPower returned before the run loop (and so any
+    // callback) runs. It is never deregistered or closed, so it is still valid here.
     let kr = unsafe { IOAllowPowerChange(root_port, id) };
     if kr != 0 {
         log(&format!("IOAllowPowerChange failed: IOKit error 0x{kr:08x}"));
@@ -88,11 +90,8 @@ fn allow(root_port: IoConnect, id: isize) {
 
 /// Start a thread running a CFRunLoop that sends `PowerChanged`, `WillSleep` and
 /// `DidWake` to the engine. A failed registration is logged; ticks still run.
-pub fn spawn_os_events(tx: Sender<Event>) {
-    std::thread::Builder::new()
-        .name("os-events".into())
-        .spawn(move || run(tx))
-        .expect("spawning os-events thread");
+pub fn spawn_os_events(tx: Sender<Event>) -> std::io::Result<()> {
+    std::thread::Builder::new().name("os-events".into()).spawn(move || run(tx)).map(|_| ())
 }
 
 fn run(tx: Sender<Event>) {

@@ -60,7 +60,13 @@ fn remove_socket(path: &Path) {
 }
 
 /// After an engine panic: put the keys back so charging is not left inhibited.
+///
+/// This deliberately ignores the engine's `may_touch_keys` gate (which keeps it off
+/// the keys while another limiter is present or the mode is unsupported): the engine's
+/// state is gone, so we err toward allowing charging. `restore_all` only writes keys
+/// that exist, and only to the restore state.
 fn emergency_restore() {
+    log("engine thread panicked: restoring SMC keys and exiting");
     if let Err(e) = restore(log) {
         log(&format!("emergency restore failed: {e:#}"));
     }
@@ -71,6 +77,13 @@ fn run_helper() -> anyhow::Result<u8> {
     require_root("running the helper")?;
     log(&format!("eighty-helper {} starting", env!("CARGO_PKG_VERSION")));
     let (tx, rx) = mpsc::channel::<Event>();
+    // Install the handler before the engine can write any key. A signal during
+    // startup queues Shutdown, which the engine handles (and restores) right after start.
+    let signal_tx = tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = signal_tx.send(Event::Shutdown);
+    })
+    .context("installing signal handler")?;
     let (started_tx, started_rx) = mpsc::channel::<Result<(), String>>();
     // The engine owns the SMC connection, so open it on the engine thread.
     let engine = std::thread::Builder::new()
@@ -105,32 +118,33 @@ fn run_helper() -> anyhow::Result<u8> {
         // The sender dropped without a message: the engine panicked while starting.
         Err(_) => {
             let _ = engine.join();
-            return Ok(engine_panicked());
+            emergency_restore();
+            return Ok(1);
         }
     }
 
     let socket = Path::new(SOCKET_PATH);
-    if let Err(e) = connect(socket, &tx) {
+    let connected = connect(socket, &tx);
+    if connected.is_err() {
         // The engine may be holding charge inhibited: shut it down so it restores.
         let _ = tx.send(Event::Shutdown);
-        if engine.join().is_err() {
-            engine_panicked();
-        }
-        remove_socket(socket);
-        return Err(e);
     }
-
-    match engine.join() {
+    let code = match engine.join() {
         Ok(()) => {
             log("eighty-helper stopped");
-            remove_socket(socket);
-            Ok(0)
+            0
         }
-        Err(_) => Ok(engine_panicked()),
-    }
+        // Exit 1 so launchd restarts the helper.
+        Err(_) => {
+            emergency_restore();
+            1
+        }
+    };
+    remove_socket(socket);
+    connected.map(|()| code)
 }
 
-/// Wire the IPC socket, OS power events and termination signals to the engine.
+/// Wire the IPC socket and OS power events to the engine.
 fn connect(socket: &Path, tx: &mpsc::Sender<Event>) -> anyhow::Result<()> {
     let listener = ipc::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
     let ipc_tx = tx.clone();
@@ -138,21 +152,8 @@ fn connect(socket: &Path, tx: &mpsc::Sender<Event>) -> anyhow::Result<()> {
         .name("ipc".into())
         .spawn(move || ipc::serve(listener, ipc_tx))
         .context("spawning ipc thread")?;
-    spawn_os_events(tx.clone());
-    let signal_tx = tx.clone();
-    ctrlc::set_handler(move || {
-        let _ = signal_tx.send(Event::Shutdown);
-    })
-    .context("installing signal handler")?;
+    spawn_os_events(tx.clone()).context("spawning os-events thread")?;
     Ok(())
-}
-
-/// Returns exit code 1 so launchd restarts the helper.
-fn engine_panicked() -> u8 {
-    log("engine thread panicked: restoring SMC keys and exiting");
-    emergency_restore();
-    remove_socket(Path::new(SOCKET_PATH));
-    1
 }
 
 fn main() -> ExitCode {
