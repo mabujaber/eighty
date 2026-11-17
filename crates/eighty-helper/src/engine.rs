@@ -372,6 +372,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             // may still report unplugged for a moment, so an unplugged reading is trusted
             // again only once it is newer than the stop (or, without a timestamp, a full
             // tick later); a plugged-in reading is always trusted.
+            // Known limitation: a discharge started while unplugged (a `DischargeTo`
+            // override) latches "unplugged", and plugging in mid-discharge can't be seen
+            // while CHIE=08 hides the adapter. Status says on battery and the watchdog
+            // skips until the discharge stops (target, floor, lid or sleep). CHTE/CHIE
+            // are decided the same either way; only the status and `charge full`
+            // ("plug in first") are wrong meanwhile.
             if self.prev.discharge {
                 s.external_connected |= self.trusted_external;
             } else if let Some(stopped) = self.discharge_stopped {
