@@ -382,7 +382,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             // stops at the target or the floor (decided by percent). After CHIE=00 macOS
             // may still report unplugged for a moment, so an unplugged reading is trusted
             // again only once it is newer than the stop (or, without a timestamp, a full
-            // tick later); a plugged-in reading is always trusted.
+            // tick later), and in any case from three ticks after the stop on; a
+            // plugged-in reading is always trusted.
             // Known limitation: a discharge started while unplugged (a `DischargeTo`
             // override) latches "unplugged", and plugging in mid-discharge can't be seen
             // while CHIE=08 hides the adapter. Status says on battery and the watchdog
@@ -392,10 +393,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             if self.prev.discharge {
                 s.external_connected |= self.trusted_external;
             } else if let Some(stopped) = self.discharge_stopped {
-                let fresh = match s.update_time {
-                    Some(u) => u > stopped,
-                    None => (self.clock)() >= stopped + TICK_SECS,
-                };
+                let now = (self.clock)();
+                // Bounded: a frozen update_time must not keep the window open for good.
+                let fresh = now >= stopped + 3 * TICK_SECS
+                    || match s.update_time {
+                        Some(u) => u > stopped,
+                        None => now >= stopped + TICK_SECS,
+                    };
                 if s.external_connected || fresh {
                     self.discharge_stopped = None;
                     self.trusted_external = s.external_connected;
@@ -1177,6 +1181,18 @@ mod tests {
         r.clock.set(2000 + TICK_SECS);
         e.handle(Event::Tick);
         assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+    }
+    #[test] fn frozen_update_time_does_not_distrust_forever() {
+        let (r, mut e) = stopped_discharge_rig();
+        // update_time never moves past the stop: still distrusted just before the cap...
+        r.clock.set(2000 + 3 * TICK_SECS - 1);
+        r.set(80, false, false, 0, Some(1990)); e.handle(Event::Tick);
+        assert!(e.status().external);
+        // ...and trusted from three ticks after the stop on.
+        r.clock.set(2000 + 3 * TICK_SECS);
+        e.handle(Event::Tick);
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+        assert_eq!(e.discharge_stopped, None);
     }
     #[test] fn lagging_unplugged_reading_after_startup_restore_is_not_trusted() {
         // A crash left CHIE=08; the startup restore clears it at t=1000, but macOS still
