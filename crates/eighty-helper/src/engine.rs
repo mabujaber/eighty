@@ -153,12 +153,14 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         match ev {
             Event::Tick | Event::PowerChanged => self.tick(),
             Event::DidWake => {
+                log("wake: macOS woke");
                 self.sleeping = false;
                 let now = (self.clock)();
                 self.restart_settle(Some(now));
                 self.tick();
             }
             Event::WillSleep(ack) => {
+                log("sleep: macOS is going to sleep");
                 self.sleeping = true;
                 self.tick();
                 let _ = ack.send(());
