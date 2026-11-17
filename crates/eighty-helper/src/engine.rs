@@ -47,6 +47,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
     /// floor while the Mac is asleep.
     sleeping: bool,
+    /// Set when a conflict found our discharge running and stopping it failed;
+    /// cleared by the next restore, which writes `CHIE=00` itself.
+    discharge_warning: Option<String>,
     /// One warning per key the last restore failed to write; empty once a restore
     /// (or a successful apply) puts the keys back in a known state.
     restore_failures: Vec<String>,
@@ -88,6 +91,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             light_warning: None,
             sleep_warning: None,
             sleeping: false,
+            discharge_warning: None,
             restore_failures: Vec::new(),
             detection,
             control,
@@ -202,6 +206,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 .iter()
                 .chain(&self.light_warning)
                 .chain(&self.sleep_warning)
+                .chain(&self.discharge_warning)
                 .chain(&self.restore_failures)
                 .cloned()
                 .collect(),
@@ -386,12 +391,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         }
 
         if let Err(h) = self.control.check_unchanged(&mut self.smc) {
-            // A conflict means something else owns the keys: stop without fighting it.
+            // A conflict means something else owns the keys: stop without fighting it,
+            // except that our own discharge must not outlive our control of the floor.
             // A failed read is treated like a failed write: restore.
             let restore = matches!(h, Health::WriteFailed { .. });
+            let conflict = matches!(h, Health::Conflict { .. });
             self.set_health(h);
             if restore {
                 self.restore();
+            } else if conflict {
+                self.stop_our_discharge();
             }
             self.set_activity(Activity::Paused);
             return;
@@ -469,6 +478,25 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         self.set_activity(d.activity);
     }
 
+    /// On entering a conflict: stop our discharge if `CHIE` still holds our `08`;
+    /// every other key stays as the other writer left it.
+    fn stop_our_discharge(&mut self) {
+        match self.control.stop_discharge_if_ours(&mut self.smc) {
+            Ok(true) => {
+                log("conflict: stopped our discharge (CHIE=00); other keys left as found");
+                self.prev.discharge = false;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                let w = format!(
+                    "couldn't stop discharging (CHIE): {err}; the battery may drain while plugged in"
+                );
+                log(&w);
+                self.discharge_warning = Some(w);
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         if !self.may_touch_keys() {
             log("shutting down; keys left untouched");
@@ -494,6 +522,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             })
             .collect();
         self.set_restore_failures(failures);
+        self.discharge_warning = None;
         self.prev = Outputs::default();
         self.restart_settle(None);
     }
@@ -686,6 +715,45 @@ mod tests {
         e.handle(Event::Tick); e.handle(Event::Shutdown);
         assert!(matches!(e.status().health, Health::Conflict { .. }));
         assert_eq!(r.smc.writes().len(), n);
+    }
+    /// Hold rig at 85% on the charger: inhibit and discharge on (CHTE=01000000, CHIE=08).
+    fn discharging_rig() -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+        let r = Rig::hold(); r.set(85, false, true, -400, Some(900));
+        let e = r.engine();
+        assert_eq!((r.smc.value("CHTE"), r.smc.value("CHIE")), (Some(vec![1, 0, 0, 0]), Some(vec![8])));
+        (r, e)
+    }
+    #[test] fn conflict_while_discharging_stops_our_discharge() {
+        let (r, mut e) = discharging_rig();
+        let aclc = r.smc.value("ACLC");
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept); // another writer allows charging
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { ref key, .. } if key == "CHTE"));
+        assert_eq!(r.smc.writes()[n..], [("CHIE".to_string(), vec![0])]);
+        assert_eq!((r.smc.value("CHTE"), r.smc.value("CHIE"), r.smc.value("ACLC")), (Some(vec![0; 4]), Some(vec![0]), aclc));
+        assert!(!e.prev.discharge);
+        e.handle(Event::Tick); e.handle(Event::Shutdown);
+        assert_eq!(r.smc.writes().len(), n + 1);
+    }
+    #[test] fn conflict_on_chie_leaves_it_alone() {
+        let (r, mut e) = discharging_rig();
+        r.smc.insert("CHIE", "ui8 ", &[0], WriteMode::Accept); // another writer owns CHIE now
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick); e.handle(Event::Shutdown);
+        assert!(matches!(e.status().health, Health::Conflict { ref key, .. } if key == "CHIE"));
+        assert_eq!(r.smc.writes().len(), n);
+    }
+    #[test] fn conflict_failed_stop_discharge_warns() {
+        let (r, mut e) = discharging_rig();
+        r.smc.insert("CHIE", "ui8 ", &[8], WriteMode::NotPrivileged);
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept);
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick);
+        let st = e.status();
+        assert!(matches!(st.health, Health::Conflict { ref key, .. } if key == "CHTE"));
+        assert!(st.warnings.iter().any(|w| w.starts_with("couldn't stop discharging (CHIE): ") && w.ends_with("; the battery may drain while plugged in")), "{:?}", st.warnings);
+        assert_eq!((r.smc.value("CHIE"), r.smc.writes().len()), (Some(vec![8]), n));
     }
     #[test] fn write_failure_restores_and_reports() {
         let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));

@@ -152,6 +152,22 @@ impl SmcControl {
         Ok(())
     }
 
+    /// After a conflict: if we last wrote `CHIE=08` and it still reads `08`, write
+    /// `CHIE=00` so a plugged-in Mac does not drain with nothing enforcing the floor.
+    /// Writes nothing else. Returns true if it wrote.
+    pub fn stop_discharge_if_ours(&mut self, smc: &mut dyn SmcIo) -> Result<bool, SmcError> {
+        if self.last.get(CHIE).map(Vec::as_slice) != Some(&CHIE_BATTERY[..]) {
+            return Ok(false);
+        }
+        let k = fourcc(CHIE);
+        if smc.read(k)? != CHIE_BATTERY {
+            return Ok(false); // someone else owns CHIE now
+        }
+        smc.write(k, &CHIE_OFF)?;
+        self.last.insert(CHIE, CHIE_OFF.to_vec());
+        Ok(true)
+    }
+
     /// Write the restore state to the present keys and forget what we wrote.
     pub fn restore(&mut self, smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
         self.last.clear();
