@@ -80,4 +80,12 @@ mod tests {
             assert!(w.unwrap().contains("config.toml"));
         }
     }
+    #[test]
+    fn partial_settings_load_with_lower_derived() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "[settings]\nupper = 70\n").unwrap();
+        let (c, w) = Store::new(d.path().into()).load();
+        assert_eq!(c.settings, Settings { upper: 70, lower: 65, auto_discharge: true });
+        assert_eq!(w, None);
+    }
 }

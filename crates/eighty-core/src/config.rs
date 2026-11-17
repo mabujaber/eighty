@@ -2,11 +2,37 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(default)]
+#[serde(from = "RawSettings")]
 pub struct Settings {
     pub upper: u8,
     pub lower: u8,
     pub auto_discharge: bool,
+}
+
+/// Wire form of `Settings`: a missing `lower` follows `upper - 5`, other gaps use defaults.
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawSettings {
+    upper: u8,
+    lower: Option<u8>,
+    auto_discharge: bool,
+}
+
+impl Default for RawSettings {
+    fn default() -> RawSettings {
+        let d = Settings::default();
+        RawSettings { upper: d.upper, lower: None, auto_discharge: d.auto_discharge }
+    }
+}
+
+impl From<RawSettings> for Settings {
+    fn from(r: RawSettings) -> Settings {
+        Settings { upper: r.upper, lower: r.lower.unwrap_or_else(|| default_lower(r.upper)), auto_discharge: r.auto_discharge }
+    }
+}
+
+fn default_lower(upper: u8) -> u8 {
+    upper.saturating_sub(5).max(10)
 }
 
 impl Default for Settings {
@@ -31,7 +57,7 @@ impl Settings {
 
     /// Returns a copy with new limits; `lower` defaults to `upper - 5` (at least 10).
     pub fn with_limits(self, upper: u8, lower: Option<u8>) -> Result<Settings, String> {
-        let lower = lower.unwrap_or_else(|| upper.saturating_sub(5).max(10));
+        let lower = lower.unwrap_or_else(|| default_lower(upper));
         let s = Settings { upper, lower, ..self };
         s.validate()?;
         Ok(s)
@@ -66,6 +92,6 @@ mod tests {
     }
     #[test] fn partial_settings_fill_defaults() {
         let c: Config = toml::from_str("[settings]\nupper = 70\n").unwrap();
-        assert_eq!(c.settings, Settings { upper: 70, lower: 75, auto_discharge: true });
+        assert_eq!(c.settings, Settings { upper: 70, lower: 65, auto_discharge: true });
     }
 }
