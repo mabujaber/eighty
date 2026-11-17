@@ -71,6 +71,12 @@ extern "C" {
         output: *mut c_void,
         output_size: *mut usize,
     ) -> KernReturn;
+    pub fn IORegistryEntryCreateCFProperty(
+        entry: IoObject,
+        key: *const c_void,
+        allocator: *const c_void,
+        options: u32,
+    ) -> *const c_void;
     pub fn IORegistryEntryCreateCFProperties(
         entry: IoObject,
         properties: *mut *mut c_void,

@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub upper: u8,
     pub lower: u8,
@@ -62,5 +63,9 @@ mod tests {
         let c: Config = toml::from_str("[settings]\nupper = 70\nlower = 60\nauto_discharge = false\n").unwrap();
         assert_eq!(c.settings.upper, 70);
         assert_eq!(toml::from_str::<Config>("").unwrap(), Config::default());
+    }
+    #[test] fn partial_settings_fill_defaults() {
+        let c: Config = toml::from_str("[settings]\nupper = 70\n").unwrap();
+        assert_eq!(c.settings, Settings { upper: 70, lower: 75, auto_discharge: true });
     }
 }
