@@ -60,6 +60,28 @@ fn bootout() -> std::io::Result<std::process::ExitStatus> {
     Command::new(LAUNCHCTL).arg("bootout").arg(format!("system/{LABEL}")).status()
 }
 
+/// Poll until `launchctl print system/<LABEL>` fails (job gone), up to 5 s.
+fn wait_until_unloaded() -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let loaded = Command::new(LAUNCHCTL)
+            .arg("print")
+            .arg(format!("system/{LABEL}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !loaded {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn write_root_file(path: &Path, mode: u32) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("can't set mode on {}", path.display()))?;
@@ -74,12 +96,20 @@ pub fn install() -> Result<()> {
     }
     if Path::new(PLIST_PATH).exists() {
         let _ = bootout(); // may not be loaded; ignore
+        if !wait_until_unloaded() {
+            bail!("the old helper is still loaded; run `sudo launchctl bootout system/{LABEL}` and retry");
+        }
     }
     if let Some(dir) = Path::new(HELPER_INSTALL_PATH).parent() {
         fs::create_dir_all(dir).with_context(|| format!("can't create {}", dir.display()))?;
     }
-    fs::copy(&src, HELPER_INSTALL_PATH).with_context(|| format!("can't copy helper to {HELPER_INSTALL_PATH}"))?;
-    write_root_file(Path::new(HELPER_INSTALL_PATH), 0o755)?;
+    // Copy to a temp file and rename: rewriting a signed binary in place leaves a stale kernel
+    // signature cache and the new binary gets killed at launch.
+    let tmp = format!("{HELPER_INSTALL_PATH}.new");
+    let _ = fs::remove_file(&tmp);
+    fs::copy(&src, &tmp).with_context(|| format!("can't copy helper to {tmp}"))?;
+    write_root_file(Path::new(&tmp), 0o755)?;
+    fs::rename(&tmp, HELPER_INSTALL_PATH).with_context(|| format!("can't move helper into {HELPER_INSTALL_PATH}"))?;
 
     if let Some(dir) = Path::new(LOG_PATH).parent() {
         fs::create_dir_all(dir).with_context(|| format!("can't create {}", dir.display()))?;
@@ -111,17 +141,38 @@ pub fn install() -> Result<()> {
     }
 }
 
-fn restore_charging() -> bool {
-    let installed = PathBuf::from(HELPER_INSTALL_PATH);
-    let bin = if installed.exists() {
-        installed
+/// Which binary to run `--restore` with: the installed helper, else the sibling.
+fn restore_binary(installed_exists: bool, sibling: Option<PathBuf>) -> Option<PathBuf> {
+    if installed_exists {
+        Some(PathBuf::from(HELPER_INSTALL_PATH))
     } else {
-        match sibling_helper() {
-            Ok(p) if p.exists() => p,
-            _ => return false,
-        }
-    };
-    matches!(Command::new(&bin).arg("--restore").status(), Ok(s) if s.success())
+        sibling.filter(|p| p.exists())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    restored: bool,
+    keep_helper: bool,
+    warning: Option<String>,
+}
+
+/// Decide the uninstall result. `restore_ok` is None when the restore wasn't run.
+fn decide(unloaded: bool, restore_ok: Option<bool>, bin: Option<&Path>) -> Outcome {
+    let restored = unloaded && restore_ok == Some(true);
+    if restored {
+        return Outcome { restored, keep_helper: false, warning: None };
+    }
+    let keep_helper = bin == Some(Path::new(HELPER_INSTALL_PATH));
+    let cmd = bin.map_or_else(|| HELPER_NAME.to_string(), |p| p.display().to_string());
+    let why = if unloaded { "" } else { " (the helper is still loaded)" };
+    Outcome {
+        restored,
+        keep_helper,
+        warning: Some(format!(
+            "WARNING: couldn't confirm charging was restored{why}; run `sudo {cmd} --restore`"
+        )),
+    }
 }
 
 fn remove_file(path: &str) {
@@ -143,17 +194,30 @@ fn remove_dir(path: &Path) {
 pub fn uninstall(purge: bool) -> Result<()> {
     require_root()?;
     println!("stopping helper…");
-    if let Err(e) = bootout() {
-        eprintln!("couldn't run launchctl: {e}");
+    match bootout() {
+        Ok(st) if st.success() => {}
+        Ok(st) => eprintln!("launchctl bootout exited with {st}"),
+        Err(e) => eprintln!("couldn't run launchctl: {e}"),
     }
-    println!("restoring charging…");
-    let restored = restore_charging();
-    if !restored {
-        eprintln!("WARNING: couldn't confirm charging was restored; run `sudo eighty-helper --restore`");
+    let unloaded = wait_until_unloaded();
+    let bin = restore_binary(Path::new(HELPER_INSTALL_PATH).exists(), sibling_helper().ok());
+    // Only restore once the helper is gone, or it would rewrite the inhibit key.
+    let restore_ok = match (&bin, unloaded) {
+        (Some(b), true) => {
+            println!("restoring charging…");
+            Some(matches!(Command::new(b).arg("--restore").status(), Ok(s) if s.success()))
+        }
+        _ => None,
+    };
+    let outcome = decide(unloaded, restore_ok, bin.as_deref());
+    if let Some(w) = &outcome.warning {
+        eprintln!("{w}");
     }
     println!("removing files…");
     remove_file(PLIST_PATH);
-    remove_file(HELPER_INSTALL_PATH);
+    if !outcome.keep_helper {
+        remove_file(HELPER_INSTALL_PATH);
+    }
     remove_file(SOCKET_PATH);
     if purge {
         remove_dir(Path::new(CONFIG_DIR));
@@ -161,7 +225,7 @@ pub fn uninstall(purge: bool) -> Result<()> {
             remove_dir(dir);
         }
     }
-    if restored {
+    if outcome.restored {
         println!("charging restored; eighty uninstalled");
         Ok(())
     } else {
@@ -185,5 +249,34 @@ mod tests {
         ] {
             assert!(p.contains(needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn decide_branches() {
+        let inst = Path::new(HELPER_INSTALL_PATH);
+        let sib = Path::new("/x/eighty-helper");
+        let ok = decide(true, Some(true), Some(inst));
+        assert!(ok.restored && !ok.keep_helper && ok.warning.is_none());
+
+        let failed = decide(true, Some(false), Some(inst));
+        assert!(!failed.restored && failed.keep_helper);
+        assert!(failed.warning.unwrap().contains(&format!("sudo {HELPER_INSTALL_PATH} --restore")));
+
+        let loaded = decide(false, None, Some(inst));
+        assert!(!loaded.restored && loaded.keep_helper);
+        assert!(loaded.warning.unwrap().contains("still loaded"));
+
+        let sibling = decide(true, Some(false), Some(sib));
+        assert!(!sibling.keep_helper);
+        assert!(sibling.warning.unwrap().contains("sudo /x/eighty-helper --restore"));
+
+        let none = decide(true, None, None);
+        assert!(!none.restored && !none.keep_helper && none.warning.is_some());
+    }
+
+    #[test]
+    fn restore_binary_prefers_installed() {
+        assert_eq!(restore_binary(true, None), Some(PathBuf::from(HELPER_INSTALL_PATH)));
+        assert_eq!(restore_binary(false, Some(PathBuf::from("/nonexistent/h"))), None);
     }
 }
