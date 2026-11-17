@@ -17,7 +17,7 @@ fn mode_text(m: ControlMode) -> &'static str {
 fn activity_text(s: &Status) -> String {
     match s.activity {
         Activity::Charging { to } => format!("Charging to {to}%"),
-        Activity::Holding => format!("Holding at {}%", s.settings.upper),
+        Activity::Holding => format!("Holding at {}%", s.percent),
         Activity::Discharging { to } => format!("Discharging to {to}%"),
         Activity::OnBattery => "On battery".to_string(),
         Activity::LidClosed if s.mode == ControlMode::Hold => {
@@ -186,6 +186,13 @@ mod tests {
         assert!(render_status(&s).contains("State     Lid closed: holding at 100%, discharges to 80% when the lid opens\n"));
         let s = Status { override_: Override::DischargeTo(50), ..s };
         assert!(render_status(&s).contains("State     Lid closed: holding at 100%, discharges to 50% when the lid opens\n"));
+    }
+
+    #[test]
+    fn holding_shows_the_current_charge() {
+        let s = Status { charging: false, amperage_ma: 0, activity: Activity::Holding, ..st() };
+        let out = render_status(&s);
+        assert!(out.contains("State     Holding at 78%\n"), "{out}");
     }
 
     #[test]
