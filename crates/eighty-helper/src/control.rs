@@ -189,6 +189,11 @@ fn chie_bit(v: &[u8]) -> bool {
     v.first().is_some_and(|b| b & CHIE_DISCHARGE_BIT != 0)
 }
 
+/// Read-only: whether `CHIE` exists and currently has our discharge bit set.
+pub fn chie_discharging(smc: &mut dyn SmcIo) -> bool {
+    smc.read(fourcc(CHIE)).is_ok_and(|v| chie_bit(&v))
+}
+
 /// Write the restore state (`CHTE=0`, `CHIE=0`, `ACLC=0`) to every key that exists.
 pub fn restore_all(smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
     let mut errors = Vec::new();

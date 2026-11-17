@@ -9,7 +9,7 @@ use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
 use eighty_hw::smc::SmcIo;
 
-use crate::control::{detect, detect_read_only, Detection, SmcControl, ACLC};
+use crate::control::{chie_discharging, detect, detect_read_only, Detection, SmcControl, ACLC};
 use crate::log::log;
 use crate::store::Store;
 use crate::system::SystemProbe;
@@ -135,7 +135,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         } else {
             self.set_health(Health::Ok);
             // Crash recovery (or fault recovery): charging may have been left inhibited.
+            let was_discharging = chie_discharging(&mut self.smc);
             self.restore();
+            if was_discharging && !chie_discharging(&mut self.smc) {
+                // This clears a CHIE=08 left behind, so macOS may still report the
+                // adapter missing for a moment: open the same window as after our own
+                // discharge stops. CHIE=08 is only set while plugged in (or by a
+                // `DischargeTo`, where on AC is the likely case), so assume on AC meanwhile.
+                self.trusted_external = true;
+                self.discharge_stopped = Some((self.clock)());
+            }
             self.restore_failures.is_empty()
         }
     }
@@ -1167,6 +1176,24 @@ mod tests {
         assert!(e.status().external);
         r.clock.set(2000 + TICK_SECS);
         e.handle(Event::Tick);
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+    }
+    #[test] fn lagging_unplugged_reading_after_startup_restore_is_not_trusted() {
+        // A crash left CHIE=08; the startup restore clears it at t=1000, but macOS still
+        // reports the adapter missing on a reading from before the restore.
+        let r = Rig::hold().hiding_ac(); r.smc.insert("CHIE", "ui8 ", &[8], WriteMode::Accept);
+        r.clock.set(1000); r.set(78, false, false, 0, Some(990));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert!(e.status().external);
+        assert_ne!(e.status().activity, Activity::OnBattery);
+        r.clock.set(1070);
+        r.set(78, false, false, -300, Some(1050)); e.handle(Event::Tick); // newer than the restore
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+    }
+    #[test] fn unplugged_start_without_stale_discharge_is_trusted() {
+        let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(78, false, false, 0, Some(990));
+        let e = r.engine();
         assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
     }
     /// Hiding hold rig at 100% on the charger: CHIE=08 written at t=1000.
