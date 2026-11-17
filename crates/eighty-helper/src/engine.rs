@@ -58,8 +58,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     snapshot: Option<BatterySnapshot>,
     /// Outputs last applied successfully; the restore state after a restore.
     prev: Outputs,
-    /// When charging outputs last changed, and to what; judged by the watchdog.
-    pending: Option<(u64, Outputs)>,
+    /// When the watchdog's settle window last restarted: on a change of charging
+    /// outputs, on replug, and on wake. Readings from `since + SETTLE_SECS` on are judged.
+    since: Option<u64>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
@@ -91,7 +92,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             override_: Override::None,
             snapshot: None,
             prev: Outputs::default(),
-            pending: None,
+            since: None,
         };
         e.bring_up();
         e.tick();
@@ -137,6 +138,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             Event::Tick | Event::PowerChanged => self.tick(),
             Event::DidWake => {
                 self.sleeping = false;
+                self.since = Some((self.clock)());
                 self.tick();
             }
             Event::WillSleep(ack) => {
@@ -278,18 +280,18 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         Ok(())
     }
 
-    /// Judge whether the last charging change took effect, once a reading is fresh enough.
-    /// Returns the fault if it did not.
-    fn watchdog(&mut self, snap: &BatterySnapshot) -> Option<Health> {
-        let (t, o) = self.pending?;
-        // No timestamp, or a reading from before the change settled: wait for a newer one.
-        let fresh = snap.update_time.is_some_and(|u| u >= t + SETTLE_SECS);
-        if !fresh {
+    /// Judge whether the applied charging outputs are taking effect, on every reading
+    /// fresh enough to show it. Returns the fault if they are not.
+    fn watchdog(&self, snap: &BatterySnapshot) -> Option<Health> {
+        let o = self.prev;
+        // Asleep, unplugged (the battery discharges whatever we wrote), or nothing
+        // inhibited: there is nothing to judge.
+        if self.sleeping || !snap.external_connected || !(o.inhibit || o.discharge) {
             return None;
         }
-        self.pending = None;
-        if !snap.external_connected {
-            // Unplugged: the battery discharges whatever we wrote, so there is nothing to judge.
+        // No timestamp, or a reading from before the change settled: wait for a newer one.
+        let since = self.since?;
+        if snap.update_time.is_none_or(|u| u < since + SETTLE_SECS) {
             return None;
         }
         let what = if o.discharge && snap.amperage_ma >= 0 {
@@ -322,6 +324,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         // Always read the battery, even when paused, so status shows current numbers.
         let snap = self.battery.snapshot();
         if let Ok(s) = &snap {
+            let was_external = self.snapshot.as_ref().is_some_and(|p| p.external_connected);
+            if s.external_connected && !was_external {
+                // Just plugged in: give the charger time to settle before judging.
+                self.since = Some((self.clock)());
+            }
             self.snapshot = Some(s.clone());
         }
         if !self.may_control() {
@@ -419,7 +426,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         let charging_changed =
             d.outputs.inhibit != self.prev.inhibit || d.outputs.discharge != self.prev.discharge;
         if wrote || charging_changed {
-            self.pending = Some(((self.clock)(), d.outputs));
+            self.since = Some((self.clock)());
         }
         if d.outputs != self.prev {
             log(&format!(
@@ -440,7 +447,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         }
     }
 
-    /// Write the restore state and forget the previous outputs and any pending check.
+    /// Write the restore state and forget the previous outputs and the settle window.
     fn restore(&mut self) {
         let failures = self
             .control
@@ -457,7 +464,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             .collect();
         self.set_restore_failures(failures);
         self.prev = Outputs::default();
-        self.pending = None;
+        self.since = None;
     }
 
     fn set_health(&mut self, h: Health) {
@@ -755,7 +762,7 @@ mod tests {
         assert_eq!(st.activity, Activity::Holding);
         assert!(st.warnings.iter().any(|w| w.contains("ACLC")), "{:?}", st.warnings);
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
-        assert_eq!(e.pending.map(|(t, o)| (t, o.inhibit)), Some((2_000, true)));
+        assert_eq!((e.since, e.prev.inhibit), (Some(2_000), true));
     }
     #[test] fn paused_status_still_shows_battery_numbers() {
         let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(90, true, true, 1000, Some(900));
@@ -804,6 +811,36 @@ mod tests {
         let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, None);
         let mut e = r.engine(); e.handle(Event::Tick);
         assert_eq!(e.status().health, Health::Ok);
+    }
+    #[test] fn watchdog_judges_after_replug() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();                                       // writes CHTE at t=1000
+        r.set(80, false, false, -300, Some(1030)); e.handle(Event::Tick); // unplugged: not judged
+        r.clock.set(1040);
+        r.set(80, true, true, 1200, Some(1050)); e.handle(Event::Tick);  // replugged at 1040: too fresh
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1070)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
+    }
+    #[test] fn watchdog_keeps_checking_after_first_verdict() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, false, true, 0, Some(990));
+        let mut e = r.engine();
+        r.set(80, false, true, 0, Some(1030)); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1090)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
+    }
+    #[test] fn watchdog_skips_sleep_and_resettles_after_wake() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, false, true, 0, Some(990));
+        let mut e = r.engine();
+        sleep(&mut e);
+        r.set(80, true, true, 1200, Some(1100)); e.handle(Event::Tick); // asleep: not judged
+        assert_eq!(e.status().health, Health::Ok);
+        r.clock.set(2000);
+        r.set(80, true, true, 1200, Some(2010)); e.handle(Event::DidWake); // settling after wake
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(2030)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { .. }));
     }
     fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
         let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
