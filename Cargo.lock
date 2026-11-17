@@ -174,9 +174,11 @@ dependencies = [
 name = "eighty-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "eighty-core",
  "eighty-hw",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

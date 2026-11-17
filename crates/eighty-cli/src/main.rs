@@ -1,5 +1,6 @@
 //! eighty: command-line client for the eighty charge-limit helper.
 use clap::{Parser, Subcommand, ValueEnum};
+use eighty_cli::install;
 use eighty_cli::client::{call, ClientError};
 use eighty_cli::render::{render_doctor, render_status};
 use eighty_core::paths::{LOG_PATH, SOCKET_PATH};
@@ -172,9 +173,14 @@ fn logs(n: usize) -> ExitCode {
     }
 }
 
-fn not_implemented() -> ExitCode {
-    eprintln!("not implemented yet");
-    ExitCode::from(1)
+fn finish(r: anyhow::Result<()>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("eighty: {e:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -189,6 +195,7 @@ fn main() -> ExitCode {
         Cmd::Discharge { percent } => expect_status(Request::DischargeTo { percent }),
         Cmd::Doctor { json, retry, accept_other_limiters } => doctor(json, retry, accept_other_limiters),
         Cmd::Logs { lines } => logs(lines),
-        Cmd::Install | Cmd::Uninstall { .. } => not_implemented(),
+        Cmd::Install => finish(install::install()),
+        Cmd::Uninstall { purge } => finish(install::uninstall(purge)),
     }
 }
