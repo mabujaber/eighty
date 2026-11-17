@@ -1,6 +1,7 @@
 //! Shared types for the eighty helper and CLI. No hardware or OS calls.
 pub mod config;
 pub mod paths;
+pub mod policy;
 
 pub use config::{Config, Settings};
 
