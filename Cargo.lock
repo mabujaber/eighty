@@ -194,6 +194,10 @@ dependencies = [
 name = "eighty-helper"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "core-foundation",
+ "ctrlc",
  "eighty-core",
  "eighty-hw",
  "libc",
