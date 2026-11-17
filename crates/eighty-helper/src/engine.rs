@@ -1167,6 +1167,51 @@ mod tests {
         e.handle(Event::Tick);
         assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
     }
+    /// Hiding hold rig at 100% on the charger: CHIE=08 written at t=1000.
+    fn hidden_discharge_rig(amp: i32) -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+        let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(100, false, true, amp, Some(990));
+        let e = r.engine();
+        assert_eq!((r.smc.value("CHIE"), e.prev.discharge), (Some(vec![8]), true));
+        (r, e)
+    }
+    #[test] fn watchdog_flags_ineffective_discharge_under_hiding() {
+        let (r, mut e) = hidden_discharge_rig(0);
+        r.set(100, false, true, 0, Some(1030)); e.handle(Event::Tick); // first strike
+        assert_eq!((e.status().health, e.strikes), (Health::Ok, 1));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.set(100, false, true, 0, Some(1090)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHIE")));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+    }
+    #[test] fn conflict_that_cleared_our_chie_bit_returns_trust() {
+        let (r, mut e) = hidden_discharge_rig(-400);
+        r.smc.insert("CHIE", "ui8 ", &[0x10], WriteMode::Accept); // another writer: our bit is gone
+        let n = r.smc.writes().len();
+        r.clock.set(1100); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { ref key, .. } if key == "CHIE"));
+        assert_eq!((r.smc.writes().len(), e.prev.discharge), (n, false));
+        r.clock.set(1200); r.set(100, false, false, -400, Some(1150)); e.handle(Event::Tick); // a real unplug
+        assert!(!e.status().external);
+    }
+    #[test] fn sleep_while_discharging_under_hiding_returns_trust() {
+        let (r, mut e) = hidden_discharge_rig(-400);
+        r.clock.set(1100); r.set(100, false, true, -400, Some(1090)); sleep(&mut e);
+        assert_eq!((r.smc.value("CHIE"), r.smc.value("CHTE")), (Some(vec![0]), Some(vec![1, 0, 0, 0])));
+        assert_eq!((e.prev.discharge, e.status().external), (false, true));
+        r.clock.set(1200); r.set(100, false, false, -400, Some(1150)); e.handle(Event::Tick); // a real unplug
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+    }
+    #[test] fn real_unplug_mid_discharge_under_hiding_continues_to_target() {
+        let (r, mut e) = hidden_discharge_rig(-400);
+        // The user unplugs; with CHIE=08 that looks the same as before, so keep going.
+        r.clock.set(2000); r.set(90, false, false, -600, Some(1990)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert_eq!((e.status().activity, e.status().external), (Activity::Discharging { to: 80 }, true));
+        r.clock.set(3000); r.set(80, false, false, -600, Some(2990)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        r.clock.set(3100); r.set(80, false, false, -600, Some(3050)); e.handle(Event::Tick);
+        assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
+    }
     fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
         let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
     }
