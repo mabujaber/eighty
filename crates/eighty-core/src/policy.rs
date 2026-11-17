@@ -97,7 +97,9 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
         }
         Override::DischargeTo(n) => {
             let (inhibit, discharge, light, activity) = if i.lid_closed {
-                (hold, false, light_for(i.external, hold, false), Activity::LidClosed)
+                // "Lid closed: holding" only makes sense on the charger.
+                let activity = if i.external { Activity::LidClosed } else { Activity::OnBattery };
+                (hold, false, light_for(i.external, hold, false), activity)
             } else if !above_floor {
                 // Final guard: never discharge at or below the floor; charge normally.
                 (false, false, light_for(i.external, false, false), Activity::Charging { to: s.upper })
@@ -249,6 +251,15 @@ mod tests {
         let d = decide(&s(), Override::DischargeTo(50), &i(50, true, false, Hold), &prev(true, true));
         assert!(d.clear_override);
         assert!(!d.outputs.discharge);
+    }
+    #[test]
+    fn discharge_to_lid_closed_says_on_battery_when_unplugged() {
+        for mode in [Hold, Cycle] {
+            let d = decide(&s(), Override::DischargeTo(50), &i(60, true, true, mode), &prev(false, true));
+            assert_eq!((d.outputs.discharge, d.activity), (false, LidClosed), "{mode:?}");
+            let d = decide(&s(), Override::DischargeTo(50), &i(60, false, true, mode), &prev(false, true));
+            assert_eq!((d.outputs.discharge, d.outputs.light, d.activity), (false, None, OnBattery), "{mode:?}");
+        }
     }
     #[test]
     fn never_discharges_at_or_below_floor() {
