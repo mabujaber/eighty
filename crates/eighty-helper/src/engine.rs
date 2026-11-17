@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use eighty_core::config::{Config, Settings};
-use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
+use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Light, Outputs, Override};
 use eighty_core::proto::{DoctorReport, Health, Request, Response, Status};
 use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
@@ -41,6 +41,12 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     config: Config,
     config_warning: Option<String>,
     light_warning: Option<String>,
+    /// Set while cycle mode had to stop discharging for sleep; cleared once a tick
+    /// after wake sees the charge back at or below the upper limit.
+    sleep_warning: Option<String>,
+    /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
+    /// floor while the Mac is asleep.
+    sleeping: bool,
     /// One warning per key the last restore failed to write; empty once a restore
     /// (or a successful apply) puts the keys back in a known state.
     restore_failures: Vec<String>,
@@ -75,6 +81,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             config,
             config_warning,
             light_warning: None,
+            sleep_warning: None,
+            sleeping: false,
             restore_failures: Vec::new(),
             detection,
             control,
@@ -126,8 +134,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
     /// Handle one event. Returns false once the engine has shut down.
     pub fn handle(&mut self, ev: Event) -> bool {
         match ev {
-            Event::Tick | Event::PowerChanged | Event::DidWake => self.tick(),
+            Event::Tick | Event::PowerChanged => self.tick(),
+            Event::DidWake => {
+                self.sleeping = false;
+                self.tick();
+            }
             Event::WillSleep(ack) => {
+                self.sleeping = true;
                 self.tick();
                 let _ = ack.send(());
             }
@@ -179,6 +192,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 .config_warning
                 .iter()
                 .chain(&self.light_warning)
+                .chain(&self.sleep_warning)
                 .chain(&self.restore_failures)
                 .cloned()
                 .collect(),
@@ -360,10 +374,27 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             lid_closed: self.system.lid_closed(),
             mode: self.detection.mode,
         };
-        let d = decide(&self.config.settings, self.override_, &inputs, &self.prev);
+        let mut d = decide(&self.config.settings, self.override_, &inputs, &self.prev);
         if d.clear_override {
             log(&format!("override {:?} finished", self.override_));
             self.override_ = Override::None;
+        }
+        if self.sleeping && d.outputs.discharge {
+            // Nothing watches the floor while asleep: stop discharging. Hold mode keeps
+            // inhibit (a true hold); cycle mode has no hold, so it charges.
+            let o = &mut d.outputs;
+            o.discharge = false;
+            if !o.inhibit {
+                o.light = inputs.external.then_some(Light::Orange);
+            }
+            if self.detection.mode == ControlMode::Cycle {
+                self.set_sleep_warning(Some(format!(
+                    "the limit isn't enforced while asleep in cycle mode; the battery may charge past {}%",
+                    self.config.settings.upper
+                )));
+            }
+        } else if !self.sleeping && snap.percent <= self.config.settings.upper {
+            self.set_sleep_warning(None);
         }
 
         let wrote = match self.control.apply(&mut self.smc, &d.outputs) {
@@ -452,6 +483,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 log(f);
             }
             self.restore_failures = failures;
+        }
+    }
+
+    fn set_sleep_warning(&mut self, w: Option<String>) {
+        if w != self.sleep_warning {
+            match &w {
+                Some(w) => log(w),
+                None => log("back at or below the limit after sleep"),
+            }
+            self.sleep_warning = w;
         }
     }
 
@@ -654,6 +695,44 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel(); e.handle(Event::WillSleep(tx));
         rx.try_recv().unwrap();
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+    }
+    fn sleep(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>) {
+        let (tx, rx) = std::sync::mpsc::channel(); e.handle(Event::WillSleep(tx));
+        rx.try_recv().expect("sleep acked");
+    }
+    fn asleep_warning(e: &Engine<FakeSmc, FakeBattery, FakeSystem>) -> bool {
+        e.status().warnings.iter().any(|w| w == "the limit isn't enforced while asleep in cycle mode; the battery may charge past 80%")
+    }
+    #[test] fn cycle_sleep_stops_discharge_and_warns_until_back_at_limit() {
+        let r = Rig::cycle(); r.set(82, false, true, -400, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        sleep(&mut e);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert!(asleep_warning(&e), "{:?}", e.status().warnings);
+        e.handle(Event::Tick); // dark wake / timer tick before DidWake
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        r.set(83, true, true, 1200, Some(960)); e.handle(Event::DidWake);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert!(asleep_warning(&e), "kept while above the limit");
+        r.set(80, false, true, -400, Some(1100)); e.handle(Event::Tick);
+        assert!(!asleep_warning(&e), "{:?}", e.status().warnings);
+    }
+    #[test] fn hold_sleep_holds_instead_of_discharging() {
+        let r = Rig::hold(); r.set(85, false, true, -400, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        sleep(&mut e);
+        assert_eq!((r.smc.value("CHIE"), r.smc.value("CHTE")), (Some(vec![0]), Some(vec![1, 0, 0, 0])));
+        assert!(!asleep_warning(&e));
+    }
+    #[test] fn discharge_override_pauses_while_asleep() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        req(&mut e, 501, Request::DischargeTo { percent: 50 });
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        sleep(&mut e);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(e.status().override_, Override::DischargeTo(50));
     }
     #[test] fn cycle_mode_on_m2_shape() {
         let r = Rig::cycle(); r.set(80, true, true, 2700, Some(900));
