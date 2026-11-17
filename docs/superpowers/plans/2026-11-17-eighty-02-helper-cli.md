@@ -909,7 +909,7 @@ fn st() -> Status { /* percent 78, external, charging, 1197 mA, Hold, Charging{t
 - [ ] **Step 4: Run `cargo test --workspace && cargo clippy --workspace -- -D warnings`.** Expected: PASS.
 - [ ] **Step 5: Check by hand on the M5.**
   1. `cargo build --release && sudo ./target/release/eighty install`. Expected: status printed, `Mode hold (CHTE)`.
-  2. `sudo pkill -9 eighty-helper`, then `eighty status` within 10 s. Expected: launchd restarted it, and the state is correct.
+  2. `sudo pkill -9 -f io.github.mabujaber.eighty.helper`, then `eighty status` within 10 s. Expected: launchd restarted it, and the state is correct.
   3. `sudo ./target/release/eighty uninstall`. Expected: `eighty-probe` shows the restore state and the Mac charges.
 - [ ] **Step 6: Commit** — `feat(cli): add install and uninstall with charging restore`
 
@@ -934,7 +934,7 @@ Run each check on the **M5 Pro (hold mode)** and the **M2 Max (cycle mode)**, wi
   2. Lid **open**: while discharging (cycle mode on the M2, auto-discharge on the M5), put the Mac to sleep via idle sleep or Apple menu → Sleep for 30+ min, then wake. Record the % before and after. Expected: no discharge while asleep (`CHIE=00`). On the M2, `eighty status` shows the warning `the limit isn't enforced while asleep in cycle mode; the battery may charge past <upper>%` until the charge is back at or below the upper limit.
   3. Record whether macOS changes `CHTE`/`CHIE` across sleep or wake. A `NOT LIMITING: … was changed by something else` (Conflict) right after wake means it does.
 - [ ] **Step 4b: Watchdog across replug.** Run `eighty limit <current%>` so the M5 holds, unplug within 20 s, then replug. Expected: after a minute or two, still `Holding`, no `NotEffective` fault, amperage ≈ 0.
-- [ ] **Step 5: Crash and reboot.** `sudo pkill -9 eighty-helper` while discharging → it restarts and recovers. Reboot → the helper starts before login (`eighty status` from SSH or right after login) and applies the limit.
+- [ ] **Step 5: Crash and reboot.** `sudo pkill -9 -f io.github.mabujaber.eighty.helper` while discharging → it restarts and recovers. Reboot → the helper starts before login (`eighty status` from SSH or right after login) and applies the limit.
 - [ ] **Step 6: Conflict.** With the helper holding (M5), set macOS's own Charge Limit to 80%, then 100% again after a few minutes. Record whether eighty reported `NOT LIMITING: CHTE was changed by something else…`, and whether `eighty doctor --retry` recovered. Either way, this tells us whether the native limit writes `CHTE` (spec §5.5, input to Plan 3). The conflict path itself is covered by unit tests.
 - [ ] **Step 7: Permissions.** As a second, non-admin user (or `sudo -u nobody eighty limit 70`): `permission denied`, while `eighty status` works.
 - [ ] **Step 8: Uninstall.** `sudo eighty uninstall` → `eighty-probe` read shows the restore state, `ACLC=00` hands the light back to macOS (record the colour seen), and the Mac charges to 100%.
