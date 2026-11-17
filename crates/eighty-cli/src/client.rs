@@ -5,6 +5,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+/// Longer than the helper's 10 s wait for the engine, so its "helper busy" reply arrives.
+const READ_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(thiserror::Error, Debug)]
 pub enum ClientError {
     #[error("the eighty helper isn't running. Install it with `sudo eighty install`.")]
@@ -32,7 +35,7 @@ pub fn call(path: &Path, req: &Request) -> Result<Response, ClientError> {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => ClientError::NotRunning,
         _ => ClientError::Io(e),
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     write_msg(&mut stream, req)?;
     Ok(read_msg(&mut BufReader::new(stream))?)
@@ -49,7 +52,7 @@ mod tests {
         let l = std::os::unix::net::UnixListener::bind(&p).unwrap();
         let h = std::thread::spawn(move || {
             let (_s, _) = l.accept().unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(6));
+            std::thread::sleep(READ_TIMEOUT + Duration::from_secs(1));
         });
         let e = call(&p, &Request::Status).unwrap_err();
         assert!(matches!(e, ClientError::Protocol(m) if m == "the helper didn't answer in time"));

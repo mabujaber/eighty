@@ -78,6 +78,7 @@ pub struct Status {
     pub activity: Activity,
     pub health: Health,
     pub settings: Settings,
+    #[serde(rename = "override")]
     pub override_: Override,
     pub light_supported: bool,
     pub warnings: Vec<String>,
@@ -158,6 +159,27 @@ mod tests {
     fn only_status_and_doctor_are_read_only() {
         assert!(!Request::Status.is_mutating() && !Request::Doctor.is_mutating());
         assert!(Request::ChargeAuto.is_mutating());
+    }
+    #[test]
+    fn status_json_names_override_field() {
+        let s = Status {
+            percent: 80,
+            external: true,
+            charging: false,
+            amperage_ma: 0,
+            mode: ControlMode::Hold,
+            activity: Activity::Holding,
+            health: Health::Ok,
+            settings: Settings::default(),
+            override_: Override::DischargeTo(50),
+            light_supported: true,
+            warnings: vec![],
+            version: "0.1.0".into(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["override"], serde_json::json!({ "DischargeTo": 50 }));
+        assert!(v.get("override_").is_none());
+        assert_eq!(serde_json::from_value::<Status>(v).unwrap(), s);
     }
     #[test]
     fn conflict_message_mentions_native_limit() {

@@ -25,10 +25,20 @@ fn activity_text(s: &Status) -> String {
     }
 }
 
+/// The health message, without claiming charging was restored when a restore failed.
+fn health_text(s: &Status) -> String {
+    let msg = s.health.message();
+    if s.warnings.iter().any(|w| w.starts_with("couldn't restore")) {
+        msg.replace("Charging restored", "Charging may NOT be restored — see warnings")
+    } else {
+        msg
+    }
+}
+
 pub fn render_status(s: &Status) -> String {
     let mut out = String::new();
     if !s.health.is_ok() {
-        out.push_str(&format!("NOT LIMITING: {}\n", s.health.message()));
+        out.push_str(&format!("NOT LIMITING: {}\n", health_text(s)));
     }
     let charging_part = if s.charging {
         format!("charging {} mA", s.amperage_ma)
@@ -85,7 +95,7 @@ pub fn render_doctor(d: &DoctorReport) -> String {
     }
     let others = if d.other_limiters.is_empty() { "none".to_string() } else { d.other_limiters.join(", ") };
     line(&mut out, "Limiters", &others);
-    line(&mut out, "Health", &d.status.health.message());
+    line(&mut out, "Health", &health_text(&d.status));
     out.push('\n');
     out.push_str(&render_status(&d.status));
     out
@@ -130,6 +140,31 @@ mod tests {
     fn fault_is_first_line() {
         let s = Status { health: Health::Unsupported, activity: Activity::Paused, ..st() };
         assert!(render_status(&s).starts_with("NOT LIMITING: this Mac has no SMC key"));
+    }
+
+    #[test]
+    fn failed_restore_does_not_claim_charging_restored() {
+        let s = Status {
+            health: Health::WriteFailed { key: "CHTE".into(), error: "x".into() },
+            activity: Activity::Paused,
+            warnings: vec!["couldn't restore CHTE: x; charging may still be inhibited".into()],
+            ..st()
+        };
+        let out = render_status(&s);
+        assert_eq!(
+            out.lines().next().unwrap(),
+            "NOT LIMITING: writing CHTE failed: x. Charging may NOT be restored — see warnings. Run `eighty doctor --retry`."
+        );
+        let s = Status { health: Health::BatteryUnreadable("gone".into()), ..s };
+        let out = render_status(&s);
+        assert!(!out.contains("Charging restored"), "{out}");
+        let doc = render_doctor(&DoctorReport {
+            machine: MachineInfo { model: "m".into(), chip: "c".into(), macos: "v".into(), build: "b".into() },
+            keys: vec![],
+            status: s,
+            other_limiters: vec![],
+        });
+        assert!(!doc.contains("Charging restored"), "{doc}");
     }
 
     #[test]

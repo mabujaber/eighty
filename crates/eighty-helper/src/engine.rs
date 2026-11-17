@@ -240,6 +240,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 self.tick();
             }
             Request::ChargeFull => {
+                if !self.snapshot.as_ref().is_some_and(|s| s.external_connected) {
+                    return Response::Error("plug in first: a full charge needs the charger".into());
+                }
                 self.override_ = Override::FullCharge;
                 self.tick();
             }
@@ -871,6 +874,11 @@ mod tests {
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
         assert_eq!(r.store.load().0.settings.upper, 70);
         assert!(matches!(req(&mut e, 501, Request::SetLimits { upper: 10, lower: None }), Response::Error(_)));
+    }
+    #[test] fn charge_full_needs_the_charger() {
+        let r = Rig::hold(); r.set(70, false, false, -400, Some(900)); let mut e = r.engine();
+        assert_eq!(req(&mut e, 501, Request::ChargeFull), Response::Error("plug in first: a full charge needs the charger".into()));
+        assert_eq!(e.status().override_, Override::None);
     }
     #[test] fn discharge_below_floor_rejected() {
         let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
