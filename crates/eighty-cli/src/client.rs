@@ -19,6 +19,9 @@ impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         match e.kind() {
             io::ErrorKind::InvalidData => ClientError::Protocol(e.to_string()),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                ClientError::Protocol("the helper didn't answer in time".to_string())
+            }
             _ => ClientError::Io(e),
         }
     }
@@ -38,6 +41,20 @@ pub fn call(path: &Path, req: &Request) -> Result<Response, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_server_maps_to_timeout_message() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.sock");
+        let l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let h = std::thread::spawn(move || {
+            let (_s, _) = l.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(6));
+        });
+        let e = call(&p, &Request::Status).unwrap_err();
+        assert!(matches!(e, ClientError::Protocol(m) if m == "the helper didn't answer in time"));
+        h.join().unwrap();
+    }
 
     #[test]
     fn not_running_when_no_socket() {
