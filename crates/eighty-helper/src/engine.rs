@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use eighty_core::config::{Config, Settings};
 use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Light, Outputs, Override};
 use eighty_core::proto::{DoctorReport, Health, Request, Response, Status};
-use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS};
+use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
 use eighty_hw::smc::SmcIo;
 
@@ -61,6 +61,10 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     /// When the watchdog's settle window last restarted: on a change of charging
     /// outputs, on replug, and on wake. Readings from `since + SETTLE_SECS` on are judged.
     since: Option<u64>,
+    /// Consecutive failing watchdog readings since the settle window last restarted.
+    strikes: u32,
+    /// `update_time` of the last failing reading, so a repeated reading is not a new strike.
+    last_strike: Option<u64>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
@@ -93,6 +97,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             snapshot: None,
             prev: Outputs::default(),
             since: None,
+            strikes: 0,
+            last_strike: None,
         };
         e.bring_up();
         e.tick();
@@ -138,7 +144,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             Event::Tick | Event::PowerChanged => self.tick(),
             Event::DidWake => {
                 self.sleeping = false;
-                self.since = Some((self.clock)());
+                let now = (self.clock)();
+                self.restart_settle(Some(now));
                 self.tick();
             }
             Event::WillSleep(ack) => {
@@ -283,9 +290,17 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         Ok(())
     }
 
+    /// Restart (or clear) the watchdog's settle window; strikes start over with it.
+    fn restart_settle(&mut self, since: Option<u64>) {
+        self.since = since;
+        self.strikes = 0;
+        self.last_strike = None;
+    }
+
     /// Judge whether the applied charging outputs are taking effect, on every reading
-    /// fresh enough to show it. Returns the fault if they are not.
-    fn watchdog(&self, snap: &BatterySnapshot) -> Option<Health> {
+    /// fresh enough to show it. Returns the fault once `WATCHDOG_STRIKES` consecutive
+    /// judged readings, each with a distinct `update_time`, show they are not.
+    fn watchdog(&mut self, snap: &BatterySnapshot) -> Option<Health> {
         let o = self.prev;
         // Asleep, unplugged (the battery discharges whatever we wrote), or nothing
         // inhibited: there is nothing to judge.
@@ -294,16 +309,27 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         }
         // No timestamp, or a reading from before the change settled: wait for a newer one.
         let since = self.since?;
-        if snap.update_time.is_none_or(|u| u < since + SETTLE_SECS) {
-            return None;
-        }
+        let updated = snap.update_time.filter(|&u| u >= since + SETTLE_SECS)?;
         let what = if o.discharge && snap.amperage_ma >= 0 {
             "CHIE (run from battery)"
         } else if o.inhibit && !o.discharge && snap.is_charging && snap.amperage_ma > 50 {
             "CHTE (stop charging)"
         } else {
+            // A passing reading: the outputs work, so earlier strikes were blips.
+            self.strikes = 0;
+            self.last_strike = None;
             return None;
         };
+        // The same reading seen again is not new evidence.
+        if self.last_strike == Some(updated) {
+            return None;
+        }
+        self.strikes += 1;
+        self.last_strike = Some(updated);
+        if self.strikes < WATCHDOG_STRIKES {
+            log(&format!("watchdog: {what} looks ineffective ({}/{WATCHDOG_STRIKES})", self.strikes));
+            return None;
+        }
         Some(Health::NotEffective { what: what.into() })
     }
 
@@ -330,7 +356,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             let was_external = self.snapshot.as_ref().is_some_and(|p| p.external_connected);
             if s.external_connected && !was_external {
                 // Just plugged in: give the charger time to settle before judging.
-                self.since = Some((self.clock)());
+                let now = (self.clock)();
+                self.restart_settle(Some(now));
             }
             self.snapshot = Some(s.clone());
         }
@@ -429,7 +456,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         let charging_changed =
             d.outputs.inhibit != self.prev.inhibit || d.outputs.discharge != self.prev.discharge;
         if wrote || charging_changed {
-            self.since = Some((self.clock)());
+            let now = (self.clock)();
+            self.restart_settle(Some(now));
         }
         if d.outputs != self.prev {
             log(&format!(
@@ -467,7 +495,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             .collect();
         self.set_restore_failures(failures);
         self.prev = Outputs::default();
-        self.since = None;
+        self.restart_settle(None);
     }
 
     fn set_health(&mut self, h: Health) {
@@ -813,9 +841,44 @@ mod tests {
         let mut e = r.engine();                                  // writes CHTE at t=1000
         r.set(80, true, true, 1200, Some(1010)); e.handle(Event::Tick); // too fresh: no verdict
         assert_eq!(e.status().health, Health::Ok);
-        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick);
+        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick); // first strike
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1090)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
         assert_eq!(r.smc.value("CHTE"), Some(vec![0; 4]));
+    }
+    #[test] fn watchdog_ignores_a_single_blip() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();                                          // writes CHTE at t=1000
+        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick);  // failing
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, false, true, 0, Some(1090)); e.handle(Event::Tick);    // passing: strikes reset
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1150)); e.handle(Event::Tick);  // failing again: one strike
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+    }
+    #[test] fn watchdog_needs_two_distinct_readings() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();
+        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        e.handle(Event::Tick);                                           // same reading again: no new strike
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1090)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
+        assert_eq!(r.smc.value("CHTE"), Some(vec![0; 4]));
+    }
+    #[test] fn watchdog_strikes_reset_on_resettle() {
+        let r = Rig::hold(); r.clock.set(1000); r.set(80, true, true, 1200, Some(990));
+        let mut e = r.engine();
+        r.set(80, true, true, 1200, Some(1030)); e.handle(Event::Tick);  // first strike
+        sleep(&mut e);
+        r.clock.set(2000);
+        r.set(80, true, true, 1200, Some(2010)); e.handle(Event::DidWake); // wake restarts the window
+        r.set(80, true, true, 1200, Some(2030)); e.handle(Event::Tick);  // one strike after the new settle
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
     }
     #[test] fn watchdog_accepts_effective_discharge() {
         let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
@@ -835,7 +898,9 @@ mod tests {
         r.clock.set(1040);
         r.set(80, true, true, 1200, Some(1050)); e.handle(Event::Tick);  // replugged at 1040: too fresh
         assert_eq!(e.status().health, Health::Ok);
-        r.set(80, true, true, 1200, Some(1070)); e.handle(Event::Tick);
+        r.set(80, true, true, 1200, Some(1070)); e.handle(Event::Tick);  // first strike
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1130)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
     }
     #[test] fn watchdog_keeps_checking_after_first_verdict() {
@@ -843,7 +908,9 @@ mod tests {
         let mut e = r.engine();
         r.set(80, false, true, 0, Some(1030)); e.handle(Event::Tick);
         assert_eq!(e.status().health, Health::Ok);
-        r.set(80, true, true, 1200, Some(1090)); e.handle(Event::Tick);
+        r.set(80, true, true, 1200, Some(1090)); e.handle(Event::Tick); // first strike
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(1150)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHTE")));
     }
     #[test] fn watchdog_skips_sleep_and_resettles_after_wake() {
@@ -855,7 +922,9 @@ mod tests {
         r.clock.set(2000);
         r.set(80, true, true, 1200, Some(2010)); e.handle(Event::DidWake); // settling after wake
         assert_eq!(e.status().health, Health::Ok);
-        r.set(80, true, true, 1200, Some(2030)); e.handle(Event::Tick);
+        r.set(80, true, true, 1200, Some(2030)); e.handle(Event::Tick); // first strike
+        assert_eq!(e.status().health, Health::Ok);
+        r.set(80, true, true, 1200, Some(2090)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { .. }));
     }
     fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
@@ -903,7 +972,10 @@ mod tests {
         let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
         let mut e = r.engine();
         assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        r.set(81, true, true, 500, Some(1020)); e.handle(Event::Tick);
+        r.set(81, true, true, 500, Some(1020)); e.handle(Event::Tick); // first strike
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.set(81, true, true, 500, Some(1080)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { ref what } if what.starts_with("CHIE")));
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
         assert_eq!(e.status().activity, Activity::Paused);

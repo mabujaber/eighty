@@ -11,5 +11,7 @@ pub use config::{Config, Settings};
 pub const HARD_FLOOR: u8 = 10;
 /// Seconds to wait after a write before judging its effect.
 pub const SETTLE_SECS: u64 = 20;
+/// Consecutive failing watchdog readings, each with a distinct update time, before a fault.
+pub const WATCHDOG_STRIKES: u32 = 2;
 /// Seconds between control-loop ticks.
 pub const TICK_SECS: u64 = 60;
