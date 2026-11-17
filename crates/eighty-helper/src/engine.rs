@@ -68,6 +68,8 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     strikes: u32,
     /// `update_time` of the last failing reading, so a repeated reading is not a new strike.
     last_strike: Option<u64>,
+    /// `external_connected` from the last reading taken while we were not discharging.
+    trusted_external: bool,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
@@ -103,6 +105,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             since: None,
             strikes: 0,
             last_strike: None,
+            trusted_external: false,
         };
         e.bring_up();
         e.tick();
@@ -356,8 +359,19 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
 
     fn tick(&mut self) {
         // Always read the battery, even when paused, so status shows current numbers.
-        let snap = self.battery.snapshot();
-        if let Ok(s) = &snap {
+        let mut snap = self.battery.snapshot();
+        if let Ok(s) = &mut snap {
+            // While CHIE=08 is ours, macOS reports the adapter as disconnected even
+            // though it is not, so an unplugged reading then can't be trusted: keep the
+            // last reading taken while we weren't discharging. A real unplug mid-discharge
+            // is harmless: the battery was discharging anyway, and the discharge still
+            // stops at the target or the floor (decided by percent); readings are trusted
+            // again from the tick after CHIE=00.
+            if self.prev.discharge {
+                s.external_connected |= self.trusted_external;
+            } else {
+                self.trusted_external = s.external_connected;
+            }
             let was_external = self.snapshot.as_ref().is_some_and(|p| p.external_connected);
             if s.external_connected && !was_external {
                 // Just plugged in: give the charger time to settle before judging.
@@ -486,7 +500,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 log("conflict: stopped our discharge (CHIE=00); other keys left as found");
                 self.prev.discharge = false;
             }
-            Ok(false) => {}
+            // Not ours any more (or never was): our discharge isn't running either.
+            Ok(false) => self.prev.discharge = false,
             Err(err) => {
                 let w = format!(
                     "couldn't stop discharging (CHIE): {err}; the battery may drain while plugged in"
@@ -593,6 +608,9 @@ mod tests {
         fail: Rc<Cell<bool>>,
         snap: Rc<RefCell<BatterySnapshot>>,
         fallible: bool,
+        /// Mirrors the hardware: while CHIE has the discharge bit set, macOS reports
+        /// the adapter as disconnected.
+        chie_hides_ac: bool,
         _dir: tempfile::TempDir,
     }
 
@@ -615,6 +633,7 @@ mod tests {
                     update_time: None,
                 })),
                 fallible: false,
+                chie_hides_ac: false,
                 _dir: dir,
             }
         }
@@ -635,6 +654,10 @@ mod tests {
         fn hold_fallible() -> Rig {
             Rig { fallible: true, ..Rig::hold() }
         }
+        /// Battery reports `external_connected: false` whenever CHIE has bit 0x08 set.
+        fn hiding_ac(self) -> Rig {
+            Rig { chie_hides_ac: true, ..self }
+        }
         fn set(&self, pct: u8, charging: bool, external: bool, amp: i32, update_time: Option<u64>) {
             let mut s = self.snap.borrow_mut();
             s.percent = pct;
@@ -645,17 +668,25 @@ mod tests {
         }
         fn engine(&self) -> Engine<FakeSmc, FakeBattery, FakeSystem> {
             let snap = self.snap.clone();
+            let (smc, hides) = (self.smc.clone(), self.chie_hides_ac);
+            let snap = Rc::new(move || {
+                let mut s = snap.borrow().clone();
+                if hides && smc.value("CHIE").is_some_and(|v| v[0] & 0x08 != 0) {
+                    s.external_connected = false;
+                }
+                s
+            });
             let battery = if self.fallible {
                 let fail = self.fail.clone();
                 FakeBattery::fallible(move || {
                     if fail.get() {
                         Err(BatteryError::NotFound)
                     } else {
-                        Ok(snap.borrow().clone())
+                        Ok(snap())
                     }
                 })
             } else {
-                FakeBattery::new(move || snap.borrow().clone())
+                FakeBattery::new(move || snap())
             };
             let clock = self.clock.clone();
             Engine::start(Deps {
@@ -994,6 +1025,63 @@ mod tests {
         assert_eq!(e.status().health, Health::Ok);
         r.set(80, true, true, 1200, Some(2090)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::NotEffective { .. }));
+    }
+    #[test] fn discharge_does_not_flap_when_macos_reports_unplugged() {
+        let r = Rig::hold().hiding_ac(); r.set(100, false, true, -400, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        let n = r.smc.writes().len();
+        for _ in 0..3 { e.handle(Event::Tick); e.handle(Event::PowerChanged); }
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert!(!r.smc.writes()[n..].iter().any(|(k, _)| k == "CHIE"), "{:?}", &r.smc.writes()[n..]);
+        let st = e.status();
+        assert_eq!((st.activity, st.external, st.health), (Activity::Discharging { to: 80 }, true, Health::Ok));
+    }
+    #[test] fn cycle_discharge_does_not_flap() {
+        let r = Rig::cycle().hiding_ac(); r.set(85, false, true, -400, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        let n = r.smc.writes().len();
+        for _ in 0..3 { e.handle(Event::Tick); e.handle(Event::PowerChanged); }
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert!(!r.smc.writes()[n..].iter().any(|(k, _)| k == "CHIE"), "{:?}", &r.smc.writes()[n..]);
+        let st = e.status();
+        assert_eq!((st.activity, st.external, st.health), (Activity::Discharging { to: 75 }, true, Health::Ok));
+    }
+    #[test] fn discharge_still_stops_at_target() {
+        // Hold: stops at the upper limit.
+        let r = Rig::hold().hiding_ac(); r.set(100, false, true, -400, Some(900));
+        let mut e = r.engine();
+        e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.set(80, false, true, -400, Some(950)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(e.status().activity, Activity::Holding);
+        r.set(80, false, false, -400, Some(960)); e.handle(Event::Tick); // a real unplug
+        assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
+        // Cycle: stops at the lower limit.
+        let r = Rig::cycle().hiding_ac(); r.set(85, false, true, -400, Some(900));
+        let mut e = r.engine();
+        r.set(76, false, true, -400, Some(950)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.set(75, false, true, -400, Some(960)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
+        r.set(75, false, false, -400, Some(970)); e.handle(Event::Tick);
+        assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
+    }
+    #[test] fn chie_induced_external_flip_is_not_a_replug() {
+        let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(100, false, true, -400, Some(990));
+        let mut e = r.engine();                                          // CHIE=08 at t=1000
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.clock.set(2000);
+        r.set(80, false, true, -400, Some(1990)); e.handle(Event::Tick); // at the limit: CHIE=00 at t=2000
+        assert_eq!((r.smc.value("CHIE"), e.since), (Some(vec![0]), Some(2000)));
+        // macOS reports the adapter again now that CHIE is off: not a replug.
+        r.clock.set(2100);
+        r.set(80, true, true, 1200, Some(2050)); e.handle(Event::Tick); // failing CHTE reading: first strike
+        assert_eq!((e.since, e.strikes), (Some(2000), 1));
+        assert_eq!(e.status().health, Health::Ok);
     }
     fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
         let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
