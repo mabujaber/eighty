@@ -1,0 +1,511 @@
+//! The control engine: startup recovery, periodic ticks, health and shutdown restore.
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use eighty_core::config::Config;
+use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
+use eighty_core::proto::{Health, Request, Response, Status};
+use eighty_core::TICK_SECS;
+use eighty_hw::battery::{BatterySnapshot, BatterySource};
+use eighty_hw::smc::SmcIo;
+
+use crate::control::{detect, detect_read_only, Detection, SmcControl};
+use crate::log::log;
+use crate::store::Store;
+use crate::system::SystemProbe;
+
+pub enum Event {
+    Tick,
+    PowerChanged,
+    WillSleep(mpsc::Sender<()>),
+    DidWake,
+    Request { uid: u32, req: Request, reply: mpsc::Sender<Response> },
+    Shutdown,
+}
+
+pub struct Deps<S: SmcIo, B: BatterySource, Y: SystemProbe> {
+    pub smc: S,
+    pub battery: B,
+    pub system: Y,
+    pub store: Store,
+    /// Returns Unix seconds.
+    pub clock: Box<dyn FnMut() -> u64>,
+}
+
+pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
+    smc: S,
+    battery: B,
+    system: Y,
+    #[allow(dead_code)] // used for saving config changes (Task 7)
+    store: Store,
+    clock: Box<dyn FnMut() -> u64>,
+    config: Config,
+    config_warning: Option<String>,
+    light_warning: Option<String>,
+    detection: Detection,
+    control: SmcControl,
+    health: Health,
+    activity: Activity,
+    override_: Override,
+    snapshot: Option<BatterySnapshot>,
+    /// Outputs last applied successfully; the restore state after a restore.
+    prev: Outputs,
+    /// When charging outputs last changed, and to what; judged by the watchdog (Task 7).
+    pending: Option<(u64, Outputs)>,
+}
+
+impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
+    pub fn start(d: Deps<S, B, Y>) -> Engine<S, B, Y> {
+        let Deps { mut smc, battery, mut system, store, clock } = d;
+        let (config, config_warning) = store.load();
+        if let Some(w) = &config_warning {
+            log(w);
+        }
+        let limiters = if config.accept_other_limiters { Vec::new() } else { system.other_limiters() };
+        // With another limiter present, not even detect's write-back may happen.
+        let detection = if limiters.is_empty() { detect(&mut smc) } else { detect_read_only(&mut smc) };
+        log(&format!("mode {:?}, light {}, keys {:?}", detection.mode, detection.light, detection.keys));
+        let control = SmcControl::new(&detection);
+        let mut e = Engine {
+            smc,
+            battery,
+            system,
+            store,
+            clock,
+            config,
+            config_warning,
+            light_warning: None,
+            detection,
+            control,
+            health: Health::Ok,
+            activity: Activity::Paused,
+            override_: Override::None,
+            snapshot: None,
+            prev: Outputs::default(),
+            pending: None,
+        };
+        if !limiters.is_empty() {
+            e.set_health(Health::OtherLimiters(limiters));
+        } else if e.detection.mode == ControlMode::Unsupported {
+            e.set_health(Health::Unsupported);
+        } else {
+            // Crash recovery: a previous run may have left charging inhibited.
+            e.restore();
+        }
+        e.tick();
+        e
+    }
+
+    /// Handle one event. Returns false once the engine has shut down.
+    pub fn handle(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Tick | Event::PowerChanged | Event::DidWake => self.tick(),
+            Event::WillSleep(ack) => {
+                self.tick();
+                let _ = ack.send(());
+            }
+            Event::Request { uid, req, reply } => {
+                let resp = self.request(uid, req);
+                let _ = reply.send(resp);
+            }
+            Event::Shutdown => {
+                self.shutdown();
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Process events until `Shutdown` or until every sender is gone; tick every `TICK_SECS`.
+    pub fn run(mut self, rx: Receiver<Event>) {
+        let period = Duration::from_secs(TICK_SECS);
+        let mut next_tick = Instant::now() + period;
+        loop {
+            let ev = match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                Ok(ev) => ev,
+                Err(RecvTimeoutError::Timeout) => {
+                    next_tick = Instant::now() + period;
+                    Event::Tick
+                }
+                Err(RecvTimeoutError::Disconnected) => Event::Shutdown,
+            };
+            if !self.handle(ev) {
+                break;
+            }
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        let s = self.snapshot.as_ref();
+        Status {
+            percent: s.map_or(0, |s| s.percent),
+            external: s.is_some_and(|s| s.external_connected),
+            charging: s.is_some_and(|s| s.is_charging),
+            amperage_ma: s.map_or(0, |s| s.amperage_ma),
+            mode: self.detection.mode,
+            activity: if self.health.is_ok() { self.activity } else { Activity::Paused },
+            health: self.health.clone(),
+            settings: self.config.settings,
+            override_: self.override_,
+            light_supported: self.detection.light,
+            warnings: self.config_warning.iter().chain(&self.light_warning).cloned().collect(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    fn request(&mut self, _uid: u32, _req: Request) -> Response {
+        Response::Error("not implemented".into())
+    }
+
+    /// Health states in which the engine keeps controlling the keys.
+    fn may_control(&self) -> bool {
+        self.detection.mode != ControlMode::Unsupported
+            && matches!(self.health, Health::Ok | Health::BatteryUnreadable(_))
+    }
+
+    fn tick(&mut self) {
+        // Always read the battery, even when paused, so status shows current numbers.
+        let snap = self.battery.snapshot();
+        if let Ok(s) = &snap {
+            self.snapshot = Some(s.clone());
+        }
+        if !self.may_control() {
+            self.set_activity(Activity::Paused);
+            return;
+        }
+        let snap = match snap {
+            Ok(s) => s,
+            Err(err) => {
+                let was_unreadable = matches!(self.health, Health::BatteryUnreadable(_));
+                self.set_health(Health::BatteryUnreadable(err.to_string()));
+                if !was_unreadable {
+                    self.restore();
+                }
+                self.set_activity(Activity::Paused);
+                return;
+            }
+        };
+        if matches!(self.health, Health::BatteryUnreadable(_)) {
+            self.set_health(Health::Ok);
+        }
+
+        if let Err(h) = self.control.check_unchanged(&mut self.smc) {
+            // A conflict means something else owns the keys: stop without fighting it.
+            // A failed read is treated like a failed write: restore.
+            let restore = matches!(h, Health::WriteFailed { .. });
+            self.set_health(h);
+            if restore {
+                self.restore();
+            }
+            self.set_activity(Activity::Paused);
+            return;
+        }
+
+        let inputs = Inputs {
+            percent: snap.percent,
+            external: snap.external_connected,
+            lid_closed: self.system.lid_closed(),
+            mode: self.detection.mode,
+        };
+        let d = decide(&self.config.settings, self.override_, &inputs, &self.prev);
+        if d.clear_override {
+            log(&format!("override {:?} finished", self.override_));
+            self.override_ = Override::None;
+        }
+
+        let wrote = match self.control.apply(&mut self.smc, &d.outputs) {
+            Ok(wrote) => {
+                self.set_light_warning(None);
+                wrote
+            }
+            // The light is cosmetic: CHTE/CHIE were already written, so keep limiting.
+            Err((key, err)) if key == "ACLC" => {
+                self.set_light_warning(Some(format!("couldn't set the charge light (ACLC): {err}")));
+                false
+            }
+            Err((key, err)) => {
+                self.set_health(Health::WriteFailed { key, error: err.to_string() });
+                self.restore();
+                self.set_activity(Activity::Paused);
+                return;
+            }
+        };
+        let charging_changed =
+            d.outputs.inhibit != self.prev.inhibit || d.outputs.discharge != self.prev.discharge;
+        if wrote || charging_changed {
+            self.pending = Some(((self.clock)(), d.outputs));
+        }
+        if d.outputs != self.prev {
+            log(&format!(
+                "outputs inhibit={} discharge={} light={:?}",
+                d.outputs.inhibit, d.outputs.discharge, d.outputs.light
+            ));
+        }
+        self.prev = d.outputs;
+        self.set_activity(d.activity);
+    }
+
+    fn shutdown(&mut self) {
+        let leave_alone = matches!(
+            self.health,
+            Health::OtherLimiters(_) | Health::Conflict { .. } | Health::Unsupported
+        );
+        if leave_alone {
+            log("shutting down; keys left untouched");
+        } else {
+            log("shutting down; restoring charging");
+            self.restore();
+        }
+    }
+
+    /// Write the restore state and forget the previous outputs and any pending check.
+    fn restore(&mut self) {
+        for (key, err) in self.control.restore(&mut self.smc) {
+            log(&format!("restoring {key} failed: {err}"));
+        }
+        self.prev = Outputs::default();
+        self.pending = None;
+    }
+
+    fn set_health(&mut self, h: Health) {
+        if h != self.health {
+            log(&format!("health: {}", h.message()));
+            self.health = h;
+        }
+    }
+
+    fn set_activity(&mut self, a: Activity) {
+        if a != self.activity {
+            log(&format!("activity {a:?}"));
+            self.activity = a;
+        }
+    }
+
+    fn set_light_warning(&mut self, w: Option<String>) {
+        if w != self.light_warning {
+            if let Some(w) = &w {
+                log(w);
+            }
+            self.light_warning = w;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::FakeSystem;
+    use eighty_core::policy::{Activity, ControlMode};
+    use eighty_core::proto::Health;
+    use eighty_hw::battery::fake::FakeBattery;
+    use eighty_hw::battery::{BatteryError, BatterySnapshot};
+    use eighty_hw::smc::fake::{FakeSmc, WriteMode};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct Rig {
+        smc: FakeSmc,
+        sys: FakeSystem,
+        store: Store,
+        clock: Rc<Cell<u64>>,
+        fail: Rc<Cell<bool>>,
+        snap: Rc<RefCell<BatterySnapshot>>,
+        fallible: bool,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        fn with(smc: FakeSmc) -> Rig {
+            let dir = tempfile::tempdir().unwrap();
+            Rig {
+                smc,
+                sys: FakeSystem::default(),
+                store: Store::new(dir.path().into()),
+                clock: Rc::new(Cell::new(1_000)),
+                fail: Rc::new(Cell::new(false)),
+                snap: Rc::new(RefCell::new(BatterySnapshot {
+                    percent: 50,
+                    is_charging: false,
+                    external_connected: false,
+                    amperage_ma: 0,
+                    temperature_c: None,
+                    cycle_count: None,
+                    update_time: None,
+                })),
+                fallible: false,
+                _dir: dir,
+            }
+        }
+        fn hold() -> Rig {
+            let s = FakeSmc::new();
+            s.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept);
+            s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+            s.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+            Rig::with(s)
+        }
+        fn cycle() -> Rig {
+            let s = FakeSmc::new();
+            s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
+            s.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+            Rig::with(s)
+        }
+        /// Like `hold`, but the battery returns an error while `fail` is set.
+        fn hold_fallible() -> Rig {
+            Rig { fallible: true, ..Rig::hold() }
+        }
+        fn set(&self, pct: u8, charging: bool, external: bool, amp: i32, update_time: Option<u64>) {
+            let mut s = self.snap.borrow_mut();
+            s.percent = pct;
+            s.is_charging = charging;
+            s.external_connected = external;
+            s.amperage_ma = amp;
+            s.update_time = update_time;
+        }
+        fn engine(&self) -> Engine<FakeSmc, FakeBattery, FakeSystem> {
+            let snap = self.snap.clone();
+            let battery = if self.fallible {
+                let fail = self.fail.clone();
+                FakeBattery::fallible(move || {
+                    if fail.get() {
+                        Err(BatteryError::NotFound)
+                    } else {
+                        Ok(snap.borrow().clone())
+                    }
+                })
+            } else {
+                FakeBattery::new(move || snap.borrow().clone())
+            };
+            let clock = self.clock.clone();
+            Engine::start(Deps {
+                smc: self.smc.clone(),
+                battery,
+                system: self.sys.clone(),
+                store: Store::new(self._dir.path().into()),
+                clock: Box::new(move || clock.get()),
+            })
+        }
+    }
+
+    #[test] fn startup_hold_at_limit_inhibits_and_lights_green() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900));
+        let e = r.engine();
+        assert_eq!(e.status().mode, ControlMode::Hold);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        assert_eq!(r.smc.value("ACLC"), Some(vec![3]));
+        assert_eq!(e.status().activity, Activity::Holding);
+    }
+    #[test] fn startup_recovers_stale_discharge() {
+        let r = Rig::hold(); r.smc.insert("CHIE", "ui8 ", &[8], WriteMode::Accept); r.set(60, false, true, -400, Some(900));
+        let _e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+    }
+    #[test] fn other_limiter_blocks_all_writes() {
+        let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(90, true, true, 1000, Some(900));
+        let mut e = r.engine(); e.handle(Event::Tick); e.handle(Event::Shutdown);
+        assert!(r.smc.writes().is_empty());
+        assert!(matches!(e.status().health, Health::OtherLimiters(_)));
+        assert_eq!(e.status().activity, Activity::Paused);
+    }
+    #[test] fn unsupported_reports_and_writes_nothing() {
+        let r = Rig::with(FakeSmc::new()); r.set(90, true, true, 1000, Some(900));
+        let e = r.engine();
+        assert_eq!(e.status().health, Health::Unsupported);
+        assert!(r.smc.writes().is_empty());
+    }
+    #[test] fn conflict_stops_writing_and_does_not_restore() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept);
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick); e.handle(Event::Shutdown);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
+        assert_eq!(r.smc.writes().len(), n);
+    }
+    #[test] fn write_failure_restores_and_reports() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::NotPrivileged);
+        r.set(80, true, true, 1200, Some(960)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::WriteFailed { ref key, .. } if key == "CHTE"));
+    }
+    #[test] fn battery_unreadable_restores_then_recovers() {
+        // Rig::hold_fallible: the battery closure returns Err while r.fail is set
+        let r = Rig::hold_fallible(); r.set(85, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.fail.set(true); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::BatteryUnreadable(_)));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        r.fail.set(false); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+    }
+    #[test] fn shutdown_restores() {
+        let r = Rig::hold(); r.set(85, true, true, 1200, Some(900));
+        let mut e = r.engine(); assert!(!e.handle(Event::Shutdown));
+        assert_eq!((r.smc.value("CHTE"), r.smc.value("CHIE"), r.smc.value("ACLC")), (Some(vec![0; 4]), Some(vec![0]), Some(vec![0])));
+    }
+    #[test] fn will_sleep_ticks_then_acks() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+        let mut e = r.engine(); r.set(80, true, true, 1200, Some(960));
+        let (tx, rx) = std::sync::mpsc::channel(); e.handle(Event::WillSleep(tx));
+        rx.try_recv().unwrap();
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+    }
+    #[test] fn cycle_mode_on_m2_shape() {
+        let r = Rig::cycle(); r.set(80, true, true, 2700, Some(900));
+        let e = r.engine();
+        assert_eq!(e.status().mode, ControlMode::Cycle);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+    }
+
+    // Added beyond the brief.
+
+    #[test] fn light_write_failure_is_only_a_warning() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("ACLC"), Some(vec![4]));
+        r.smc.insert("ACLC", "ui8 ", &[4], WriteMode::NotPrivileged);
+        r.clock.set(2_000);
+        r.set(80, true, true, 1200, Some(960)); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!(st.health, Health::Ok);
+        assert_eq!(st.activity, Activity::Holding);
+        assert!(st.warnings.iter().any(|w| w.contains("ACLC")), "{:?}", st.warnings);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        assert_eq!(e.pending.map(|(t, o)| (t, o.inhibit)), Some((2_000, true)));
+    }
+    #[test] fn paused_status_still_shows_battery_numbers() {
+        let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(90, true, true, 1000, Some(900));
+        let st = r.engine().status();
+        assert_eq!((st.percent, st.external, st.charging, st.amperage_ma), (90, true, true, 1000));
+    }
+    #[test] fn status_without_any_snapshot_is_zeroed() {
+        let r = Rig::hold_fallible(); r.fail.set(true);
+        let st = r.engine().status();
+        assert!(matches!(st.health, Health::BatteryUnreadable(_)));
+        assert_eq!((st.percent, st.external, st.charging, st.amperage_ma), (0, false, false, 0));
+        assert_eq!(st.activity, Activity::Paused);
+    }
+    #[test] fn config_warning_and_version_in_status() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+        std::fs::write(r._dir.path().join("config.toml"), "not toml [[[").unwrap();
+        let st = r.engine().status();
+        assert!(st.warnings.iter().any(|w| w.contains("config.toml")));
+        assert_eq!(st.version, env!("CARGO_PKG_VERSION"));
+        assert!(st.light_supported);
+    }
+    #[test] fn accepted_other_limiters_do_not_block() {
+        let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(80, true, true, 1200, Some(900));
+        r.store.save(&Config { accept_other_limiters: true, ..Config::default() }).unwrap();
+        let e = r.engine();
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+    }
+    #[test] fn requests_are_not_implemented_yet() {
+        let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(e.handle(Event::Request { uid: 0, req: eighty_core::proto::Request::Status, reply: tx }));
+        assert_eq!(rx.try_recv().unwrap(), Response::Error("not implemented".into()));
+    }
+}
