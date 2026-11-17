@@ -621,6 +621,19 @@ mod tests {
         let _e = r.engine();
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
     }
+    #[test] fn startup_restores_before_deciding() {
+        // Unplugged below the limit: the decision leaves the light alone (light: None),
+        // so only the startup restore can clear a stale green light.
+        let r = Rig::hold(); r.smc.insert("ACLC", "ui8 ", &[3], WriteMode::Accept); r.set(60, false, false, -400, Some(900));
+        let _e = r.engine();
+        assert_eq!(r.smc.value("ACLC"), Some(vec![0]));
+        let w = |k: &str, v: &[u8]| (k.to_string(), v.to_vec());
+        assert_eq!(r.smc.writes(), vec![
+            w("CHTE", &[0; 4]), w("CHIE", &[0]), w("ACLC", &[3]), // detect's write-back
+            w("CHTE", &[0; 4]), w("CHIE", &[0]), w("ACLC", &[0]), // startup restore
+            w("CHTE", &[0; 4]), w("CHIE", &[0]),                  // first decision
+        ]);
+    }
     #[test] fn other_limiter_blocks_all_writes() {
         let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(90, true, true, 1000, Some(900));
         let mut e = r.engine(); e.handle(Event::Tick); e.handle(Event::Shutdown);
