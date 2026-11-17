@@ -70,6 +70,8 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     last_strike: Option<u64>,
     /// `external_connected` from the last reading taken while we were not discharging.
     trusted_external: bool,
+    /// When our discharge last stopped, until a reading shows macOS caught up with it.
+    discharge_stopped: Option<u64>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
@@ -106,6 +108,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             strikes: 0,
             last_strike: None,
             trusted_external: false,
+            discharge_stopped: None,
         };
         e.bring_up();
         e.tick();
@@ -365,10 +368,23 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             // though it is not, so an unplugged reading then can't be trusted: keep the
             // last reading taken while we weren't discharging. A real unplug mid-discharge
             // is harmless: the battery was discharging anyway, and the discharge still
-            // stops at the target or the floor (decided by percent); readings are trusted
-            // again from the tick after CHIE=00.
+            // stops at the target or the floor (decided by percent). After CHIE=00 macOS
+            // may still report unplugged for a moment, so an unplugged reading is trusted
+            // again only once it is newer than the stop (or, without a timestamp, a full
+            // tick later); a plugged-in reading is always trusted.
             if self.prev.discharge {
                 s.external_connected |= self.trusted_external;
+            } else if let Some(stopped) = self.discharge_stopped {
+                let fresh = match s.update_time {
+                    Some(u) => u > stopped,
+                    None => (self.clock)() >= stopped + TICK_SECS,
+                };
+                if s.external_connected || fresh {
+                    self.discharge_stopped = None;
+                    self.trusted_external = s.external_connected;
+                } else {
+                    s.external_connected = self.trusted_external;
+                }
             } else {
                 self.trusted_external = s.external_connected;
             }
@@ -488,13 +504,23 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 d.outputs.inhibit, d.outputs.discharge, d.outputs.light
             ));
         }
+        let was_discharging = self.prev.discharge;
         self.prev = d.outputs;
+        self.note_discharge_stop(was_discharging);
         self.set_activity(d.activity);
+    }
+
+    /// Call after changing `prev`: if our discharge just stopped, remember when.
+    fn note_discharge_stop(&mut self, was_discharging: bool) {
+        if was_discharging && !self.prev.discharge {
+            self.discharge_stopped = Some((self.clock)());
+        }
     }
 
     /// On entering a conflict: stop our discharge if `CHIE` still holds our `08`;
     /// every other key stays as the other writer left it.
     fn stop_our_discharge(&mut self) {
+        let was_discharging = self.prev.discharge;
         match self.control.stop_discharge_if_ours(&mut self.smc) {
             Ok(true) => {
                 log("conflict: stopped our discharge (CHIE=00); other keys left as found");
@@ -510,6 +536,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 self.discharge_warning = Some(w);
             }
         }
+        self.note_discharge_stop(was_discharging);
     }
 
     fn shutdown(&mut self) {
@@ -538,7 +565,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             .collect();
         self.set_restore_failures(failures);
         self.discharge_warning = None;
+        let was_discharging = self.prev.discharge;
         self.prev = Outputs::default();
+        self.note_discharge_stop(was_discharging);
         self.restart_settle(None);
     }
 
@@ -1066,7 +1095,7 @@ mod tests {
         r.set(80, false, true, -400, Some(950)); e.handle(Event::Tick);
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
         assert_eq!(e.status().activity, Activity::Holding);
-        r.set(80, false, false, -400, Some(960)); e.handle(Event::Tick); // a real unplug
+        r.set(80, false, false, -400, Some(1010)); e.handle(Event::Tick); // a real unplug, read after the stop at t=1000
         assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
         // Cycle: stops at the lower limit.
         let r = Rig::cycle().hiding_ac(); r.set(85, false, true, -400, Some(900));
@@ -1076,7 +1105,7 @@ mod tests {
         r.set(75, false, true, -400, Some(960)); e.handle(Event::Tick);
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
         assert_eq!(e.status().activity, Activity::Charging { to: 80 });
-        r.set(75, false, false, -400, Some(970)); e.handle(Event::Tick);
+        r.set(75, false, false, -400, Some(1010)); e.handle(Event::Tick); // read after the stop
         assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
     }
     #[test] fn chie_induced_external_flip_is_not_a_replug() {
@@ -1091,6 +1120,46 @@ mod tests {
         r.set(80, true, true, 1200, Some(2050)); e.handle(Event::Tick); // failing CHTE reading: first strike
         assert_eq!((e.since, e.strikes), (Some(2000), 1));
         assert_eq!(e.status().health, Health::Ok);
+    }
+    /// Hiding hold rig: CHIE=08 at t=1000, then CHIE=00 at t=2000 on reaching the limit.
+    fn stopped_discharge_rig() -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+        let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(100, false, true, -400, Some(990));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        r.clock.set(2000);
+        r.set(80, false, true, -400, Some(1990)); e.handle(Event::Tick);
+        assert_eq!((r.smc.value("CHIE"), e.since), (Some(vec![0]), Some(2000)));
+        (r, e)
+    }
+    #[test] fn lagging_unplugged_reading_after_discharge_is_not_trusted() {
+        let (r, mut e) = stopped_discharge_rig();
+        // macOS still reports the adapter missing, on a reading from before the stop.
+        r.clock.set(2010);
+        r.set(80, false, false, 0, Some(1990)); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.external, st.activity), (true, Activity::Holding));
+        // The adapter shows up again: not a replug, the settle window keeps running.
+        r.clock.set(2100);
+        r.set(80, false, true, 0, Some(2050)); e.handle(Event::Tick);
+        assert_eq!((e.since, e.status().external, e.status().activity), (Some(2000), true, Activity::Holding));
+    }
+    #[test] fn fresh_unplugged_reading_after_discharge_is_honoured() {
+        let (r, mut e) = stopped_discharge_rig();
+        r.clock.set(2010);
+        r.set(80, false, false, 0, Some(1990)); e.handle(Event::Tick); // lagging: distrusted
+        assert!(e.status().external);
+        r.clock.set(2070);
+        r.set(80, false, false, -300, Some(2050)); e.handle(Event::Tick); // newer than the stop
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
+    }
+    #[test] fn unplugged_reading_without_update_time_is_trusted_after_a_tick() {
+        let (r, mut e) = stopped_discharge_rig();
+        r.clock.set(2010);
+        r.set(80, false, false, 0, None); e.handle(Event::Tick);
+        assert!(e.status().external);
+        r.clock.set(2000 + TICK_SECS);
+        e.handle(Event::Tick);
+        assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
     }
     fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
         let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
