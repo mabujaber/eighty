@@ -786,6 +786,15 @@ mod tests {
         assert!(st.warnings.iter().any(|w| w.starts_with("couldn't stop discharging (CHIE): ") && w.ends_with("; the battery may drain while plugged in")), "{:?}", st.warnings);
         assert_eq!((r.smc.value("CHIE"), r.smc.writes().len()), (Some(vec![8]), n));
     }
+    #[test] fn extra_chie_bits_while_discharging_are_not_a_conflict() {
+        let (r, mut e) = discharging_rig();
+        r.smc.insert("CHIE", "ui8 ", &[0x18], WriteMode::Accept); // firmware set another bit
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.health, st.activity), (Health::Ok, Activity::Discharging { to: 80 }));
+        assert_eq!((r.smc.value("CHIE"), r.smc.writes().len()), (Some(vec![0x18]), n));
+    }
     #[test] fn write_failure_restores_and_reports() {
         let r = Rig::hold(); r.set(70, true, true, 1200, Some(900));
         let mut e = r.engine();

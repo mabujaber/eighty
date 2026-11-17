@@ -12,7 +12,10 @@ pub const ACLC: &str = "ACLC";
 
 const CHTE_STOP: [u8; 4] = [1, 0, 0, 0];
 const CHTE_ALLOW: [u8; 4] = [0; 4];
-const CHIE_BATTERY: [u8; 1] = [8];
+const CHIE_BATTERY: [u8; 1] = [CHIE_DISCHARGE_BIT];
+/// The `CHIE` bit eighty owns. Firmware may set other bits (seen: `0x10` after a
+/// power-source change), so ownership is judged by this bit alone.
+const CHIE_DISCHARGE_BIT: u8 = 0x08;
 const CHIE_OFF: [u8; 1] = [0];
 
 /// Keys eighty uses, with the size each must have.
@@ -134,14 +137,20 @@ impl SmcControl {
         Ok(wrote)
     }
 
-    /// Verify `CHTE`/`CHIE` still hold the values we last wrote.
+    /// Verify `CHTE`/`CHIE` still hold the values we last wrote: `CHTE` exactly,
+    /// `CHIE` by our discharge bit only.
     pub fn check_unchanged(&self, smc: &mut dyn SmcIo) -> Result<(), Health> {
         for key in [CHTE, CHIE] {
             let Some(expected) = self.last.get(key) else { continue };
             let found = smc
                 .read(fourcc(key))
                 .map_err(|e| Health::WriteFailed { key: key.to_string(), error: e.to_string() })?;
-            if &found != expected {
+            let unchanged = if key == CHIE {
+                found.len() == expected.len() && chie_bit(&found) == chie_bit(expected)
+            } else {
+                &found == expected
+            };
+            if !unchanged {
                 return Err(Health::Conflict {
                     key: key.to_string(),
                     expected: hex(expected),
@@ -152,7 +161,7 @@ impl SmcControl {
         Ok(())
     }
 
-    /// After a conflict: if we last wrote `CHIE=08` and it still reads `08`, write
+    /// After a conflict: if we last wrote `CHIE=08` and it still has our bit, write
     /// `CHIE=00` so a plugged-in Mac does not drain with nothing enforcing the floor.
     /// Writes nothing else. Returns true if it wrote.
     pub fn stop_discharge_if_ours(&mut self, smc: &mut dyn SmcIo) -> Result<bool, SmcError> {
@@ -160,7 +169,7 @@ impl SmcControl {
             return Ok(false);
         }
         let k = fourcc(CHIE);
-        if smc.read(k)? != CHIE_BATTERY {
+        if !chie_bit(&smc.read(k)?) {
             return Ok(false); // someone else owns CHIE now
         }
         smc.write(k, &CHIE_OFF)?;
@@ -173,6 +182,11 @@ impl SmcControl {
         self.last.clear();
         restore_all(smc)
     }
+}
+
+/// Whether a `CHIE` value has our discharge bit set.
+fn chie_bit(v: &[u8]) -> bool {
+    v.first().is_some_and(|b| b & CHIE_DISCHARGE_BIT != 0)
 }
 
 /// Write the restore state (`CHTE=0`, `CHIE=0`, `ACLC=0`) to every key that exists.
@@ -249,6 +263,36 @@ mod tests {
         c.apply(&mut smc, &on(true, false, None)).unwrap();
         s.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept);
         assert!(matches!(c.check_unchanged(&mut smc), Err(Health::Conflict { ref key, .. }) if key == "CHTE"));
+    }
+    fn check_chie(expected_discharge: bool, found: u8) -> Result<(), Health> {
+        let s = hold_smc(); let mut smc = s.clone();
+        let mut c = SmcControl::new(&detect(&mut smc));
+        c.apply(&mut smc, &on(true, expected_discharge, None)).unwrap();
+        s.insert("CHIE", "ui8 ", &[found], WriteMode::Accept);
+        c.check_unchanged(&mut smc)
+    }
+    #[test] fn chie_ownership_is_judged_by_the_discharge_bit() {
+        assert_eq!(check_chie(true, 0x18), Ok(())); // firmware added a bit: still ours
+        assert_eq!(check_chie(false, 0x10), Ok(()));
+        for (dis, found) in [(true, 0x10), (true, 0x00), (false, 0x08)] {
+            assert!(matches!(check_chie(dis, found), Err(Health::Conflict { ref key, .. }) if key == "CHIE"), "{dis} {found:#x}");
+        }
+    }
+    #[test] fn chte_comparison_stays_exact() {
+        let s = hold_smc(); let mut smc = s.clone();
+        let mut c = SmcControl::new(&detect(&mut smc));
+        c.apply(&mut smc, &on(true, false, None)).unwrap();
+        s.insert("CHTE", "ui32", &[1, 0, 0, 8], WriteMode::Accept);
+        assert!(matches!(c.check_unchanged(&mut smc), Err(Health::Conflict { ref key, .. }) if key == "CHTE"));
+    }
+    #[test] fn stop_discharge_if_ours_with_extra_firmware_bits() {
+        let s = hold_smc(); let mut smc = s.clone();
+        let mut c = SmcControl::new(&detect(&mut smc));
+        c.apply(&mut smc, &on(true, true, None)).unwrap();
+        s.insert("CHIE", "ui8 ", &[0x18], WriteMode::Accept);
+        assert!(c.stop_discharge_if_ours(&mut smc).unwrap());
+        assert_eq!(s.value("CHIE"), Some(vec![0]));
+        assert_eq!(s.writes().last(), Some(&("CHIE".to_string(), vec![0])));
     }
     #[test] fn restore_writes_restore_state() {
         let s = hold_smc(); s.insert("CHTE", "ui32", &[1, 0, 0, 0], WriteMode::Accept); s.insert("CHIE", "ui8 ", &[8], WriteMode::Accept);
