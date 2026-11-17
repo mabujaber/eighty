@@ -120,6 +120,9 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
         let discharge = s.auto_discharge && i.external && !i.lid_closed && i.percent > s.upper && above_floor;
         let activity = if !i.external {
             Activity::OnBattery
+        } else if i.lid_closed && s.auto_discharge && i.percent > s.upper {
+            // Would discharge, but never with the lid closed: say so instead of "Holding at <upper>%".
+            Activity::LidClosed
         } else if discharge {
             Activity::Discharging { to: s.upper }
         } else if inhibit {
@@ -195,8 +198,18 @@ mod tests {
     }
     #[test]
     fn hold_lid_closed_never_discharges() {
-        let d = decide(&s(), Override::None, &i(85, true, true, Hold), &prev(true, false));
-        assert_eq!((d.outputs.inhibit, d.outputs.discharge, d.activity), (true, false, Holding));
+        let off = Settings { auto_discharge: false, ..s() };
+        // (settings, percent, external, inhibit, activity)
+        let rows = [
+            (s(), 85, true, true, LidClosed), // would discharge with the lid open
+            (s(), 80, true, true, Holding),
+            (off, 85, true, true, Holding),
+            (s(), 85, false, true, OnBattery),
+        ];
+        for (st, p, ext, inh, act) in rows {
+            let d = decide(&st, Override::None, &i(p, ext, true, Hold), &prev(true, false));
+            assert_eq!((d.outputs.inhibit, d.outputs.discharge, d.activity), (inh, false, act), "pct {p} ext {ext} auto {}", st.auto_discharge);
+        }
     }
     #[test]
     fn cycle_mode_table() {

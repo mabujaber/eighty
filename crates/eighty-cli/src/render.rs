@@ -20,6 +20,13 @@ fn activity_text(s: &Status) -> String {
         Activity::Holding => format!("Holding at {}%", s.settings.upper),
         Activity::Discharging { to } => format!("Discharging to {to}%"),
         Activity::OnBattery => "On battery".to_string(),
+        Activity::LidClosed if s.mode == ControlMode::Hold => {
+            let to = match s.override_ {
+                Override::DischargeTo(n) => n,
+                _ => s.settings.upper,
+            };
+            format!("Lid closed: holding at {}%, discharges to {to}% when the lid opens", s.percent)
+        }
         Activity::LidClosed => "Lid closed: can't hold the limit in cycle mode".to_string(),
         Activity::Paused => "Paused".to_string(),
     }
@@ -171,6 +178,14 @@ mod tests {
     fn lid_closed_cycle_warns() {
         let s = Status { mode: ControlMode::Cycle, activity: Activity::LidClosed, ..st() };
         assert!(render_status(&s).contains("Lid closed: can't hold the limit in cycle mode"));
+    }
+
+    #[test]
+    fn lid_closed_hold_explains_the_hold() {
+        let s = Status { percent: 100, activity: Activity::LidClosed, ..st() };
+        assert!(render_status(&s).contains("State     Lid closed: holding at 100%, discharges to 80% when the lid opens\n"));
+        let s = Status { override_: Override::DischargeTo(50), ..s };
+        assert!(render_status(&s).contains("State     Lid closed: holding at 100%, discharges to 50% when the lid opens\n"));
     }
 
     #[test]
