@@ -9,7 +9,7 @@ use eighty_core::TICK_SECS;
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
 use eighty_hw::smc::SmcIo;
 
-use crate::control::{detect, detect_read_only, Detection, SmcControl};
+use crate::control::{detect, detect_read_only, Detection, SmcControl, ACLC};
 use crate::log::log;
 use crate::store::Store;
 use crate::system::SystemProbe;
@@ -42,6 +42,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     config: Config,
     config_warning: Option<String>,
     light_warning: Option<String>,
+    /// One warning per key the last restore failed to write; empty once a restore
+    /// (or a successful apply) puts the keys back in a known state.
+    restore_failures: Vec<String>,
     detection: Detection,
     control: SmcControl,
     health: Health,
@@ -75,6 +78,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             config,
             config_warning,
             light_warning: None,
+            restore_failures: Vec::new(),
             detection,
             control,
             health: Health::Ok,
@@ -148,7 +152,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             settings: self.config.settings,
             override_: self.override_,
             light_supported: self.detection.light,
-            warnings: self.config_warning.iter().chain(&self.light_warning).cloned().collect(),
+            warnings: self
+                .config_warning
+                .iter()
+                .chain(&self.light_warning)
+                .chain(&self.restore_failures)
+                .cloned()
+                .collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -163,6 +173,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             && matches!(self.health, Health::Ok | Health::BatteryUnreadable(_))
     }
 
+    /// Whether the engine may write the keys at all, even just to restore them.
+    /// Conflict, other limiters and unsupported mean the keys are not ours to touch.
+    fn may_touch_keys(&self) -> bool {
+        self.detection.mode != ControlMode::Unsupported
+            && !matches!(
+                self.health,
+                Health::OtherLimiters(_) | Health::Conflict { .. } | Health::Unsupported
+            )
+    }
+
     fn tick(&mut self) {
         // Always read the battery, even when paused, so status shows current numbers.
         let snap = self.battery.snapshot();
@@ -170,6 +190,10 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             self.snapshot = Some(s.clone());
         }
         if !self.may_control() {
+            // A failed restore may have left charging inhibited: keep retrying it.
+            if !self.restore_failures.is_empty() && self.may_touch_keys() {
+                self.restore();
+            }
             self.set_activity(Activity::Paused);
             return;
         }
@@ -178,7 +202,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             Err(err) => {
                 let was_unreadable = matches!(self.health, Health::BatteryUnreadable(_));
                 self.set_health(Health::BatteryUnreadable(err.to_string()));
-                if !was_unreadable {
+                if !was_unreadable || !self.restore_failures.is_empty() {
                     self.restore();
                 }
                 self.set_activity(Activity::Paused);
@@ -219,7 +243,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 wrote
             }
             // The light is cosmetic: CHTE/CHIE were already written, so keep limiting.
-            Err((key, err)) if key == "ACLC" => {
+            Err((key, err)) if key == ACLC => {
                 self.set_light_warning(Some(format!("couldn't set the charge light (ACLC): {err}")));
                 false
             }
@@ -230,6 +254,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 return;
             }
         };
+        // CHTE/CHIE now hold values we chose, so an earlier failed restore no longer matters.
+        self.set_restore_failures(Vec::new());
         let charging_changed =
             d.outputs.inhibit != self.prev.inhibit || d.outputs.discharge != self.prev.discharge;
         if wrote || charging_changed {
@@ -246,11 +272,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
     }
 
     fn shutdown(&mut self) {
-        let leave_alone = matches!(
-            self.health,
-            Health::OtherLimiters(_) | Health::Conflict { .. } | Health::Unsupported
-        );
-        if leave_alone {
+        if !self.may_touch_keys() {
             log("shutting down; keys left untouched");
         } else {
             log("shutting down; restoring charging");
@@ -260,9 +282,20 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
 
     /// Write the restore state and forget the previous outputs and any pending check.
     fn restore(&mut self) {
-        for (key, err) in self.control.restore(&mut self.smc) {
-            log(&format!("restoring {key} failed: {err}"));
-        }
+        let failures = self
+            .control
+            .restore(&mut self.smc)
+            .into_iter()
+            .map(|(key, err)| {
+                let effect = if key == ACLC {
+                    "the charge light may be wrong"
+                } else {
+                    "charging may still be inhibited"
+                };
+                format!("couldn't restore {key}: {err}; {effect}")
+            })
+            .collect();
+        self.set_restore_failures(failures);
         self.prev = Outputs::default();
         self.pending = None;
     }
@@ -278,6 +311,18 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         if a != self.activity {
             log(&format!("activity {a:?}"));
             self.activity = a;
+        }
+    }
+
+    fn set_restore_failures(&mut self, failures: Vec<String>) {
+        if failures != self.restore_failures {
+            if failures.is_empty() {
+                log("restore succeeded");
+            }
+            for f in &failures {
+                log(f);
+            }
+            self.restore_failures = failures;
         }
     }
 
@@ -427,6 +472,36 @@ mod tests {
         r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::NotPrivileged);
         r.set(80, true, true, 1200, Some(960)); e.handle(Event::Tick);
         assert!(matches!(e.status().health, Health::WriteFailed { ref key, .. } if key == "CHTE"));
+        assert_eq!((r.smc.value("CHIE"), r.smc.value("ACLC")), (Some(vec![0]), Some(vec![0])));
+    }
+    #[test] fn failed_restore_is_reported_and_retried() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        // CHTE is stuck at "stop charging": allowing charge fails, and so does restoring.
+        r.smc.insert("CHTE", "ui32", &[1, 0, 0, 0], WriteMode::NotPrivileged);
+        r.set(74, true, true, 0, Some(960)); e.handle(Event::Tick);
+        let st = e.status();
+        assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "CHTE"));
+        assert!(st.warnings.iter().any(|w| w.contains("couldn't restore CHTE")), "{:?}", st.warnings);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
+        // Once the key is writable again, the next tick's retry restores it.
+        r.smc.insert("CHTE", "ui32", &[1, 0, 0, 0], WriteMode::Accept);
+        e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHTE"), Some(vec![0; 4]));
+        let st = e.status();
+        assert!(st.warnings.iter().all(|w| !w.contains("restore")), "{:?}", st.warnings);
+        assert!(matches!(st.health, Health::WriteFailed { .. }));
+    }
+    #[test] fn conflict_never_retries_restore() {
+        let r = Rig::hold(); r.set(80, true, true, 1200, Some(900));
+        let mut e = r.engine();
+        e.restore_failures = vec!["couldn't restore CHTE: x".into()];
+        r.smc.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept);
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
+        assert_eq!(r.smc.writes().len(), n);
     }
     #[test] fn battery_unreadable_restores_then_recovers() {
         // Rig::hold_fallible: the battery closure returns Err while r.fail is set

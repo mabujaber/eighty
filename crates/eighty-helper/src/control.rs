@@ -7,7 +7,8 @@ use eighty_hw::smc::{hex, FourCC, SmcError, SmcIo};
 
 const CHTE: &str = "CHTE";
 const CHIE: &str = "CHIE";
-const ACLC: &str = "ACLC";
+/// The charge-light key; failures writing it are only warnings.
+pub const ACLC: &str = "ACLC";
 
 const CHTE_STOP: [u8; 4] = [1, 0, 0, 0];
 const CHTE_ALLOW: [u8; 4] = [0; 4];
