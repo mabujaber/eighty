@@ -72,6 +72,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     trusted_external: bool,
     /// When our discharge last stopped, until a reading shows macOS caught up with it.
     discharge_stopped: Option<u64>,
+    /// When `inhibit` or `discharge` last changed. Status marks a battery reading taken
+    /// before `SETTLE_SECS` after it as stale: its current shows the old state.
+    charging_changed_at: Option<u64>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
@@ -109,6 +112,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             last_strike: None,
             trusted_external: false,
             discharge_stopped: None,
+            charging_changed_at: None,
         };
         e.bring_up();
         e.tick();
@@ -212,6 +216,10 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             external: s.is_some_and(|s| s.external_connected),
             charging: s.is_some_and(|s| s.is_charging),
             amperage_ma: s.map_or(0, |s| s.amperage_ma),
+            amperage_stale: matches!(
+                (self.charging_changed_at, s.and_then(|s| s.update_time)),
+                (Some(changed), Some(updated)) if updated < changed + SETTLE_SECS
+            ),
             mode: self.detection.mode,
             activity: if self.health.is_ok() { self.activity } else { Activity::Paused },
             health: self.health.clone(),
@@ -525,15 +533,20 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 d.outputs.inhibit, d.outputs.discharge, d.outputs.light
             ));
         }
-        let was_discharging = self.prev.discharge;
+        let old = self.prev;
         self.prev = d.outputs;
-        self.note_discharge_stop(was_discharging);
+        self.note_prev_change(old);
         self.set_activity(d.activity);
     }
 
-    /// Call after changing `prev`: if our discharge just stopped, remember when.
-    fn note_discharge_stop(&mut self, was_discharging: bool) {
-        if was_discharging && !self.prev.discharge {
+    /// Call after changing `prev` from `old`: remember when charging changed, and when
+    /// our discharge stopped.
+    fn note_prev_change(&mut self, old: Outputs) {
+        let p = self.prev;
+        if old.inhibit != p.inhibit || old.discharge != p.discharge {
+            self.charging_changed_at = Some((self.clock)());
+        }
+        if old.discharge && !p.discharge {
             self.discharge_stopped = Some((self.clock)());
         }
     }
@@ -541,7 +554,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
     /// On entering a conflict: stop our discharge if `CHIE` still holds our `08`;
     /// every other key stays as the other writer left it.
     fn stop_our_discharge(&mut self) {
-        let was_discharging = self.prev.discharge;
+        let old = self.prev;
         match self.control.stop_discharge_if_ours(&mut self.smc) {
             Ok(true) => {
                 log("conflict: stopped our discharge (CHIE=00); other keys left as found");
@@ -557,7 +570,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 self.discharge_warning = Some(w);
             }
         }
-        self.note_discharge_stop(was_discharging);
+        self.note_prev_change(old);
     }
 
     fn shutdown(&mut self) {
@@ -586,9 +599,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             .collect();
         self.set_restore_failures(failures);
         self.discharge_warning = None;
-        let was_discharging = self.prev.discharge;
+        let old = self.prev;
         self.prev = Outputs::default();
-        self.note_discharge_stop(was_discharging);
+        self.note_prev_change(old);
         self.restart_settle(None);
     }
 
@@ -970,6 +983,24 @@ mod tests {
         let r = Rig::hold(); r.sys.0.borrow_mut().other_limiters = vec!["battery".into()]; r.set(90, true, true, 1000, Some(900));
         let st = r.engine().status();
         assert_eq!((st.percent, st.external, st.charging, st.amperage_ma), (90, true, true, 1000));
+    }
+    #[test] fn battery_reading_from_before_a_switch_is_marked_stale() {
+        // Cycle mode at 81%: discharge starts at t=1000 while the last reading (t=990)
+        // still shows the charger's current.
+        let r = Rig::cycle(); r.set(81, true, true, 2157, Some(990));
+        let mut e = r.engine();
+        assert!(e.prev.discharge);
+        assert!(e.status().amperage_stale);
+        // Too soon after the switch to show its effect: still stale.
+        r.clock.set(1_060); r.set(81, false, true, 2157, Some(1_001)); e.handle(Event::Tick);
+        assert!(e.status().amperage_stale);
+        // A reading SETTLE_SECS after the switch is fresh.
+        r.clock.set(1_120); r.set(81, false, true, -820, Some(1_000 + SETTLE_SECS)); e.handle(Event::Tick);
+        assert!(!e.status().amperage_stale);
+        // A reading without a timestamp can't be judged, so it's shown as is.
+        r.clock.set(1_180); r.set(75, false, true, -820, None); e.handle(Event::Tick);
+        assert!(!e.prev.discharge);
+        assert!(!e.status().amperage_stale);
     }
     #[test] fn status_without_any_snapshot_is_zeroed() {
         let r = Rig::hold_fallible(); r.fail.set(true);

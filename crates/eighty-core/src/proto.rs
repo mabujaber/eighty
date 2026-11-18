@@ -74,6 +74,10 @@ pub struct Status {
     pub external: bool,
     pub charging: bool,
     pub amperage_ma: i32,
+    /// The reading predates the last charging switch, so `charging` and `amperage_ma`
+    /// still show the old state.
+    #[serde(default)]
+    pub amperage_stale: bool,
     pub mode: ControlMode,
     pub activity: Activity,
     pub health: Health,
@@ -167,6 +171,7 @@ mod tests {
             external: true,
             charging: false,
             amperage_ma: 0,
+            amperage_stale: false,
             mode: ControlMode::Hold,
             activity: Activity::Holding,
             health: Health::Ok,

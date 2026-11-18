@@ -47,7 +47,9 @@ pub fn render_status(s: &Status) -> String {
     if !s.health.is_ok() {
         out.push_str(&format!("NOT LIMITING: {}\n", health_text(s)));
     }
-    let charging_part = if s.charging {
+    let charging_part = if s.amperage_stale {
+        "updating…".to_string()
+    } else if s.charging {
         format!("charging {} mA", s.amperage_ma)
     } else if s.amperage_ma < 0 {
         format!("discharging {} mA", s.amperage_ma.abs())
@@ -122,6 +124,7 @@ mod tests {
             external: true,
             charging: true,
             amperage_ma: 1197,
+            amperage_stale: false,
             mode: ControlMode::Hold,
             activity: Activity::Charging { to: 80 },
             health: Health::Ok,
@@ -141,6 +144,12 @@ mod tests {
         assert!(out.contains("State     Charging to 80%"));
         assert!(out.contains("Mode      hold (CHTE) · MagSafe light: yes"));
         assert!(!out.contains("NOT LIMITING"));
+    }
+
+    #[test]
+    fn stale_reading_hides_the_current() {
+        let s = Status { amperage_stale: true, ..st() };
+        assert_eq!(render_status(&s).lines().next().unwrap(), "Battery   78% · updating… · on AC");
     }
 
     #[test]
