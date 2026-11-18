@@ -52,18 +52,17 @@ fn restore(print: impl Fn(&str)) -> anyhow::Result<usize> {
     Ok(errors.len())
 }
 
-/// `--restore`: SMC keys first, then the user's own native limit. Returns the failure count.
+/// `--restore`: SMC keys first, then the user's own native limit. Returns the failure
+/// count; an unreadable config counts, since the original limit couldn't be put back.
 fn restore_everything(print: impl Fn(&str)) -> anyhow::Result<usize> {
     let mut failed = restore(&print)?;
     let store = Store::new(PathBuf::from(CONFIG_DIR));
     match restore_native(&mut PowerUi::new(), &store) {
         Ok(NativeRestore::Restored(n)) => print(&format!("restore: native limit back to {n}%")),
         Ok(NativeRestore::LeftAsIs) => print("restore: native limit left as is"),
-        Ok(NativeRestore::ConfigUnreadable(w)) => {
-            print(&format!("restore: config unreadable ({w}); native limit left as is"))
-        }
+        // Includes an unreadable config: the original couldn't be put back.
         Err(e) => {
-            print(&format!("restore native: FAILED: {e}"));
+            print(&e.message());
             failed += 1;
         }
     }

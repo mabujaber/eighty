@@ -263,22 +263,45 @@ pub enum NativeRestore {
     Restored(u8),
     /// No original recorded, or no Charge Limit on this Mac: nothing to put back.
     LeftAsIs,
+}
+
+/// Why `restore_native` couldn't put the user's limit back. Either way `--restore`
+/// fails, so `eighty uninstall` doesn't report success.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeRestoreError {
     /// The config (and so the recorded original) couldn't be read: the store's warning.
+    /// The native limit is left as is.
     ConfigUnreadable(String),
+    /// Setting the original back failed.
+    SetFailed(String),
+}
+
+impl NativeRestoreError {
+    /// The line `--restore` prints.
+    pub fn message(&self) -> String {
+        match self {
+            NativeRestoreError::ConfigUnreadable(w) => {
+                format!("restore: config unreadable ({w}); native limit left as is")
+            }
+            NativeRestoreError::SetFailed(e) => format!("restore native: FAILED: {e}"),
+        }
+    }
 }
 
 /// Put the user's own native Charge Limit back (the one recorded when eighty
 /// first took control). Does nothing without a record or without Charge Limit.
-pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<NativeRestore, String> {
+pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<NativeRestore, NativeRestoreError> {
     let (config, warning) = store.load();
     if let Some(w) = warning {
-        return Ok(NativeRestore::ConfigUnreadable(w));
+        return Err(NativeRestoreError::ConfigUnreadable(w));
     }
     let Some(original) = config.native_original else { return Ok(NativeRestore::LeftAsIs) };
     if !native.supported() {
         return Ok(NativeRestore::LeftAsIs);
     }
-    native.set_limit(original).map_err(|e| format!("setting the native limit back to {original}%: {e}"))?;
+    native
+        .set_limit(original)
+        .map_err(|e| NativeRestoreError::SetFailed(format!("setting the native limit back to {original}%: {e}")))?;
     Ok(NativeRestore::Restored(original))
 }
 
@@ -415,8 +438,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
         std::fs::write(dir.path().join("config.toml"), "not toml [[[").unwrap();
         let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
-        let Ok(NativeRestore::ConfigUnreadable(w)) = restore_native(&mut n, &store) else { panic!() };
+        // An error, so `--restore` (and with it `eighty uninstall`) reports a failure.
+        let Err(e @ NativeRestoreError::ConfigUnreadable(_)) = restore_native(&mut n, &store) else { panic!() };
+        let NativeRestoreError::ConfigUnreadable(w) = &e else { unreachable!() };
         assert!(w.contains("config.toml"), "{w}");
+        assert_eq!(e.message(), format!("restore: config unreadable ({w}); native limit left as is"));
         assert_eq!(n.writes(), Vec::<u8>::new());
+    }
+    #[test] fn restore_native_reports_a_failed_set() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        store.save(&Config { native_original: Some(95), ..Config::default() }).unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80); n.fail_calls(true);
+        let Err(e) = restore_native(&mut n, &store) else { panic!() };
+        assert_eq!(e.message(), "restore native: FAILED: setting the native limit back to 95%: fake native call failed");
     }
 }
