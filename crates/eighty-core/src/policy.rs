@@ -111,6 +111,7 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
             } else {
                 (hold, true, if native { None } else { Some(Light::Green) }, Activity::Discharging { to: n })
             };
+            let light = if native { None } else { light };
             return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override, native_limit: nl(s.upper) };
         }
         Override::None => {}
@@ -226,6 +227,13 @@ mod tests {
         assert_eq!((r.outputs.discharge, r.outputs.inhibit, r.native_limit), (true, false, Some(80)));
         let r = decide(&s(), Override::DischargeTo(70), &i(78, true, true, Native), &prev(false, true));
         assert!(!r.outputs.discharge); // lid closed
+    }
+    #[test] fn native_discharge_to_never_touches_the_light() {
+        // lid closed on AC, and at or below the floor on AC
+        for (pct, lid) in [(78, true), (10, false), (8, false)] {
+            let r = decide(&s(), Override::DischargeTo(5), &i(pct, true, lid, Native), &prev(false, false));
+            assert_eq!(r.outputs.light, None, "pct {pct} lid {lid}");
+        }
     }
     #[test] fn hold_mode_has_no_native_limit() {
         assert_eq!(decide(&s(), Override::None, &i(80, true, false, Hold), &prev(false, false)).native_limit, None);
