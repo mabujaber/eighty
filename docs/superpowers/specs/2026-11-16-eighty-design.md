@@ -84,11 +84,11 @@ This is the riskiest part and the reason the project exists. Which SMC keys cont
   - **Legacy SMC:** `CH0B`/`CH0C` (inhibit), `CH0I` (discharge).
   - **Tahoe-era SMC:** `CHTE` (inhibit, 4 bytes), `CHIE` / `CH0J` (discharge).
   - **Firmware charge-limit registers:** `bfD0`/`bfE0`/`bfF0` (upper limit / lower limit / enable), reported in battery#482.
-  - **PowerUI / MCL** (private `PowerUISmartChargeClient`, `setMCLLimit:`), reported in battery#474 as the route on macOS 27, where direct SMC writes return `kIOReturnNotPrivileged`. It only supports fixed steps (80/85/90/95/100), so features that need arbitrary limits degrade, and that degradation must be shown to the user. *Claude's call:* macOS 27 isn't testable yet, so v1 reserves this backend's slot in the trait and probe order but doesn't implement it. Work on it starts once macOS 27 betas can be tested.
+  - **PowerUI / MCL** (private `PowerUISmartChargeClient`, `setMCLLimit:`), reported in battery#474 as the route on macOS 27, where direct SMC writes return `kIOReturnNotPrivileged`. It only supports fixed steps (80/85/90/95/100), so features that need arbitrary limits degrade, and that degradation must be shown to the user. *Update (2026-11-18):* verified on the M2 Max / macOS 27.2 and now the backend for Macs without `CHTE`. See §5.6.
 - **If no backend works** (on the owner's Mac or any other): the project continues (owner's decision). eighty reports "unsupported on this firmware/macOS" through `doctor`, the CLI and the menu bar. It does nothing to charging, and it keeps probing on each launch and after OS updates so it picks up a working path when one appears (e.g. a new backend in a later release).
 - **MagSafe light:** the SMC key `ACLC` (seen still readable on newer builds in battery#482) controls the light. `battery` uses 0 = system control, 3 = green, 4 = orange. The probe spike confirms which values work on the owner's Mac. The helper exposes this as intent-level operations (`set_light(Green|Orange|System)`), never as raw key writes.
 - **First milestone is a probe spike on the owner's M5 Pro / macOS 26.6.2:** find which keys exist, which accept writes from a root process, and which actually change charging behavior. The backend order and the default key set come from that result, not from this document.
-- **Probe results:** see `docs/probe/README.md`. On the owner's M5 Pro / macOS 26.6.2 (2026-11-16): `CHTE` = `01000000` stops charging, `CHIE` = `08` makes the Mac run from the battery while plugged in, `ACLC` = `03` sets the light green and `04` orange. `CH0J` is blocked for root, and `CH0B`/`CH0C`/`CH0I` are missing. The Tahoe-era backend comes first in the probe order. On the owner's M2 Max / **macOS 27.2** (2026-11-17), there's **no key that stops charging**: `CHTE` and the legacy keys are missing, and `bfD0`/`bfE0`/`bfF0` are blocked for root. But `CHIE` = `08` is verified. So the helper needs a **`CHIE`-only mode**: turn it on at the upper limit and off at the lower limit, so the battery cycles gently between the two. `doctor` reports which mode is active. macOS 27 also doesn't report battery `Temperature` (§5.3).
+- **Probe results:** see `docs/probe/README.md`. On the owner's M5 Pro / macOS 26.6.2 (2026-11-16): `CHTE` = `01000000` stops charging, `CHIE` = `08` makes the Mac run from the battery while plugged in, `ACLC` = `03` sets the light green and `04` orange. `CH0J` is blocked for root, and `CH0B`/`CH0C`/`CH0I` are missing. The Tahoe-era backend comes first in the probe order. On the owner's M2 Max / **macOS 27.2** (2026-11-17), there's **no key that stops charging**: `CHTE` and the legacy keys are missing, and `bfD0`/`bfE0`/`bfF0` are blocked for root. But `CHIE` = `08` is verified. So Plan 2 added a **`CHIE`-only cycle mode**: turn it on at the upper limit and off at the lower limit, so the battery cycles between the two. *Superseded (2026-11-18):* the M2 Max acceptance run showed cycle mode keeps the Mac on battery about 85% of the time it is plugged in and can't hold the limit while asleep (80 → 94% in 21 min). Macs without `CHTE` now use native mode (§5.6), and cycle mode is removed. macOS 27 also doesn't report battery `Temperature` (§5.3).
 - Prior art to check against: `charlie0129/batt` (Go; reported working on Sequoia 15.8 in battery#482), `anarchy89/batterycharging`, and `battery`'s PRs #469 and #486.
 
 ### 5.3 Reading battery state
@@ -111,9 +111,50 @@ Use IOKit's `AppleSmartBattery` registry entry (`CurrentCapacity`, `MaxCapacity`
 
 Recent macOS (26.4+) has a native charge limit and Optimized Battery Charging. BattOpt tells users to set the native limit to 100% and turn off Optimized Charging. eighty's `doctor` and first-run flow detect a conflicting native setting and tell the user what to change. Whether eighty can set these itself is left to the builder.
 
+- **Hold mode (`CHTE`):** the native limit should stay at 100%, as before. On the M5 Pro, the native limit at 80% did not write `CHTE`/`CHIE` and caused no Conflict, but two limiters stacked on one battery is confusing.
+- **Native mode (§5.6):** eighty *is* the native limit. It sets it, and treats a change made in System Settings as the user changing eighty's limit, not as a conflict.
+
 **Other charge limiters write the same keys.** On the owner's Mac, `battery`'s LaunchAgent (`com.battery.app`) kept running after `brew uninstall` and held `CHTE` at `01`, so the Mac stayed at 80% even with the native limit at 100%. eighty must:
 - detect other limiters at first run and in `doctor`: `battery` (`~/Library/LaunchAgents/battery.plist`, `/usr/local/co.palokaj.battery`, `/etc/sudoers.d/battery`), BattOpt, `batt`, and similar tools. It warns about them and doesn't start its policy loop until the user removes them or confirms.
 - read `CHTE`/`CHIE` before writing and not assume it's the only writer. If a value changes when eighty didn't write it, the helper reports a conflict and doesn't fight over the key.
+
+### 5.6 Native mode: macOS's own Charge Limit (Macs without `CHTE`)
+
+*Added 2026-11-18 after the M2 Max acceptance run (`docs/testing/plan2-acceptance.md`, finding G).*
+
+**Why.** On macOS 27 no SMC key stops charging, so eighty's only lever was `CHIE` (run from battery), which can't hold still and forced the cycle mode in §5.2. macOS's own Charge Limit can hold still, and it can be set from code through the private PowerUI framework.
+
+**What was verified** on the M2 Max / macOS 27.2 (26B123), 2026-11-18, from a normal user process with no root:
+
+| Call | Result |
+|---|---|
+| `isMCLSupported` | `YES` |
+| `availableChargeLimitsWithError:` | `80, 85, 90, 95, 100` |
+| `getMCLLimitWithError:` / `isMCLCurrentlyEnabled:` | `100` / `0` before; `80` / `1` after the write |
+| `setMCLLimit:80 error:` | `YES`, no error |
+
+After the write, at 99% on AC:
+- Charging stopped within a minute ("AC attached; not charging"), with `NotChargingReason = 16777216`. That's the same value the Mac showed at 80% and 0 mA before eighty was installed.
+- macOS ran the Mac from the battery on its own, at −0.6 to −1.1 A with `ExternalConnected = Yes`, to bring the charge down to the limit. `CHIE` stayed `00`, so this is macOS's own mechanism, not eighty's.
+- macOS set the MagSafe light green itself (`ACLC = 03`).
+
+The class's selectors and type encodings, read from the runtime: `setMCLLimit:error:` (`B28@0:8C16^@20`), `getMCLLimitWithError:` (`C24@0:8^@16`), `enableMCL:`, `disableMCL:`, `temporarilyDisableMCL:`, `temporarilyEnableCharging:`, `availableChargeLimitsWithError:`, `isMCLCurrentlyEnabled:`, `currentChargeLimit:`. Other tools report that the `…WithHandler:` variants never call their handler, so use the synchronous ones.
+
+**Behaviour** (*owner's decision, 2026-11-18*):
+- **Mode choice.** At startup, `CHTE` usable → hold mode. Otherwise, MCL supported → native mode. Otherwise → unsupported (§5.2's fail-loudly rule). Hold mode stays first because it supports any limit.
+- **Limits.** Only the steps macOS offers (`availableChargeLimitsWithError:`, today 80/85/90/95; 100 means "no limit"). `eighty limit 70` on such a Mac fails with a clear message ("this Mac only supports 80, 85, 90 or 95%"). Nothing falls back to cycling.
+- **No lower limit.** macOS decides when to resume charging. `status` shows `Limit 80% (held by macOS)`, and `limit <upper> <lower>` rejects a lower value in native mode.
+- **Discharge to the limit** is done by macOS (verified above), so auto-discharge shows as "by macOS" and can't be turned off.
+- **The light** is left to macOS, which already shows green at the limit. eighty doesn't write `ACLC` in native mode.
+- **Overrides.** `charge full` → `temporarilyDisableMCL:` (or `temporarilyEnableCharging:`; pick by test), ended at unplug as today. `discharge <n>` below the limit → `CHIE = 08` down to `n`, with all of today's rules (10% floor, lid, sleep), then hand back to macOS.
+- **Ownership.** At install, eighty records the user's current native limit, sets its own, and on uninstall or shutdown-restore puts the recorded value back. If the limit changes outside eighty (System Settings), eighty adopts the new value as its setting and logs it.
+- **Health.** Each tick reads `getMCLLimitWithError:` and `isMCLCurrentlyEnabled:`. A failed call is a `WriteFailed`-style fault, shown loudly. The watchdog judges native mode like hold mode: at or above the limit on AC, the battery must not be charging.
+
+**Still to verify on the M2 Max before building** (each changes the design):
+1. **Root.** Does `PowerUISmartChargeClient` work from a root process, and from the LaunchDaemon before anyone logs in? If not, the call moves to the user side (CLI / menu-bar app), and the helper only watches.
+2. **Reboot.** Does the limit survive a restart? Reports disagree: ChargeCap says macOS stores it, while JuiceBar says it lives only in PowerUIAgent's memory. If it doesn't, the helper re-applies it at boot or login.
+3. **Sleep.** Does it hold overnight on AC? It is enforced by macOS, so it should, unlike cycle mode.
+4. **Calibration.** macOS sometimes charges to 100% to recalibrate and ignores every limit while it does (AlDente issues #1842, #1846 on macOS 27). eighty can't stop it, but `status` must say so rather than claim the limit holds.
 
 ## 6. Release bar (owner's decision)
 
@@ -135,7 +176,7 @@ v1 ships via Homebrew after it has been tested on **2–5 Apple Silicon Macs** t
 
 ## 9. Left to the builder (calls Claude made, not the owner)
 
-- Default lower limit (75) and whether the lower limit is optional.
+- Default lower limit (75) and whether the lower limit is optional. (Hold mode only. Native mode has no lower limit, §5.6.)
 - CLI command names and flags beyond the shape in §5.1.
 - IPC mechanism: XPC via `objc2` versus a root-owned Unix socket with peer-credential checks.
 - Menu-bar UI toolkit: native AppKit via `objc2` is preferred over Tauri/web views for size and native feel, but the builder may choose.
@@ -148,5 +189,6 @@ v1 ships via Homebrew after it has been tested on **2–5 Apple Silicon Macs** t
 ## 10. Open risks
 
 - **Hardware control may not be possible on future macOS.** Apple is tightening SMC write access (battery#474). The probe-first design and the PowerUI backend reduce this risk without removing it. The fail-loudly rule keeps a lost control path from becoming silent harm.
-- Private APIs (PowerUI) can change without notice and are not usable on the App Store. That's acceptable for a Homebrew release.
+- Private APIs (PowerUI) can change without notice and are not usable on the App Store. That's acceptable for a Homebrew release. Native mode (§5.6) now depends on one. Guard every call (check the class and the selector's type encoding before calling), and fall back to "unsupported, loudly" if they change.
+- macOS's own calibration can take the battery to 100% regardless of any limit (§5.6, item 4).
 - Firmware differences between M-series generations mean "works on the owner's M5 Pro" does not guarantee it works on an M1. Issue templates should ask for `eighty doctor` output.

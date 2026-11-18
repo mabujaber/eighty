@@ -4,7 +4,7 @@ Keep your Apple Silicon Mac's battery at 80%, for free.
 
 eighty is a charge limiter written in Rust. A small root helper stops charging at your limit, can run the Mac from battery while it is plugged in to bring the charge down, and turns the MagSafe light green when the limit is reached. It always hands charging back to macOS when it stops or is uninstalled.
 
-> **Status: pre-release.** The helper and CLI pass hardware acceptance on an M5 Pro running macOS 26.6.2 ([results](docs/testing/plan2-acceptance.md)). The menu-bar app, signed builds and Homebrew come later. For now you build from source.
+> **Status: pre-release.** The helper and CLI pass hardware acceptance on an M5 Pro running macOS 26.6.2 (hold mode) and an M2 Max running macOS 27.2 (cycle mode) ([results](docs/testing/plan2-acceptance.md)). On Macs without a stop-charging key, like the M2 Max on macOS 27, cycle mode keeps running from the battery while plugged in and can't hold the limit during sleep. There, macOS's own Charge Limit at 80% is the better choice for now. The menu-bar app, signed builds and Homebrew come later. For now you build from source.
 
 ## Install
 
@@ -80,7 +80,7 @@ Files:
 
 ## Other charge limiters
 
-Run only one limiter at a time. Other tools write the same keys. Uninstall them fully before installing eighty. For [battery](https://github.com/actuallymentor/battery), run `battery uninstall` before `brew uninstall`, or its LaunchAgent keeps running. If eighty finds another limiter installed, it stays paused and `eighty doctor` names the limiter. `eighty doctor --accept-other-limiters` makes eighty run anyway.
+Run only one limiter at a time. Other tools write the same keys. Uninstall them fully before installing eighty. For [battery](https://github.com/actuallymentor/battery), run `battery uninstall` before `brew uninstall`, or its LaunchAgent keeps running. Then remove the app with `brew uninstall --cask --zap battery`: at every login it reinstalls its CLI as root. If eighty finds another limiter installed, it stays paused and `eighty doctor` names the limiter. `eighty doctor --accept-other-limiters` makes eighty run anyway.
 
 ## Check your Mac
 
