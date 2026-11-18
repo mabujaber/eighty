@@ -232,6 +232,10 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     fn native_failed(&mut self, h: Health) {
         let retrying = matches!(h, Health::NativeUnavailable(_));
         let was_retrying = matches!(self.health, Health::NativeUnavailable(_));
+        // What macOS reports once it answers again can't be told apart from a change
+        // made while eighty wasn't watching: confirm eighty's limit afresh (and set it
+        // again if it differs) rather than adopt it.
+        self.native_confirmed = false;
         self.set_health(h);
         if !(retrying && was_retrying) || !self.restore_failures.is_empty() {
             self.restore();
@@ -1677,6 +1681,16 @@ mod tests {
         r.native.fail_calls(false); e.handle(Event::Tick);
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![80, 85]));
+    }
+    #[test] fn native_change_while_macos_was_unreachable_is_not_adopted() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // 80, confirmed
+        r.native.fail_calls(true); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        r.native.set_externally(90); r.native.fail_calls(false);
+        r.clock.set(1_000 + SETTLE_SECS); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!((e.status().settings.upper, r.native.limit_now(), r.native.writes()), (80, 80, vec![80, 80]));
     }
     #[test] fn native_unsaved_original_is_a_fault_not_a_retry() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));
