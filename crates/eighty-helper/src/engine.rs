@@ -18,6 +18,11 @@ use crate::system::SystemProbe;
 /// Settled checks in a row that find eighty's native limit still unconfirmed (about
 /// two minutes, one per tick) before it is reported as `NativeUnavailable`.
 const NATIVE_UNCONFIRMED_STRIKES: u32 = 2;
+/// A candidate native limit is judged only this long after it was first seen, so the
+/// next regular tick can adopt it but a burst of events (e.g. `PowerChanged`) can't.
+const NATIVE_ADOPT_AFTER_SECS: u64 = TICK_SECS - SETTLE_SECS;
+/// Candidates replaced in a row (the read keeps changing) before eighty sets its limit again.
+const NATIVE_CANDIDATE_REPLACEMENTS: u32 = 3;
 
 pub enum Event {
     Tick,
@@ -62,9 +67,13 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// Consecutive checks, each `SETTLE_SECS` after eighty last (re)sent its limit, that
     /// still found it unconfirmed. At `NATIVE_UNCONFIRMED_STRIKES` it is `NativeUnavailable`.
     native_unconfirmed: u32,
-    /// A read that differs from eighty's confirmed limit, waiting for the next check: the
-    /// same value again is adopted as the user's change, anything else drops it.
-    native_candidate: Option<u8>,
+    /// A read that differs from eighty's confirmed limit, with the clock time it was first
+    /// seen. The same value again, `NATIVE_ADOPT_AFTER_SECS` or more later, is adopted as
+    /// the user's change; a different value replaces it.
+    native_candidate: Option<(u8, u64)>,
+    /// Times the candidate was replaced by yet another value without being adopted. At
+    /// `NATIVE_CANDIDATE_REPLACEMENTS` eighty sets its own limit again.
+    native_candidate_replaced: u32,
     /// Shown in `warnings` after adopting a limit changed in System Settings, until the
     /// next successful `SetLimits`.
     native_notice: Option<String>,
@@ -132,6 +141,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             native_confirmed: false,
             native_unconfirmed: 0,
             native_candidate: None,
+            native_candidate_replaced: 0,
             native_notice: None,
             native_ready: false,
             native_warning: None,
@@ -174,7 +184,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.native_written = None;
         self.native_confirmed = false;
         self.native_unconfirmed = 0;
-        self.native_candidate = None;
+        self.clear_native_candidate();
         self.native_ready = false;
         self.set_native_warning(None);
         if !limiters.is_empty() {
@@ -254,7 +264,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         // made while eighty wasn't watching: confirm eighty's limit afresh (and set it
         // again if it differs) rather than adopt it.
         self.native_confirmed = false;
-        self.native_candidate = None;
+        self.clear_native_candidate();
         self.set_health(h);
         if !(retrying && was_retrying) || !self.restore_failures.is_empty() {
             self.restore();
@@ -388,13 +398,15 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         )
     }
 
-    /// Native mode, no override, macOS confirmed eighty's limit, on AC at or below it,
+    /// Native mode, no override, macOS confirmed eighty's limit (and no other reading is
+    /// pending), on AC at or below it,
     /// and a reading fresh enough to judge shows macOS isn't charging.
     fn native_idle_below_limit(&self) -> bool {
         let Some(s) = &self.snapshot else { return false };
         let upper = self.settings().upper;
         self.detection.mode == ControlMode::Native
             && self.native_confirmed
+            && self.native_candidate.is_none()
             && self.override_ == Override::None
             && self.activity == (Activity::Charging { to: upper })
             && s.external_connected
@@ -440,6 +452,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     return Response::Error(m);
                 }
                 self.native_notice = None;
+                // The user's explicit choice wins over a reading not yet adopted.
+                self.clear_native_candidate();
                 self.tick();
             }
             Request::SetAutoDischarge { on } => {
@@ -463,6 +477,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     return Response::Error("plug in first: a full charge needs the charger".into());
                 }
                 self.override_ = Override::FullCharge;
+                self.clear_native_candidate();
                 self.tick();
             }
             Request::ChargeAuto => {
@@ -488,7 +503,10 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 self.override_ = Override::DischargeTo(percent);
                 self.tick();
             }
-            Request::ClearFault => self.clear_fault(),
+            Request::ClearFault => {
+                self.clear_native_candidate();
+                self.clear_fault();
+            }
             Request::AcceptOtherLimiters => {
                 if let Err(m) = self.save(Config { accept_other_limiters: true, ..self.config.clone() }) {
                     return Response::Error(m);
@@ -551,8 +569,23 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         Some(Health::NotEffective { what: what.into() })
     }
 
+    /// The native limit eighty wants now: 100 during `charge full`, else the limit in effect.
+    fn native_wanted(&self) -> u8 {
+        if self.override_ == Override::FullCharge {
+            100
+        } else {
+            self.settings().upper
+        }
+    }
+
+    fn clear_native_candidate(&mut self) {
+        self.native_candidate = None;
+        self.native_candidate_replaced = 0;
+    }
+
     /// Native mode, before deciding: read the Charge Limit and compare it with the last
-    /// value eighty set. A match confirms eighty's write.
+    /// value eighty set. A match confirms eighty's write. If eighty now wants a different
+    /// limit (`eighty limit`, `charge full`/`auto`), nothing is judged: `tick` writes it.
     ///
     /// A difference before that confirmation may be PowerUI still reporting the old
     /// value, so it is never adopted: once `SETTLE_SECS` have passed eighty sets its limit
@@ -560,17 +593,21 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     /// `NativeUnavailable` (retried, like a failed call) until a read matches.
     ///
     /// A difference after it may be the user changing the limit in System Settings, or a
-    /// one-off odd read. The first such read is only a candidate; the same value on the
-    /// next check is adopted as the configured limit (not while `charge full` has lifted
-    /// it), and anything else drops the candidate, setting eighty's limit again if the
-    /// read still differs.
+    /// one-off odd read. The first such read is only a candidate. The same value read
+    /// again at least `NATIVE_ADOPT_AFTER_SECS` later is adopted as the configured limit
+    /// (not while `charge full` has lifted it); a different value replaces the candidate,
+    /// and after `NATIVE_CANDIDATE_REPLACEMENTS` replacements eighty sets its limit again.
     fn check_native_limit(&mut self) -> Result<(), Health> {
         let Some(written) = self.native_written else { return Ok(()) };
+        if self.native_wanted() != written {
+            self.clear_native_candidate();
+            return Ok(());
+        }
         let now = self.native.limit().map_err(unavailable)?;
         if now == written {
             self.native_confirmed = true;
             self.native_unconfirmed = 0;
-            self.native_candidate = None;
+            self.clear_native_candidate();
             return Ok(());
         }
         if !self.native_confirmed {
@@ -579,15 +616,27 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         if self.override_ == Override::FullCharge {
             return Ok(());
         }
-        match self.native_candidate.take() {
+        let t = (self.clock)();
+        match self.native_candidate {
             None => {
                 log(&format!("native: macOS reports {now}%, not eighty's {written}%; checking again next tick"));
-                self.native_candidate = Some(now);
+                self.native_candidate = Some((now, t));
             }
-            Some(c) if c == now => self.adopt_native_limit(written, now),
-            Some(c) => {
-                log(&format!("native: macOS reported {c}%, now {now}%; setting eighty's {written}% again"));
-                self.write_native(written).map_err(unavailable)?;
+            Some((c, seen)) if c == now => {
+                if t >= seen + NATIVE_ADOPT_AFTER_SECS {
+                    self.clear_native_candidate();
+                    self.adopt_native_limit(written, now);
+                }
+            }
+            Some((c, _)) => {
+                self.native_candidate_replaced += 1;
+                if self.native_candidate_replaced >= NATIVE_CANDIDATE_REPLACEMENTS {
+                    log(&format!("native: macOS's reading keeps changing (now {now}%); setting eighty's {written}% again"));
+                    self.write_native(written).map_err(unavailable)?;
+                } else {
+                    log(&format!("native: macOS reported {c}%, now {now}%; checking again next tick"));
+                    self.native_candidate = Some((now, t));
+                }
             }
         }
         Ok(())
@@ -645,7 +694,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             // A new limit, not a re-send: its own confirmation starts from scratch.
             self.native_unconfirmed = 0;
         }
-        self.native_candidate = None;
+        self.clear_native_candidate();
         self.native_written = Some(limit);
         self.native_written_at = Some((self.clock)());
         // A failed read-back is left to the next tick's check, which reports it.
@@ -1814,7 +1863,7 @@ mod tests {
         assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (85, 85));
         assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![80, 85]));
         // A real change in System Settings after confirmation is still adopted.
-        r.native.set_externally(90); e.handle(Event::Tick); e.handle(Event::Tick);
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick); r.clock.set(1_120); e.handle(Event::Tick);
         assert_eq!((e.status().settings.upper, r.native.writes()), (90, vec![80, 85]));
     }
     #[test] fn native_lagging_read_after_charge_full_ends_does_not_adopt_100() {
@@ -1996,15 +2045,73 @@ mod tests {
         let st = e.status();
         assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.writes()), (80, 80, vec![80]));
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
-        // A blip that comes back as a third value is dropped too, and eighty's limit set again.
-        r.native.set_externally(100); r.clock.set(1_180); e.handle(Event::Tick);
-        r.native.set_externally(95); r.clock.set(1_240); e.handle(Event::Tick);
+        // Reads that never settle on one value are never adopted: after three
+        // replacements of the candidate, eighty's limit is set again.
+        for (t, v) in [(1_180, 100), (1_240, 95), (1_300, 90)] {
+            r.native.set_externally(v); r.clock.set(t); e.handle(Event::Tick);
+            assert_eq!((e.status().settings.upper, r.native.writes()), (80, vec![80]), "at {t}");
+        }
+        r.native.set_externally(85); r.clock.set(1_360); e.handle(Event::Tick); // 3rd replacement
         let st = e.status();
         assert_eq!((st.settings.upper, r.store.load().0.settings.upper), (80, 80));
         assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80, 80]));
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
-        r.clock.set(1_300); e.handle(Event::Tick);
+        r.clock.set(1_420); e.handle(Event::Tick);
         assert_eq!((e.status().settings.upper, e.status().health, r.native.writes()), (80, Health::Ok, vec![80, 80]));
+    }
+    #[test] fn native_changed_candidate_is_replaced_and_adopted_when_steady() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // 80, confirmed
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        r.native.set_externally(95); r.clock.set(1_120); e.handle(Event::Tick); // the user moved on: new candidate
+        assert_eq!((e.status().settings.upper, r.native.writes()), (80, vec![80]));
+        r.clock.set(1_180); e.handle(Event::Tick); // 95 again a minute later: adopted
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.writes()), (95, 95, vec![80]));
+        assert_eq!(st.warnings, vec!["Charge Limit changed in System Settings: now 95%.".to_string()]);
+    }
+    #[test] fn native_candidate_is_not_adopted_by_an_event_burst() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        r.clock.set(1_065); e.handle(Event::PowerChanged); // 5 s later: too soon to judge
+        assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (80, 80));
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+        r.clock.set(1_120); e.handle(Event::Tick); // the next regular tick still sees 90
+        assert_eq!(e.status().settings.upper, 90);
+    }
+    #[test] fn native_set_limits_overrides_a_pending_candidate() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick); // candidate 90
+        r.clock.set(1_110);
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        r.clock.set(1_170); e.handle(Event::Tick); r.clock.set(1_230); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.limit_now()), (85, 85, 85));
+        assert_eq!(r.native.writes(), vec![80, 85]);
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+    #[test] fn native_set_limits_while_unconfirmed_sends_the_new_limit() {
+        let r = Rig::native(); r.native.freeze_reads(Some(100)); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.clock.set(1_060); e.handle(Event::Tick); r.clock.set(1_120); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        assert_eq!(r.native.writes(), vec![80, 80, 80]);
+        r.clock.set(1_150);
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        assert_eq!(r.native.writes(), vec![80, 80, 80, 85]);
+        r.clock.set(1_210); e.handle(Event::Tick); // re-sends the new limit, counting afresh
+        assert_eq!(r.native.writes(), vec![80, 80, 80, 85, 85]);
+        assert_eq!(e.status().health, Health::Ok);
+        r.clock.set(1_270); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::NativeUnavailable("macOS still reports 100% after eighty set 85%".into()));
+    }
+    #[test] fn native_pending_candidate_never_shows_holding() {
+        let r = Rig::native(); r.set(78, false, true, 0, Some(900));
+        let mut e = r.engine(); // 80 at t=1000, confirmed
+        r.native.set_externally(90); r.clock.set(1_060); r.set(78, false, true, 0, Some(1_050)); e.handle(Event::Tick);
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
     }
     #[test] fn native_steady_change_is_adopted_on_second_read_with_notice() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));
