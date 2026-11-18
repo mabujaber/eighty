@@ -7,6 +7,7 @@ use eighty_hw::native::NativeLimit;
 use eighty_hw::smc::{hex, FourCC, SmcError, SmcIo};
 
 use crate::log::log;
+use crate::store::Store;
 
 const CHTE: &str = "CHTE";
 const CHIE: &str = "CHIE";
@@ -255,10 +256,23 @@ fn restore_keys(smc: &mut dyn SmcIo, keys: &[(&str, u32)]) -> Vec<(String, SmcEr
     errors
 }
 
+/// Put the user's own native Charge Limit back (the one recorded when eighty
+/// first took control). Does nothing without a record or without Charge Limit.
+pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<Option<u8>, String> {
+    let (config, _) = store.load();
+    let Some(original) = config.native_original else { return Ok(None) };
+    if !native.supported() {
+        return Ok(None);
+    }
+    native.set_limit(original).map_err(|e| format!("setting the native limit back to {original}%: {e}"))?;
+    Ok(Some(original))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eighty_hw::native::FakeNative;
+    use eighty_core::config::Config;
     use eighty_hw::smc::fake::{FakeSmc, WriteMode};
 
     fn no_native() -> FakeNative { FakeNative::unsupported() }
@@ -368,5 +382,19 @@ mod tests {
         let mut c = SmcControl::new(&detect(&mut smc));
         s.insert("CHTE", "ui32", &[0; 4], WriteMode::NotPrivileged);
         assert_eq!(c.apply(&mut smc, &on(true, false, None)).unwrap_err().0, "CHTE");
+    }
+
+    #[test] fn restore_native_puts_back_the_original() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        store.save(&Config { native_original: Some(95), ..Config::default() }).unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        assert_eq!(restore_native(&mut n, &store), Ok(Some(95)));
+        assert_eq!(n.limit_now(), 95);
+    }
+    #[test] fn restore_native_without_a_record_leaves_the_limit() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        assert_eq!(restore_native(&mut n, &store), Ok(None));
+        assert_eq!(n.writes(), Vec::<u8>::new());
     }
 }

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use clap::Parser;
 use eighty_core::paths::{CONFIG_DIR, SOCKET_PATH};
-use eighty_helper::control::restore_all;
+use eighty_helper::control::{restore_all, restore_native};
 use eighty_helper::engine::{Deps, Engine, Event};
 use eighty_helper::log::log;
 use eighty_helper::ipc;
@@ -50,6 +50,21 @@ fn restore(print: impl Fn(&str)) -> anyhow::Result<usize> {
         print("restore: wrote CHTE=00000000, CHIE=00, ACLC=00 to every key present");
     }
     Ok(errors.len())
+}
+
+/// `--restore`: SMC keys first, then the user's own native limit. Returns the failure count.
+fn restore_everything(print: impl Fn(&str)) -> anyhow::Result<usize> {
+    let mut failed = restore(&print)?;
+    let store = Store::new(PathBuf::from(CONFIG_DIR));
+    match restore_native(&mut PowerUi::new(), &store) {
+        Ok(Some(n)) => print(&format!("restore: native limit back to {n}%")),
+        Ok(None) => print("restore: native limit left as is"),
+        Err(e) => {
+            print(&format!("restore native: FAILED: {e}"));
+            failed += 1;
+        }
+    }
+    Ok(failed)
 }
 
 fn remove_socket(path: &Path) {
@@ -163,7 +178,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let result = if args.restore {
         require_root("--restore")
-            .and_then(|()| restore(|m| println!("{m}")))
+            .and_then(|()| restore_everything(|m| println!("{m}")))
             .map(|failed| u8::from(failed > 0))
     } else {
         run_helper()
