@@ -4,7 +4,7 @@ Keep your Apple Silicon Mac's battery at 80%, for free.
 
 eighty is a charge limiter written in Rust. A small root helper stops charging at your limit, can run the Mac from battery while it is plugged in to bring the charge down, and turns the MagSafe light green when the limit is reached. It always hands charging back to macOS when it stops or is uninstalled.
 
-> **Status: pre-release.** The helper and CLI pass hardware acceptance on an M5 Pro running macOS 26.6.2 (hold mode) and an M2 Max running macOS 27.2 (cycle mode) ([results](docs/testing/plan2-acceptance.md)). On Macs without a stop-charging key, like the M2 Max on macOS 27, cycle mode keeps running from the battery while plugged in and can't hold the limit during sleep. There, macOS's own Charge Limit at 80% is the better choice for now. The menu-bar app, signed builds and Homebrew come later. For now you build from source.
+> **Status: pre-release.** The helper and CLI pass hardware acceptance on an M5 Pro running macOS 26.6.2 (hold mode) and an M2 Max running macOS 27.2 ([results](docs/testing/plan2-acceptance.md)). The menu-bar app, signed builds and Homebrew come later. For now you build from source.
 
 ## Install
 
@@ -24,7 +24,9 @@ sudo ./target/release/eighty install
 sudo ln -s "$PWD/target/release/eighty" /usr/local/bin/eighty
 ```
 
-Turn off **Optimized Battery Charging** in System Settings → Battery so it does not fight eighty. Leaving the macOS Charge Limit at 100% is fine.
+Turn off **Optimized Battery Charging** in System Settings → Battery so it does not fight eighty.
+
+In hold mode, leave the macOS Charge Limit at 100%. In native mode, leave it to eighty: eighty sets it, and a change you make in System Settings → Battery → Charge Limit becomes eighty's limit. `eighty uninstall` puts back the limit you had before eighty first took control.
 
 ## Use
 
@@ -39,8 +41,8 @@ Mode      hold (CHTE) · MagSafe light: yes
 | Command | What it does |
 |---|---|
 | `eighty status [--json]` | Battery, limits and what the helper is doing |
-| `eighty limit <upper> [lower]` | Set the limit (20–100). Charging resumes below `lower`, which defaults to `upper − 5` |
-| `eighty auto-discharge on\|off` | When the battery is above the limit on AC, run from battery until it is back at the limit (hold mode only) |
+| `eighty limit <upper> [lower]` | Set the limit (20–100). Charging resumes below `lower`, which defaults to `upper − 5`. In native mode only 80, 85, 90, 95 and 100 (no limit) work, and there is no lower limit |
+| `eighty auto-discharge on\|off` | When the battery is above the limit on AC, run from battery until it is back at the limit (hold mode only; in native mode macOS does it and it can't be turned off) |
 | `eighty charge full` | Charge to 100% once. It ends when you unplug. `eighty charge auto` ends it now |
 | `eighty discharge <percent>` | Run from battery on AC down to `percent`, then hold |
 | `eighty doctor [--retry]` | Check SMC support and helper health. `--retry` clears a recorded fault |
@@ -62,7 +64,7 @@ The helper talks to the SMC directly. It does not shell out to other tools. It c
 There are two modes, chosen from what the Mac supports:
 
 - **Hold** (`CHTE` works, for example M5 Pro on macOS 26): stop charging at the limit and hold there. Auto-discharge brings a higher charge down to the limit.
-- **Cycle** (no stop-charging key, for example M2 Max on macOS 27): run from battery at the upper limit and charge again below the lower one.
+- **Native** (no stop-charging key, for example M2 Max on macOS 27): eighty sets macOS's own Charge Limit (80, 85, 90 or 95%), and macOS holds it. macOS brings a higher charge down to the limit itself and sets the MagSafe light. There is no lower limit. If macOS charges past the limit (it does this to calibrate), `eighty status` shows a warning. eighty can't stop it.
 
 Safety rules:
 

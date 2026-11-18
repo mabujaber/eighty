@@ -1,6 +1,6 @@
 //! Plain-text rendering of status and doctor output.
 use eighty_core::policy::{Activity, ControlMode, Override};
-use eighty_core::proto::{DoctorReport, KeyState, Status};
+use eighty_core::proto::{DoctorReport, KeyState, NativeState, Status};
 
 fn line(out: &mut String, label: &str, text: &str) {
     out.push_str(&format!("{:<10}{}\n", label, text));
@@ -9,7 +9,7 @@ fn line(out: &mut String, label: &str, text: &str) {
 fn mode_text(m: ControlMode) -> &'static str {
     match m {
         ControlMode::Hold => "hold (CHTE)",
-        ControlMode::Cycle => "cycle (CHIE only)",
+        ControlMode::Native => "native (macOS Charge Limit)",
         ControlMode::Unsupported => "unsupported",
     }
 }
@@ -27,7 +27,7 @@ fn activity_text(s: &Status) -> String {
             };
             format!("Lid closed: holding at {}%, discharges to {to}% when the lid opens", s.percent)
         }
-        Activity::LidClosed => "Lid closed: can't hold the limit in cycle mode".to_string(),
+        Activity::LidClosed => "Lid closed".to_string(),
         Activity::Paused => "Paused".to_string(),
     }
 }
@@ -58,18 +58,20 @@ pub fn render_status(s: &Status) -> String {
     };
     let power = if s.external { "on AC" } else { "on battery" };
     line(&mut out, "Battery", &format!("{}% · {} · {}", s.percent, charging_part, power));
-    let auto = match s.mode {
-        ControlMode::Cycle => "auto-discharge n/a in cycle mode",
-        _ if s.settings.auto_discharge => "auto-discharge on",
-        _ => "auto-discharge off",
+    let limit_text = match s.mode {
+        ControlMode::Native => format!("{}% (held by macOS)", s.settings.upper),
+        _ => {
+            let auto = if s.settings.auto_discharge { "auto-discharge on" } else { "auto-discharge off" };
+            format!("{}% (resumes below {}%) · {}", s.settings.upper, s.settings.lower, auto)
+        }
     };
-    line(
-        &mut out,
-        "Limit",
-        &format!("{}% (resumes below {}%) · {}", s.settings.upper, s.settings.lower, auto),
-    );
+    line(&mut out, "Limit", &limit_text);
     line(&mut out, "State", &activity_text(s));
-    let light = if s.light_supported { "yes" } else { "no" };
+    let light = match (s.mode, s.light_supported) {
+        (ControlMode::Native, _) => "macOS",
+        (_, true) => "yes",
+        (_, false) => "no",
+    };
     line(&mut out, "Mode", &format!("{} · MagSafe light: {}", mode_text(s.mode), light));
     match s.override_ {
         Override::None => {}
@@ -92,6 +94,12 @@ fn key_text(k: &KeyState) -> String {
     }
 }
 
+fn native_text(n: &NativeState) -> String {
+    let limit = n.limit.map_or("unreadable".to_string(), |l| format!("{l}%"));
+    let steps: Vec<String> = n.available.iter().map(|a| a.to_string()).collect();
+    format!("{limit} · steps {}", steps.join(", "))
+}
+
 pub fn render_doctor(d: &DoctorReport) -> String {
     let mut out = String::new();
     line(&mut out, "Machine", &format!("{} · {}", d.machine.model, d.machine.chip));
@@ -104,6 +112,9 @@ pub fn render_doctor(d: &DoctorReport) -> String {
     }
     let others = if d.other_limiters.is_empty() { "none".to_string() } else { d.other_limiters.join(", ") };
     line(&mut out, "Limiters", &others);
+    if let Some(n) = &d.native {
+        line(&mut out, "Native", &native_text(n));
+    }
     line(&mut out, "Health", &health_text(&d.status));
     out.push('\n');
     out.push_str(&render_status(&d.status));
@@ -114,7 +125,7 @@ pub fn render_doctor(d: &DoctorReport) -> String {
 mod tests {
     use super::*;
     use eighty_core::policy::{Activity, ControlMode, Override};
-    use eighty_core::proto::{DoctorReport, Health, KeyState, Status};
+    use eighty_core::proto::{DoctorReport, Health, KeyState, NativeState, Status};
     use eighty_core::Settings;
     use eighty_hw::machine::MachineInfo;
 
@@ -179,14 +190,9 @@ mod tests {
             keys: vec![],
             status: s,
             other_limiters: vec![],
+            native: None,
         });
         assert!(!doc.contains("Charging restored"), "{doc}");
-    }
-
-    #[test]
-    fn lid_closed_cycle_warns() {
-        let s = Status { mode: ControlMode::Cycle, activity: Activity::LidClosed, ..st() };
-        assert!(render_status(&s).contains("Lid closed: can't hold the limit in cycle mode"));
     }
 
     #[test]
@@ -205,11 +211,34 @@ mod tests {
     }
 
     #[test]
-    fn cycle_mode_auto_discharge_is_na() {
-        let s = Status { mode: ControlMode::Cycle, ..st() };
+    fn native_status_text() {
+        let s = Status { mode: ControlMode::Native, activity: Activity::Holding, charging: false, amperage_ma: 0, ..st() };
         let out = render_status(&s);
-        assert!(out.contains("auto-discharge n/a in cycle mode"));
-        assert!(out.contains("cycle (CHIE only)"));
+        assert!(out.contains("Limit     80% (held by macOS)\n"), "{out}");
+        assert!(out.contains("Mode      native (macOS Charge Limit) · MagSafe light: macOS\n"), "{out}");
+        assert!(!out.contains("resumes below") && !out.contains("auto-discharge"), "{out}");
+    }
+
+    fn native_doctor(limit: Option<u8>) -> String {
+        render_doctor(&DoctorReport {
+            machine: MachineInfo { model: "m".into(), chip: "c".into(), macos: "v".into(), build: "b".into() },
+            keys: vec![],
+            status: Status { mode: ControlMode::Native, ..st() },
+            other_limiters: vec![],
+            native: Some(NativeState { available: vec![80, 85, 90, 95, 100], limit, enabled: Some(true) }),
+        })
+    }
+
+    #[test]
+    fn doctor_shows_the_native_limit() {
+        assert!(native_doctor(Some(80)).contains("Native    80% · steps 80, 85, 90, 95, 100\n"));
+        assert!(native_doctor(None).contains("Native    unreadable · steps 80, 85, 90, 95, 100\n"));
+    }
+
+    #[test]
+    fn lid_closed_native_is_plain() {
+        let s = Status { mode: ControlMode::Native, activity: Activity::LidClosed, ..st() };
+        assert!(render_status(&s).contains("State     Lid closed\n"));
     }
 
     #[test]
@@ -246,10 +275,11 @@ mod tests {
                 ("CHIE".into(), KeyState::Usable),
                 ("ACLC".into(), KeyState::Usable),
             ],
-            status: Status { mode: ControlMode::Cycle, ..st() },
+            status: Status { mode: ControlMode::Unsupported, ..st() },
             other_limiters: vec![],
+            native: None,
         });
-        assert!(out.contains("CHTE  missing") && out.contains("CHIE  usable") && out.contains("Mode      cycle"));
+        assert!(out.contains("CHTE  missing") && out.contains("CHIE  usable") && out.contains("Mode      unsupported"));
         assert!(out.contains("Limiters  none\n"));
     }
 
@@ -269,6 +299,7 @@ mod tests {
             ],
             status: Status { health: Health::Unsupported, ..st() },
             other_limiters: vec!["AlDente".into(), "BCLM".into()],
+            native: None,
         });
         assert!(out.contains("Machine   Mac14,2 · Apple M2\n"));
         assert!(out.contains("macOS     26.1 (25B78)\n"));
