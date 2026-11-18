@@ -3,7 +3,10 @@ use std::collections::HashMap;
 
 use eighty_core::policy::{ControlMode, Light, Outputs};
 use eighty_core::proto::{Health, KeyState};
+use eighty_hw::native::NativeLimit;
 use eighty_hw::smc::{hex, FourCC, SmcError, SmcIo};
+
+use crate::log::log;
 
 const CHTE: &str = "CHTE";
 const CHIE: &str = "CHIE";
@@ -27,6 +30,8 @@ pub struct Detection {
     pub mode: ControlMode,
     pub light: bool,
     pub keys: Vec<(String, KeyState)>,
+    /// The macOS Charge Limit steps, ascending; empty unless the mode is Native.
+    pub native_steps: Vec<u8>,
 }
 
 fn fourcc(key: &str) -> FourCC {
@@ -60,34 +65,49 @@ fn probe_key(smc: &mut dyn SmcIo, key: &str, size: u32, write_back: bool) -> Key
     KeyState::Usable
 }
 
-fn detect_with(smc: &mut dyn SmcIo, write_back: bool) -> Detection {
-    let keys: Vec<(String, KeyState)> = KEYS
-        .iter()
-        .map(|&(key, size)| (key.to_string(), probe_key(smc, key, size, write_back)))
-        .collect();
-    let usable = |name: &str| keys.iter().any(|(k, s)| k == name && *s == KeyState::Usable);
-    let mode = match (usable(CHTE), usable(CHIE)) {
-        (true, true) => ControlMode::Hold,
-        (false, true) => ControlMode::Cycle,
-        _ => ControlMode::Unsupported,
+fn detect_with(smc: &mut dyn SmcIo, native: &mut dyn NativeLimit, write_back: bool) -> Detection {
+    let chte = probe_key(smc, CHTE, 4, write_back);
+    let chie = probe_key(smc, CHIE, 1, write_back);
+    let hold = chte == KeyState::Usable && chie == KeyState::Usable;
+    let mut native_steps = Vec::new();
+    let mode = if hold {
+        ControlMode::Hold
+    } else if native.supported() {
+        // A failing `available()` on a Mac that supports the Charge Limit is a fault,
+        // not "unsupported": stay Native so the first call's error is reported.
+        match native.available() {
+            Ok(mut steps) => {
+                steps.sort_unstable();
+                native_steps = steps;
+            }
+            Err(e) => log(&format!("native: couldn't read the available limits: {e}")),
+        }
+        ControlMode::Native
+    } else {
+        ControlMode::Unsupported
     };
-    let light = usable(ACLC);
-    Detection { mode, light, keys }
+    // The light is ours only in Hold mode; otherwise don't even write it back.
+    let aclc = probe_key(smc, ACLC, 1, write_back && mode == ControlMode::Hold);
+    let light = mode == ControlMode::Hold && aclc == KeyState::Usable;
+    let keys = vec![(CHTE.to_string(), chte), (CHIE.to_string(), chie), (ACLC.to_string(), aclc)];
+    Detection { mode, light, keys, native_steps }
 }
 
-/// Probe each key, including a write-back of its current value.
-pub fn detect(smc: &mut dyn SmcIo) -> Detection {
-    detect_with(smc, true)
+/// Probe each key, including a write-back of its current value, and the native limit.
+pub fn detect(smc: &mut dyn SmcIo, native: &mut dyn NativeLimit) -> Detection {
+    detect_with(smc, native, true)
 }
 
 /// Like `detect` but never writes; used while other limiters are present.
-pub fn detect_read_only(smc: &mut dyn SmcIo) -> Detection {
-    detect_with(smc, false)
+pub fn detect_read_only(smc: &mut dyn SmcIo, native: &mut dyn NativeLimit) -> Detection {
+    detect_with(smc, native, false)
 }
 
 pub struct SmcControl {
     mode: ControlMode,
     light: bool,
+    /// Whether `CHIE` is usable; in Native mode it is optional (only `DischargeTo` uses it).
+    chie: bool,
     last: HashMap<&'static str, Vec<u8>>,
 }
 
@@ -101,17 +121,19 @@ fn light_byte(l: Light) -> u8 {
 
 impl SmcControl {
     pub fn new(d: &Detection) -> SmcControl {
-        SmcControl { mode: d.mode, light: d.light, last: HashMap::new() }
+        let chie = d.keys.iter().any(|(k, s)| k == CHIE && *s == KeyState::Usable);
+        SmcControl { mode: d.mode, light: d.light && d.mode == ControlMode::Hold, chie, last: HashMap::new() }
     }
 
     /// Write the desired state. Returns true if a charging key (`CHTE`/`CHIE`) was written.
+    /// Native mode writes only `CHIE`: never `CHTE`, never the light.
     pub fn apply(&mut self, smc: &mut dyn SmcIo, o: &Outputs) -> Result<bool, (String, SmcError)> {
         let mut desired: Vec<(&'static str, Vec<u8>)> = Vec::new();
         if self.mode == ControlMode::Hold {
             let v = if o.inhibit { CHTE_STOP } else { CHTE_ALLOW };
             desired.push((CHTE, v.to_vec()));
         }
-        if self.mode != ControlMode::Unsupported {
+        if self.mode == ControlMode::Hold || (self.mode == ControlMode::Native && self.chie) {
             let v = if o.discharge { CHIE_BATTERY } else { CHIE_OFF };
             desired.push((CHIE, v.to_vec()));
         }
@@ -126,7 +148,7 @@ impl SmcControl {
             wrote = true;
         }
 
-        if let (true, Some(l)) = (self.light, o.light) {
+        if let (true, ControlMode::Hold, Some(l)) = (self.light, self.mode, o.light) {
             let want = [light_byte(l)];
             let k = fourcc(ACLC);
             let current = smc.read(k).map_err(|e| (ACLC.to_string(), e))?;
@@ -178,9 +200,14 @@ impl SmcControl {
     }
 
     /// Write the restore state to the present keys and forget what we wrote.
+    /// Native mode restores only `CHIE`: it never touches `CHTE` or the light.
     pub fn restore(&mut self, smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
         self.last.clear();
-        restore_all(smc)
+        if self.mode == ControlMode::Native {
+            restore_keys(smc, &[(CHIE, 1)])
+        } else {
+            restore_all(smc)
+        }
     }
 }
 
@@ -196,8 +223,12 @@ pub fn chie_discharging(smc: &mut dyn SmcIo) -> bool {
 
 /// Write the restore state (`CHTE=0`, `CHIE=0`, `ACLC=0`) to every key that exists.
 pub fn restore_all(smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
+    restore_keys(smc, &KEYS)
+}
+
+fn restore_keys(smc: &mut dyn SmcIo, keys: &[(&str, u32)]) -> Vec<(String, SmcError)> {
     let mut errors = Vec::new();
-    for (key, size) in KEYS {
+    for &(key, size) in keys {
         let k = fourcc(key);
         match smc.key_info(k) {
             Err(SmcError::KeyNotFound(_)) => continue,
@@ -217,15 +248,24 @@ pub fn restore_all(smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eighty_hw::native::FakeNative;
     use eighty_hw::smc::fake::{FakeSmc, WriteMode};
 
+    fn no_native() -> FakeNative { FakeNative::unsupported() }
+    fn detect(smc: &mut dyn SmcIo) -> Detection { super::detect(smc, &mut no_native()) }
+
     fn hold_smc() -> FakeSmc { let s = FakeSmc::new(); s.insert("CHTE", "ui32", &[0; 4], WriteMode::Accept); s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept); s.insert("ACLC", "ui8 ", &[4], WriteMode::Accept); s }
-    fn cycle_smc() -> FakeSmc { let s = FakeSmc::new(); s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept); s.insert("ACLC", "ui8 ", &[4], WriteMode::Accept); s }
+    fn native_smc() -> FakeSmc { let s = FakeSmc::new(); s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept); s.insert("ACLC", "ui8 ", &[4], WriteMode::Accept); s }
     fn on(inhibit: bool, discharge: bool, light: Option<Light>) -> Outputs { Outputs { inhibit, discharge, light } }
 
-    #[test] fn detects_hold_cycle_unsupported() {
+    fn mcl() -> FakeNative { FakeNative::new(&[80, 85, 90, 95, 100], 100) }
+    #[test] fn detects_hold_native_unsupported() {
         assert_eq!(detect(&mut hold_smc()).mode, ControlMode::Hold);
-        assert_eq!(detect(&mut cycle_smc()).mode, ControlMode::Cycle);
+        assert_eq!(super::detect(&mut hold_smc(), &mut mcl()).mode, ControlMode::Hold); // CHTE wins
+        let n = super::detect(&mut native_smc(), &mut mcl());
+        assert_eq!((n.mode, n.native_steps, n.light), (ControlMode::Native, vec![80, 85, 90, 95, 100], false));
+        let u = detect(&mut native_smc());
+        assert_eq!((u.mode, u.native_steps), (ControlMode::Unsupported, vec![]));
         let m2 = FakeSmc::new(); m2.insert("CHIE", "ui8 ", &[0], WriteMode::NotPrivileged);
         let d = detect(&mut m2.clone());
         assert_eq!(d.mode, ControlMode::Unsupported);
@@ -249,17 +289,26 @@ mod tests {
         assert_eq!(s.writes().len(), n);
         assert!(n > before);
     }
-    #[test] fn apply_cycle_never_touches_chte_and_reasserts_light() {
-        let s = cycle_smc(); let mut smc = s.clone();
+    #[test] fn apply_reasserts_light_in_hold() {
+        let s = hold_smc(); let mut smc = s.clone();
         let mut c = SmcControl::new(&detect(&mut smc));
         c.apply(&mut smc, &on(true, true, Some(Light::Green))).unwrap();
-        assert_eq!(s.value("CHIE"), Some(vec![8]));
         s.insert("ACLC", "ui8 ", &[4], WriteMode::Accept); // macOS reset the light
         c.apply(&mut smc, &on(true, true, Some(Light::Green))).unwrap();
         assert_eq!(s.value("ACLC"), Some(vec![3]));
     }
+    #[test] fn native_detect_apply_and_restore_write_only_chie() {
+        let s = native_smc(); s.insert("CHTE", "ui32", &[0; 4], WriteMode::NotPrivileged); let mut smc = s.clone();
+        let mut c = SmcControl::new(&super::detect(&mut smc, &mut mcl()));
+        c.apply(&mut smc, &on(true, true, Some(Light::Green))).unwrap(); // even if asked to
+        assert_eq!(s.value("CHIE"), Some(vec![8]));
+        assert!(c.restore(&mut smc).is_empty());
+        let w = |k: &str, v: &[u8]| (k.to_string(), v.to_vec());
+        assert_eq!(s.writes(), vec![w("CHIE", &[0]), w("CHIE", &[8]), w("CHIE", &[0])]);
+        assert_eq!(s.value("ACLC"), Some(vec![4]));
+    }
     #[test] fn detect_read_only_never_writes() {
-        let s = hold_smc(); assert_eq!(detect_read_only(&mut s.clone()).mode, ControlMode::Hold);
+        let s = hold_smc(); assert_eq!(detect_read_only(&mut s.clone(), &mut no_native()).mode, ControlMode::Hold);
         assert!(s.writes().is_empty());
     }
     #[test] fn external_change_is_conflict() {

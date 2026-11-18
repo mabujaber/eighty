@@ -65,7 +65,7 @@ mod tests {
     fn save_then_load() {
         let d = tempfile::tempdir().unwrap();
         let st = Store::new(d.path().join("eighty"));
-        let c = Config { settings: Settings { upper: 70, lower: 60, auto_discharge: false }, accept_other_limiters: true };
+        let c = Config { settings: Settings { upper: 70, lower: 60, auto_discharge: false }, accept_other_limiters: true, native_original: Some(100) };
         st.save(&c).unwrap();
         assert_eq!(st.load(), (c, None));
     }

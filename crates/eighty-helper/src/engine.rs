@@ -3,10 +3,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use eighty_core::config::{Config, Settings};
-use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Light, Outputs, Override};
+use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
 use eighty_core::proto::{DoctorReport, Health, Request, Response, Status};
 use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
+use eighty_hw::native::NativeLimit;
 use eighty_hw::smc::SmcIo;
 
 use crate::control::{chie_discharging, detect, detect_read_only, Detection, SmcControl, ACLC};
@@ -23,27 +24,32 @@ pub enum Event {
     Shutdown,
 }
 
-pub struct Deps<S: SmcIo, B: BatterySource, Y: SystemProbe> {
+pub struct Deps<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     pub smc: S,
     pub battery: B,
     pub system: Y,
     pub store: Store,
     /// Returns Unix seconds.
     pub clock: Box<dyn FnMut() -> u64>,
+    /// macOS's own Charge Limit, used in Native mode.
+    pub native: N,
 }
 
-pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
+pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     smc: S,
     battery: B,
     system: Y,
     store: Store,
     clock: Box<dyn FnMut() -> u64>,
+    native: N,
     config: Config,
     config_warning: Option<String>,
     light_warning: Option<String>,
-    /// Set while cycle mode had to stop discharging for sleep; cleared once a tick
-    /// after wake sees the charge back at or below the upper limit.
-    sleep_warning: Option<String>,
+    /// The native limit eighty last set successfully; `None` until the first write
+    /// (and again after each bring-up, so the limit is reasserted).
+    native_written: Option<u8>,
+    /// Clock time of the last successful `set_limit`.
+    native_written_at: Option<u64>,
     /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
     /// floor while the Mac is asleep.
     sleeping: bool,
@@ -77,15 +83,16 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe> {
     charging_changed_at: Option<u64>,
 }
 
-impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
-    pub fn start(d: Deps<S, B, Y>) -> Engine<S, B, Y> {
-        let Deps { smc, battery, system, store, clock } = d;
+impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y, N> {
+    pub fn start(d: Deps<S, B, Y, N>) -> Engine<S, B, Y, N> {
+        let Deps { smc, battery, system, store, clock, native } = d;
         let (config, config_warning) = store.load();
         if let Some(w) = &config_warning {
             log(w);
         }
         // Placeholder until `bring_up` detects the keys; nothing reads it before then.
-        let detection = Detection { mode: ControlMode::Unsupported, light: false, keys: Vec::new() };
+        let detection =
+            Detection { mode: ControlMode::Unsupported, light: false, keys: Vec::new(), native_steps: Vec::new() };
         let control = SmcControl::new(&detection);
         let mut e = Engine {
             smc,
@@ -93,10 +100,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             system,
             store,
             clock,
+            native,
             config,
             config_warning,
             light_warning: None,
-            sleep_warning: None,
+            native_written: None,
+            native_written_at: None,
             sleeping: false,
             discharge_warning: None,
             restore_failures: Vec::new(),
@@ -125,11 +134,15 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         let limiters =
             if self.config.accept_other_limiters { Vec::new() } else { self.system.other_limiters() };
         // With another limiter present, not even detect's write-back may happen.
-        self.detection =
-            if limiters.is_empty() { detect(&mut self.smc) } else { detect_read_only(&mut self.smc) };
+        self.detection = if limiters.is_empty() {
+            detect(&mut self.smc, &mut self.native)
+        } else {
+            detect_read_only(&mut self.smc, &mut self.native)
+        };
         let d = &self.detection;
-        log(&format!("mode {:?}, light {}, keys {:?}", d.mode, d.light, d.keys));
+        log(&format!("mode {:?}, light {}, keys {:?}, native steps {:?}", d.mode, d.light, d.keys, d.native_steps));
         self.control = SmcControl::new(&self.detection);
+        self.native_written = None;
         if !limiters.is_empty() {
             self.set_health(Health::OtherLimiters(limiters));
             false
@@ -149,7 +162,59 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                 self.trusted_external = true;
                 self.discharge_stopped = Some((self.clock)());
             }
+            if self.detection.mode == ControlMode::Native {
+                if let Err(error) = self.native_bring_up() {
+                    self.set_health(Health::WriteFailed { key: "MCL".into(), error });
+                    return false;
+                }
+            }
             self.restore_failures.is_empty()
+        }
+    }
+
+    /// Native mode, before the first `set_limit`: remember the Charge Limit macOS had
+    /// before eighty first changed it, and say if the configured limit isn't a step.
+    fn native_bring_up(&mut self) -> Result<(), String> {
+        if self.config.native_original.is_none() {
+            let original = self.native.limit().map_err(|e| e.to_string())?;
+            log(&format!("native: macOS's Charge Limit was {original}% before eighty"));
+            if self.config_warning.is_some() {
+                // The file on disk couldn't be read and may hold the real original:
+                // don't overwrite it.
+                log("native: not saving the original Charge Limit over an unreadable config file");
+            } else {
+                let c = Config { native_original: Some(original), ..self.config.clone() };
+                self.save(c).map_err(|m| format!("{m}; not changing the Charge Limit without it"))?;
+            }
+        }
+        if let Some(w) = self.native_step_warning() {
+            log(&w);
+        }
+        Ok(())
+    }
+
+    /// In Native mode with a configured limit macOS doesn't offer (an old config):
+    /// the nearest step at or above it, used for this run.
+    fn native_step(&self) -> Option<u8> {
+        let steps = &self.detection.native_steps;
+        let upper = self.config.settings.upper;
+        if self.detection.mode != ControlMode::Native || steps.is_empty() || steps.contains(&upper) {
+            return None;
+        }
+        steps.iter().copied().find(|&s| s >= upper).or(steps.last().copied())
+    }
+
+    fn native_step_warning(&self) -> Option<String> {
+        self.native_step().map(|step| {
+            format!("limit {}% isn't available on this Mac; using {step}%", self.config.settings.upper)
+        })
+    }
+
+    /// The settings in effect: the config, with the upper limit moved to a native step if needed.
+    fn settings(&self) -> Settings {
+        match self.native_step() {
+            Some(upper) => Settings { upper, ..self.config.settings },
+            None => self.config.settings,
         }
     }
 
@@ -223,17 +288,17 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             mode: self.detection.mode,
             activity: if self.health.is_ok() { self.activity } else { Activity::Paused },
             health: self.health.clone(),
-            settings: self.config.settings,
+            settings: self.settings(),
             override_: self.override_,
             light_supported: self.detection.light,
             warnings: self
                 .config_warning
                 .iter()
-                .chain(&self.light_warning)
-                .chain(&self.sleep_warning)
-                .chain(&self.discharge_warning)
-                .chain(&self.restore_failures)
                 .cloned()
+                .chain(self.native_step_warning())
+                .chain(self.light_warning.iter().cloned())
+                .chain(self.discharge_warning.iter().cloned())
+                .chain(self.restore_failures.iter().cloned())
                 .collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -253,6 +318,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
                     keys: self.detection.keys.clone(),
                     status: self.status(),
                     other_limiters: self.system.other_limiters(),
+                    native: None,
                 }))
             }
             Request::SetLimits { upper, lower } => {
@@ -479,27 +545,29 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
             lid_closed: self.system.lid_closed(),
             mode: self.detection.mode,
         };
-        let mut d = decide(&self.config.settings, self.override_, &inputs, &self.prev);
+        let mut d = decide(&self.settings(), self.override_, &inputs, &self.prev);
         if d.clear_override {
             log(&format!("override {:?} finished", self.override_));
             self.override_ = Override::None;
         }
         if self.sleeping && d.outputs.discharge {
             // Nothing watches the floor while asleep: stop discharging. Hold mode keeps
-            // inhibit (a true hold); cycle mode has no hold, so it charges.
-            let o = &mut d.outputs;
-            o.discharge = false;
-            if !o.inhibit {
-                o.light = inputs.external.then_some(Light::Orange);
+            // inhibit (a true hold); Native mode's Charge Limit holds on its own.
+            d.outputs.discharge = false;
+        }
+
+        if let Some(limit) = d.native_limit {
+            if self.native_written != Some(limit) {
+                if let Err(err) = self.native.set_limit(limit) {
+                    self.set_health(Health::WriteFailed { key: "MCL".into(), error: err.to_string() });
+                    self.restore();
+                    self.set_activity(Activity::Paused);
+                    return;
+                }
+                log(&format!("native: set macOS's Charge Limit to {limit}%"));
+                self.native_written = Some(limit);
+                self.native_written_at = Some((self.clock)());
             }
-            if self.detection.mode == ControlMode::Cycle {
-                self.set_sleep_warning(Some(format!(
-                    "the limit isn't enforced while asleep in cycle mode; the battery may charge past {}%",
-                    self.config.settings.upper
-                )));
-            }
-        } else if !self.sleeping && snap.percent <= self.config.settings.upper {
-            self.set_sleep_warning(None);
         }
 
         let wrote = match self.control.apply(&mut self.smc, &d.outputs) {
@@ -631,16 +699,6 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe> Engine<S, B, Y> {
         }
     }
 
-    fn set_sleep_warning(&mut self, w: Option<String>) {
-        if w != self.sleep_warning {
-            match &w {
-                Some(w) => log(w),
-                None => log("back at or below the limit after sleep"),
-            }
-            self.sleep_warning = w;
-        }
-    }
-
     fn set_light_warning(&mut self, w: Option<String>) {
         if w != self.light_warning {
             if let Some(w) = &w {
@@ -659,12 +717,16 @@ mod tests {
     use eighty_core::proto::{Health, KeyState};
     use eighty_hw::battery::fake::FakeBattery;
     use eighty_hw::battery::{BatteryError, BatterySnapshot};
+    use eighty_hw::native::FakeNative;
     use eighty_hw::smc::fake::{FakeSmc, WriteMode};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
+    type TestEngine = Engine<FakeSmc, FakeBattery, FakeSystem, FakeNative>;
+
     struct Rig {
         smc: FakeSmc,
+        native: FakeNative,
         sys: FakeSystem,
         store: Store,
         clock: Rc<Cell<u64>>,
@@ -682,6 +744,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             Rig {
                 smc,
+                native: FakeNative::unsupported(),
                 sys: FakeSystem::default(),
                 store: Store::new(dir.path().into()),
                 clock: Rc::new(Cell::new(1_000)),
@@ -707,11 +770,18 @@ mod tests {
             s.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
             Rig::with(s)
         }
-        fn cycle() -> Rig {
+        /// No `CHTE`, but macOS's own Charge Limit: native mode.
+        fn native() -> Rig {
+            Rig::native_with(FakeNative::new(&[80, 85, 90, 95, 100], 100))
+        }
+        fn native_with(native: FakeNative) -> Rig {
             let s = FakeSmc::new();
             s.insert("CHIE", "ui8 ", &[0], WriteMode::Accept);
             s.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
-            Rig::with(s)
+            Rig { native, ..Rig::with(s) }
+        }
+        fn write_config(&self, text: &str) {
+            std::fs::write(self._dir.path().join("config.toml"), text).unwrap();
         }
         /// Like `hold`, but the battery returns an error while `fail` is set.
         fn hold_fallible() -> Rig {
@@ -729,7 +799,7 @@ mod tests {
             s.amperage_ma = amp;
             s.update_time = update_time;
         }
-        fn engine(&self) -> Engine<FakeSmc, FakeBattery, FakeSystem> {
+        fn engine(&self) -> TestEngine {
             let snap = self.snap.clone();
             let (smc, hides) = (self.smc.clone(), self.chie_hides_ac);
             let snap = Rc::new(move || {
@@ -758,6 +828,7 @@ mod tests {
                 system: self.sys.clone(),
                 store: Store::new(self._dir.path().into()),
                 clock: Box::new(move || clock.get()),
+                native: self.native.clone(),
             })
         }
     }
@@ -811,7 +882,7 @@ mod tests {
         assert_eq!(r.smc.writes().len(), n);
     }
     /// Hold rig at 85% on the charger: inhibit and discharge on (CHTE=01000000, CHIE=08).
-    fn discharging_rig() -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+    fn discharging_rig() -> (Rig, TestEngine) {
         let r = Rig::hold(); r.set(85, false, true, -400, Some(900));
         let e = r.engine();
         assert_eq!((r.smc.value("CHTE"), r.smc.value("CHIE")), (Some(vec![1, 0, 0, 0]), Some(vec![8])));
@@ -918,27 +989,9 @@ mod tests {
         rx.try_recv().unwrap();
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
     }
-    fn sleep(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>) {
+    fn sleep(e: &mut TestEngine) {
         let (tx, rx) = std::sync::mpsc::channel(); e.handle(Event::WillSleep(tx));
         rx.try_recv().expect("sleep acked");
-    }
-    fn asleep_warning(e: &Engine<FakeSmc, FakeBattery, FakeSystem>) -> bool {
-        e.status().warnings.iter().any(|w| w == "the limit isn't enforced while asleep in cycle mode; the battery may charge past 80%")
-    }
-    #[test] fn cycle_sleep_stops_discharge_and_warns_until_back_at_limit() {
-        let r = Rig::cycle(); r.set(82, false, true, -400, Some(900));
-        let mut e = r.engine();
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        sleep(&mut e);
-        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
-        assert!(asleep_warning(&e), "{:?}", e.status().warnings);
-        e.handle(Event::Tick); // dark wake / timer tick before DidWake
-        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
-        r.set(83, true, true, 1200, Some(960)); e.handle(Event::DidWake);
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        assert!(asleep_warning(&e), "kept while above the limit");
-        r.set(80, false, true, -400, Some(1100)); e.handle(Event::Tick);
-        assert!(!asleep_warning(&e), "{:?}", e.status().warnings);
     }
     #[test] fn hold_sleep_holds_instead_of_discharging() {
         let r = Rig::hold(); r.set(85, false, true, -400, Some(900));
@@ -946,7 +999,6 @@ mod tests {
         assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
         sleep(&mut e);
         assert_eq!((r.smc.value("CHIE"), r.smc.value("CHTE")), (Some(vec![0]), Some(vec![1, 0, 0, 0])));
-        assert!(!asleep_warning(&e));
     }
     #[test] fn discharge_override_pauses_while_asleep() {
         let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
@@ -956,13 +1008,6 @@ mod tests {
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
         assert_eq!(e.status().override_, Override::DischargeTo(50));
     }
-    #[test] fn cycle_mode_on_m2_shape() {
-        let r = Rig::cycle(); r.set(80, true, true, 2700, Some(900));
-        let e = r.engine();
-        assert_eq!(e.status().mode, ControlMode::Cycle);
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-    }
-
     // Added beyond the brief.
 
     #[test] fn light_write_failure_is_only_a_warning() {
@@ -985,9 +1030,9 @@ mod tests {
         assert_eq!((st.percent, st.external, st.charging, st.amperage_ma), (90, true, true, 1000));
     }
     #[test] fn battery_reading_from_before_a_switch_is_marked_stale() {
-        // Cycle mode at 81%: discharge starts at t=1000 while the last reading (t=990)
-        // still shows the charger's current.
-        let r = Rig::cycle(); r.set(81, true, true, 2157, Some(990));
+        // Hold mode at 81% with auto-discharge: discharge starts at t=1000 while the last
+        // reading (t=990) still shows the charger's current.
+        let r = Rig::hold(); r.set(81, true, true, 2157, Some(990));
         let mut e = r.engine();
         assert!(e.prev.discharge);
         assert!(e.status().amperage_stale);
@@ -1070,13 +1115,13 @@ mod tests {
         assert_eq!(r.smc.value("CHTE"), Some(vec![1, 0, 0, 0]));
     }
     #[test] fn watchdog_accepts_effective_discharge() {
-        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
+        let r = Rig::hold(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
         let mut e = r.engine();
         r.set(81, false, true, -410, Some(1030)); e.handle(Event::Tick);
         assert_eq!(e.status().health, Health::Ok);
     }
     #[test] fn watchdog_waits_on_missing_update_time() {
-        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, None);
+        let r = Rig::hold(); r.clock.set(1000); r.set(81, true, true, 2700, None);
         let mut e = r.engine(); e.handle(Event::Tick);
         assert_eq!(e.status().health, Health::Ok);
     }
@@ -1127,17 +1172,6 @@ mod tests {
         let st = e.status();
         assert_eq!((st.activity, st.external, st.health), (Activity::Discharging { to: 80 }, true, Health::Ok));
     }
-    #[test] fn cycle_discharge_does_not_flap() {
-        let r = Rig::cycle().hiding_ac(); r.set(85, false, true, -400, Some(900));
-        let mut e = r.engine();
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        let n = r.smc.writes().len();
-        for _ in 0..3 { e.handle(Event::Tick); e.handle(Event::PowerChanged); }
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        assert!(!r.smc.writes()[n..].iter().any(|(k, _)| k == "CHIE"), "{:?}", &r.smc.writes()[n..]);
-        let st = e.status();
-        assert_eq!((st.activity, st.external, st.health), (Activity::Discharging { to: 75 }, true, Health::Ok));
-    }
     #[test] fn discharge_still_stops_at_target() {
         // Hold: stops at the upper limit.
         let r = Rig::hold().hiding_ac(); r.set(100, false, true, -400, Some(900));
@@ -1148,16 +1182,6 @@ mod tests {
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
         assert_eq!(e.status().activity, Activity::Holding);
         r.set(80, false, false, -400, Some(1010)); e.handle(Event::Tick); // a real unplug, read after the stop at t=1000
-        assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
-        // Cycle: stops at the lower limit.
-        let r = Rig::cycle().hiding_ac(); r.set(85, false, true, -400, Some(900));
-        let mut e = r.engine();
-        r.set(76, false, true, -400, Some(950)); e.handle(Event::Tick);
-        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
-        r.set(75, false, true, -400, Some(960)); e.handle(Event::Tick);
-        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
-        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
-        r.set(75, false, false, -400, Some(1010)); e.handle(Event::Tick); // read after the stop
         assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
     }
     #[test] fn chie_induced_external_flip_is_not_a_replug() {
@@ -1174,7 +1198,7 @@ mod tests {
         assert_eq!(e.status().health, Health::Ok);
     }
     /// Hiding hold rig: CHIE=08 at t=1000, then CHIE=00 at t=2000 on reaching the limit.
-    fn stopped_discharge_rig() -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+    fn stopped_discharge_rig() -> (Rig, TestEngine) {
         let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(100, false, true, -400, Some(990));
         let mut e = r.engine();
         assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
@@ -1244,7 +1268,7 @@ mod tests {
         assert_eq!((e.status().external, e.status().activity), (false, Activity::OnBattery));
     }
     /// Hiding hold rig at 100% on the charger: CHIE=08 written at t=1000.
-    fn hidden_discharge_rig(amp: i32) -> (Rig, Engine<FakeSmc, FakeBattery, FakeSystem>) {
+    fn hidden_discharge_rig(amp: i32) -> (Rig, TestEngine) {
         let r = Rig::hold().hiding_ac(); r.clock.set(1000); r.set(100, false, true, amp, Some(990));
         let e = r.engine();
         assert_eq!((r.smc.value("CHIE"), e.prev.discharge), (Some(vec![8]), true));
@@ -1288,7 +1312,7 @@ mod tests {
         r.clock.set(3100); r.set(80, false, false, -600, Some(3050)); e.handle(Event::Tick);
         assert_eq!((e.status().activity, e.status().external), (Activity::OnBattery, false));
     }
-    fn req(e: &mut Engine<FakeSmc, FakeBattery, FakeSystem>, uid: u32, q: Request) -> Response {
+    fn req(e: &mut TestEngine, uid: u32, q: Request) -> Response {
         let (tx, rx) = mpsc::channel(); e.handle(Event::Request { uid, req: q, reply: tx }); rx.recv().unwrap()
     }
     #[test] fn non_console_user_cannot_change_but_can_read() {
@@ -1322,7 +1346,7 @@ mod tests {
         assert_eq!(e.status().health, Health::Ok);
     }
     #[test] fn doctor_lists_keys_and_limiters() {
-        let r = Rig::cycle(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
+        let r = Rig::native(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
         let Response::Doctor(d) = req(&mut e, 502, Request::Doctor) else { panic!() };
         assert!(d.keys.contains(&("CHTE".into(), KeyState::Missing)));
     }
@@ -1330,7 +1354,7 @@ mod tests {
     // Added beyond the brief (Task 7).
 
     #[test] fn watchdog_flags_ineffective_discharge() {
-        let r = Rig::cycle(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
+        let r = Rig::hold(); r.clock.set(1000); r.set(81, true, true, 2700, Some(990));
         let mut e = r.engine();
         assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
         r.set(81, true, true, 500, Some(1020)); e.handle(Event::Tick); // first strike
@@ -1378,5 +1402,58 @@ mod tests {
         assert!(e.status().settings.auto_discharge);
         assert!(matches!(req(&mut e, 501, Request::SetLimits { upper: 60, lower: None }), Response::Error(_)));
         assert_eq!(e.status().settings.upper, 80);
+    }
+
+    // Native mode (macOS's own Charge Limit).
+
+    #[test] fn native_falls_back_to_unsupported_without_mcl() {
+        let r = Rig::native_with(FakeNative::unsupported()); r.set(80, false, true, 0, Some(900));
+        assert_eq!(r.engine().status().health, Health::Unsupported);
+    }
+    #[test] fn native_startup_records_the_original_and_sets_the_limit() {
+        let r = Rig::native(); r.set(85, false, true, -700, Some(900));
+        let e = r.engine();
+        assert_eq!(e.status().mode, ControlMode::Native);
+        assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80]));
+        assert_eq!(r.store.load().0.native_original, Some(100));
+        assert_eq!(e.status().activity, Activity::Discharging { to: 80 });
+        assert_eq!(r.smc.value("ACLC"), Some(vec![0])); // never written
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+    }
+    #[test] fn native_startup_reapplies_the_configured_limit() {
+        let r = Rig::native(); r.set(90, true, true, 1000, Some(900));
+        r.native.set_externally(100); // e.g. left at 100 by a crash during `charge full`
+        r.write_config("[settings]\nupper = 85\n");
+        r.engine();
+        assert_eq!(r.native.limit_now(), 85);
+    }
+    #[test] fn native_charge_full_lifts_the_limit_until_unplug() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        e.request(0, Request::ChargeFull);
+        assert_eq!(r.native.limit_now(), 100);
+        r.set(80, false, false, -500, Some(1_000)); e.handle(Event::Tick);
+        assert_eq!((r.native.limit_now(), e.status().override_), (80, Override::None));
+    }
+    #[test] fn native_set_limit_failure_is_loud() {
+        let r = Rig::native(); r.native.fail_calls(true); r.set(80, false, true, 0, Some(900));
+        let st = r.engine().status();
+        assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "MCL"), "{:?}", st.health);
+    }
+    #[test] fn native_old_limit_outside_the_steps_uses_the_next_step_up() {
+        let r = Rig::native(); r.write_config("[settings]\nupper = 70\nlower = 65\n"); r.set(75, true, true, 900, Some(900));
+        let e = r.engine();
+        assert_eq!(r.native.limit_now(), 80);
+        assert!(e.status().warnings.iter().any(|w| w == "limit 70% isn't available on this Mac; using 80%"));
+    }
+    #[test] fn native_set_limit_failure_mid_run_restores_and_pauses() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.fail_calls(true);
+        e.request(0, Request::ChargeFull);
+        let st = e.status();
+        assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "MCL"), "{:?}", st.health);
+        assert_eq!((st.activity, r.native.limit_now(), r.smc.value("CHIE")), (Activity::Paused, 80, Some(vec![0])));
+        assert!(!r.smc.writes().iter().any(|(k, _)| k == "ACLC" || k == "CHTE"), "{:?}", r.smc.writes());
     }
 }

@@ -15,6 +15,7 @@ use eighty_helper::os_events::spawn_os_events;
 use eighty_helper::store::Store;
 use eighty_helper::system::MacSystem;
 use eighty_hw::battery::IoRegBattery;
+use eighty_hw::native::PowerUi;
 use eighty_hw::smc::SmcConnection;
 
 /// Keep charging between limits. Runs as root under launchd.
@@ -102,6 +103,8 @@ fn run_helper() -> anyhow::Result<u8> {
                 system: MacSystem,
                 store: Store::new(PathBuf::from(CONFIG_DIR)),
                 clock: Box::new(unix_now),
+                // Not Send: built here, on the engine thread that uses it.
+                native: PowerUi::new(),
             };
             let engine = Engine::start(deps);
             let _ = started_tx.send(Ok(()));
