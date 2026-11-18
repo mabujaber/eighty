@@ -37,6 +37,8 @@ pub enum Health {
     WriteFailed { key: String, error: String },
     NotEffective { what: String },
     BatteryUnreadable(String),
+    /// Native mode: a PowerUI call failed. Not sticky: the helper retries every tick.
+    NativeUnavailable(String),
 }
 
 impl Health {
@@ -64,6 +66,9 @@ impl Health {
             Health::BatteryUnreadable(e) => {
                 format!("can't read the battery: {e}. Charging restored; retrying.")
             }
+            Health::NativeUnavailable(e) => format!(
+                "couldn't reach macOS's Charge Limit (PowerUI): {e}. macOS keeps its current limit; eighty is waiting for macOS and retrying."
+            ),
         }
     }
 }
@@ -203,5 +208,13 @@ mod tests {
             found: "00000000".into(),
         };
         assert!(h.message().contains("macOS's own Charge Limit"));
+    }
+    #[test]
+    fn native_unavailable_message_says_macos_keeps_its_limit() {
+        assert_eq!(
+            Health::NativeUnavailable("boom".into()).message(),
+            "couldn't reach macOS's Charge Limit (PowerUI): boom. macOS keeps its current limit; eighty is waiting for macOS and retrying."
+        );
+        assert!(!Health::NativeUnavailable("boom".into()).is_ok());
     }
 }

@@ -196,6 +196,21 @@ mod tests {
     }
 
     #[test]
+    fn native_unavailable_is_not_limiting_and_claims_no_restore() {
+        let s = Status {
+            mode: ControlMode::Native,
+            health: Health::NativeUnavailable("x".into()),
+            activity: Activity::Paused,
+            warnings: vec!["couldn't restore CHIE: y; charging may still be inhibited".into()],
+            ..st()
+        };
+        assert_eq!(
+            render_status(&s).lines().next().unwrap(),
+            "NOT LIMITING: couldn't reach macOS's Charge Limit (PowerUI): x. macOS keeps its current limit; eighty is waiting for macOS and retrying."
+        );
+    }
+
+    #[test]
     fn lid_closed_hold_explains_the_hold() {
         let s = Status { percent: 100, activity: Activity::LidClosed, ..st() };
         assert!(render_status(&s).contains("State     Lid closed: holding at 100%, discharges to 80% when the lid opens\n"));

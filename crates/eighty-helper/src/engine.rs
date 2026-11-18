@@ -55,6 +55,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// Until then a differing read may just be PowerUI lagging behind eighty's own
     /// write, so it is never adopted as the user's change.
     native_confirmed: bool,
+    /// Native mode: the startup step (recording the user's original Charge Limit) is
+    /// done. Until it is, eighty never sets the limit; `tick` retries it.
+    native_ready: bool,
     /// Set while macOS charges past the native limit (calibration); never a fault.
     native_warning: Option<String>,
     /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
@@ -114,6 +117,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             native_written: None,
             native_written_at: None,
             native_confirmed: false,
+            native_ready: false,
             native_warning: None,
             sleeping: false,
             discharge_warning: None,
@@ -153,6 +157,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.control = SmcControl::new(&self.detection);
         self.native_written = None;
         self.native_confirmed = false;
+        self.native_ready = false;
         self.set_native_warning(None);
         if !limiters.is_empty() {
             self.set_health(Health::OtherLimiters(limiters));
@@ -173,21 +178,24 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 self.trusted_external = true;
                 self.discharge_stopped = Some((self.clock)());
             }
-            if self.detection.mode == ControlMode::Native {
-                if let Err(error) = self.native_bring_up() {
-                    self.set_health(Health::WriteFailed { key: "MCL".into(), error });
-                    return false;
-                }
-            }
+            // Native mode's own startup step runs in `tick`, which retries it.
             self.restore_failures.is_empty()
         }
     }
 
     /// Native mode, before the first `set_limit`: remember the Charge Limit macOS had
     /// before eighty first changed it, and say if the configured limit isn't a step.
-    fn native_bring_up(&mut self) -> Result<(), String> {
+    /// A PowerUI failure is `NativeUnavailable` (retried); a failed save is a fault.
+    fn native_bring_up(&mut self) -> Result<(), Health> {
+        if self.detection.native_steps.is_empty() {
+            // `available()` failed at detection: try again now.
+            let mut steps = self.native.available().map_err(unavailable)?;
+            steps.sort_unstable();
+            log(&format!("native steps {steps:?}"));
+            self.detection.native_steps = steps;
+        }
         if self.config.native_original.is_none() {
-            let original = self.native.limit().map_err(|e| e.to_string())?;
+            let original = self.native.limit().map_err(unavailable)?;
             log(&format!("native: macOS's Charge Limit was {original}% before eighty"));
             if self.config_warning.is_some() {
                 // The file on disk couldn't be read and may hold the real original:
@@ -196,13 +204,39 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 self.config.native_original = Some(original);
             } else {
                 let c = Config { native_original: Some(original), ..self.config.clone() };
-                self.save(c).map_err(|m| format!("{m}; not changing the Charge Limit without it"))?;
+                self.save(c).map_err(|m| Health::WriteFailed {
+                    key: "config.toml".into(),
+                    error: format!("{m}; not changing the Charge Limit without it"),
+                })?;
             }
         }
         if let Some(w) = self.native_step_warning() {
             log(&w);
         }
+        self.native_ready = true;
         Ok(())
+    }
+
+    /// Native mode, each tick before deciding: finish the startup step if it is still
+    /// pending, then check the Charge Limit.
+    fn native_prepare(&mut self) -> Result<(), Health> {
+        if !self.native_ready {
+            self.native_bring_up()?;
+        }
+        self.check_native_limit().map_err(unavailable)
+    }
+
+    /// A native step failed. `NativeUnavailable` is retried on every tick: restore the
+    /// SMC keys once on entering it (stopping any discharge), never the native limit.
+    /// Anything else is a fault, as in Hold mode.
+    fn native_failed(&mut self, h: Health) {
+        let retrying = matches!(h, Health::NativeUnavailable(_));
+        let was_retrying = matches!(self.health, Health::NativeUnavailable(_));
+        self.set_health(h);
+        if !(retrying && was_retrying) || !self.restore_failures.is_empty() {
+            self.restore();
+        }
+        self.set_activity(Activity::Paused);
     }
 
     /// In Native mode with a configured limit macOS doesn't offer (an old config):
@@ -556,10 +590,14 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         })
     }
 
-    /// Health states in which the engine keeps controlling the keys.
+    /// Health states in which the engine keeps controlling the keys. While macOS's
+    /// Charge Limit is unavailable, `tick` keeps retrying the pending native step.
     fn may_control(&self) -> bool {
         self.detection.mode != ControlMode::Unsupported
-            && matches!(self.health, Health::Ok | Health::BatteryUnreadable(_))
+            && matches!(
+                self.health,
+                Health::Ok | Health::BatteryUnreadable(_) | Health::NativeUnavailable(_)
+            )
     }
 
     /// Whether the engine may write the keys at all, even just to restore them.
@@ -658,7 +696,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             return;
         }
 
-        // Health is Ok here: may_control passed and BatteryUnreadable was just cleared.
+        // Health is Ok here (or NativeUnavailable, being retried): may_control passed
+        // and BatteryUnreadable was just cleared.
         // In Native mode macOS holds the limit, so the SMC watchdog has nothing to judge;
         // `native_watchdog` below only warns.
         if self.detection.mode != ControlMode::Native {
@@ -671,10 +710,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
 
         if self.detection.mode == ControlMode::Native {
-            if let Err(err) = self.check_native_limit() {
-                self.set_health(Health::WriteFailed { key: "MCL".into(), error: err.to_string() });
-                self.restore();
-                self.set_activity(Activity::Paused);
+            if let Err(h) = self.native_prepare() {
+                self.native_failed(h);
                 return;
             }
         }
@@ -699,14 +736,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         if let Some(limit) = d.native_limit {
             if self.native_written != Some(limit) {
                 if let Err(err) = self.write_native(limit) {
-                    self.set_health(Health::WriteFailed { key: "MCL".into(), error: err.to_string() });
-                    self.restore();
-                    self.set_activity(Activity::Paused);
+                    self.native_failed(unavailable(err));
                     return;
                 }
             }
         }
         if self.detection.mode == ControlMode::Native {
+            // Every native step this tick succeeded: macOS is reachable again.
+            if matches!(self.health, Health::NativeUnavailable(_)) {
+                self.set_health(Health::Ok);
+            }
             self.native_watchdog(&snap);
         }
 
@@ -849,6 +888,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             self.light_warning = w;
         }
     }
+}
+
+/// A failed PowerUI call: macOS keeps its limit, and eighty retries.
+fn unavailable(e: NativeError) -> Health {
+    Health::NativeUnavailable(e.to_string())
 }
 
 #[cfg(test)]
@@ -1580,7 +1624,47 @@ mod tests {
     #[test] fn native_set_limit_failure_is_loud() {
         let r = Rig::native(); r.native.fail_calls(true); r.set(80, false, true, 0, Some(900));
         let st = r.engine().status();
-        assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "MCL"), "{:?}", st.health);
+        assert!(matches!(st.health, Health::NativeUnavailable(ref e) if e == "fake native call failed"), "{:?}", st.health);
+        assert_eq!(st.activity, Activity::Paused);
+    }
+    #[test] fn native_unavailable_at_startup_retries_until_macos_answers() {
+        let r = Rig::native(); r.native.fail_calls(true); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        assert_eq!(r.native.writes(), Vec::<u8>::new()); // the native limit is never touched meanwhile
+        r.native.fail_calls(false); e.handle(Event::Tick); // no ClearFault
+        let st = e.status();
+        assert_eq!((st.health, st.activity), (Health::Ok, Activity::Holding));
+        assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80]));
+        assert_eq!(r.store.load().0.native_original, Some(100));
+    }
+    #[test] fn native_failure_mid_run_recovers_without_clear_fault() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.fail_calls(true);
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        assert_eq!(r.native.limit_now(), 80);
+        r.native.fail_calls(false); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![80, 85]));
+    }
+    #[test] fn native_unsaved_original_is_a_fault_not_a_retry() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        std::fs::create_dir(r._dir.path().join("config.toml.tmp")).unwrap(); // makes save fail
+        let mut e = r.engine(); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::WriteFailed { ref key, .. } if key == "config.toml"), "{:?}", e.status().health);
+        assert_eq!(r.native.writes(), Vec::<u8>::new());
+    }
+    #[test] fn native_read_failure_is_loud_and_retried() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.fail_calls(true); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        r.native.fail_calls(false); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.native.writes(), vec![80]);
     }
     #[test] fn native_old_limit_outside_the_steps_uses_the_next_step_up() {
         let r = Rig::native(); r.write_config("[settings]\nupper = 70\nlower = 65\n"); r.set(75, true, true, 900, Some(900));
@@ -1594,7 +1678,7 @@ mod tests {
         r.native.fail_calls(true);
         e.request(0, Request::ChargeFull);
         let st = e.status();
-        assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "MCL"), "{:?}", st.health);
+        assert!(matches!(st.health, Health::NativeUnavailable(_)), "{:?}", st.health);
         assert_eq!((st.activity, r.native.limit_now(), r.smc.value("CHIE")), (Activity::Paused, 80, Some(vec![0])));
         assert!(!r.smc.writes().iter().any(|(k, _)| k == "ACLC" || k == "CHTE"), "{:?}", r.smc.writes());
     }
