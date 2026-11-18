@@ -16,6 +16,9 @@ pub const KNOWN_LIMITERS: &[KnownLimiter] = &[
             "~/Library/LaunchAgents/battery.plist",
             "/usr/local/co.palokaj.battery",
             "/etc/sudoers.d/battery",
+            // The menu-bar app (Homebrew cask `battery`) reinstalls the CLI above as
+            // root at every login, so it counts even when the CLI is gone.
+            "/Applications/battery.app",
         ],
         labels: &["com.battery.app"],
     },
@@ -73,5 +76,13 @@ mod tests {
             vec!["batt"]
         );
         assert!(find_other_limiters(empty.path(), &[], &mut |_| false).is_empty());
+    }
+
+    #[test]
+    fn finds_the_battery_app_left_after_its_cli_is_gone() {
+        // The app reinstalls its CLI as root at login, so the app alone counts.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("Applications/battery.app")).unwrap();
+        assert_eq!(find_other_limiters(root.path(), &[], &mut |_| false), vec!["battery"]);
     }
 }
