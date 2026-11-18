@@ -472,7 +472,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             return;
         }
         log(&format!("native limit changed outside eighty: now {now}%"));
-        let settings = Settings { upper: now, ..self.config.settings };
+        let settings = match self.config.settings.with_native_upper(now) {
+            Ok(s) => s,
+            Err(m) => {
+                log(&format!("native: can't adopt {now}%: {m}"));
+                return;
+            }
+        };
         if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
             // Keep it for this run anyway, rather than fight the user's choice.
             log(&format!("{m}; using {now}% until eighty restarts"));
@@ -1568,6 +1574,25 @@ mod tests {
         assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (90, 90));
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!(r.native.writes(), vec![80]); // adopted, not overwritten
+    }
+    #[test] fn native_adoption_keeps_a_hold_era_config_loadable() {
+        let r = Rig::native(); r.set(85, false, true, 0, Some(900));
+        r.write_config("[settings]\nupper = 90\nlower = 85\n"); // left from Hold mode
+        let mut e = r.engine();
+        assert_eq!(r.native.limit_now(), 90);
+        r.native.set_externally(80); r.clock.set(1_060); e.handle(Event::Tick);
+        let (c, warning) = r.store.load();
+        assert_eq!(warning, None);
+        assert_eq!((c.settings.upper, c.settings.lower, c.native_original), (80, 80, Some(100)));
+        assert_eq!(r.native.writes(), vec![90]);
+    }
+    #[test] fn native_set_limits_below_a_hold_era_lower_keeps_the_config_loadable() {
+        let r = Rig::native(); r.set(85, false, true, 0, Some(900));
+        r.write_config("[settings]\nupper = 90\nlower = 85\n");
+        let mut e = r.engine();
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 80, lower: None }), Response::Status(_)));
+        let (c, warning) = r.store.load();
+        assert_eq!((warning, c.settings.upper, c.settings.lower, c.native_original), (None, 80, 80, Some(100)));
     }
     #[test] fn native_charging_past_the_limit_warns_without_faulting() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));

@@ -76,7 +76,17 @@ impl Settings {
         if lower.is_some() {
             return Err("macOS decides when charging resumes on this Mac, so there is no lower limit".into());
         }
-        Ok(Settings { upper, ..self })
+        self.with_native_upper(upper)
+    }
+
+    /// Returns a copy with `upper` set to a native limit, whether or not it is one of
+    /// the steps (e.g. one the user picked in System Settings). `lower` is unused in
+    /// Native mode but is clamped to at most `upper`, so the result always validates
+    /// and the config file stays loadable.
+    pub fn with_native_upper(self, upper: u8) -> Result<Settings, String> {
+        let s = Settings { upper, lower: self.lower.min(upper), ..self };
+        s.validate()?;
+        Ok(s)
     }
 }
 
@@ -120,6 +130,15 @@ mod tests {
             "this Mac only supports a limit of 80, 85, 90, 95 or 100%");
         assert_eq!(Settings::default().with_native_limit(80, Some(75), &steps).unwrap_err(),
             "macOS decides when charging resumes on this Mac, so there is no lower limit");
+    }
+    #[test] fn native_limit_below_a_hold_era_lower_clamps_lower() {
+        let hold = Settings { upper: 90, lower: 85, auto_discharge: true };
+        let s = hold.with_native_limit(80, None, &[80, 85, 90, 95, 100]).unwrap();
+        assert_eq!((s.upper, s.lower), (80, 80));
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(hold.with_native_upper(82).unwrap().lower, 82);
+        assert_eq!(hold.with_native_upper(95).unwrap().lower, 85); // kept when already valid
+        assert!(hold.with_native_upper(5).is_err());
     }
     #[test] fn old_config_without_native_original_loads() {
         assert_eq!(toml::from_str::<Config>("[settings]\nupper = 80\n").unwrap().native_original, None);
