@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlMode {
     Hold,
-    Cycle,
+    Native,
     Unsupported,
 }
 
@@ -54,6 +54,8 @@ pub struct Decision {
     pub outputs: Outputs,
     pub activity: Activity,
     pub clear_override: bool,
+    /// The macOS Charge Limit to ask for. `Some` only in Native mode.
+    pub native_limit: Option<u8>,
 }
 
 fn light_for(external: bool, inhibit: bool, discharge: bool) -> Option<Light> {
@@ -68,9 +70,11 @@ fn light_for(external: bool, inhibit: bool, discharge: bool) -> Option<Light> {
 
 pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decision {
     if i.mode == ControlMode::Unsupported {
-        return Decision { outputs: Outputs::default(), activity: Activity::Paused, clear_override: false };
+        return Decision { outputs: Outputs::default(), activity: Activity::Paused, clear_override: false, native_limit: None };
     }
     let hold = i.mode == ControlMode::Hold;
+    let native = i.mode == ControlMode::Native;
+    let nl = |n: u8| if native { Some(n) } else { None };
     let above_floor = i.percent > HARD_FLOOR;
     let mut clear_override = false;
     let mut ov = ov;
@@ -90,9 +94,10 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
     match ov {
         Override::FullCharge => {
             return Decision {
-                outputs: Outputs { inhibit: false, discharge: false, light: Some(Light::System) },
+                outputs: Outputs { inhibit: false, discharge: false, light: if native { None } else { Some(Light::System) } },
                 activity: Activity::Charging { to: 100 },
                 clear_override,
+                native_limit: nl(100),
             };
         }
         Override::DischargeTo(n) => {
@@ -104,61 +109,52 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
                 // Final guard: never discharge at or below the floor; charge normally.
                 (false, false, light_for(i.external, false, false), Activity::Charging { to: s.upper })
             } else {
-                (hold, true, Some(Light::Green), Activity::Discharging { to: n })
+                (hold, true, if native { None } else { Some(Light::Green) }, Activity::Discharging { to: n })
             };
-            return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override };
+            return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override, native_limit: nl(s.upper) };
         }
         Override::None => {}
     }
 
-    let (inhibit, discharge, activity) = if hold {
-        let inhibit = if i.percent >= s.upper {
-            true
-        } else if i.percent < s.lower {
-            false
-        } else {
-            prev.inhibit
-        };
-        let discharge = s.auto_discharge && i.external && !i.lid_closed && i.percent > s.upper && above_floor;
+    if native {
         let activity = if !i.external {
             Activity::OnBattery
-        } else if i.lid_closed && s.auto_discharge && i.percent > s.upper {
-            // Would discharge, but never with the lid closed: say so instead of "Holding at <upper>%".
-            Activity::LidClosed
-        } else if discharge {
+        } else if i.percent > s.upper {
             Activity::Discharging { to: s.upper }
-        } else if inhibit {
+        } else if i.percent == s.upper {
             Activity::Holding
         } else {
             Activity::Charging { to: s.upper }
         };
-        (inhibit, discharge, activity)
+        return Decision { outputs: Outputs::default(), activity, clear_override, native_limit: Some(s.upper) };
+    }
+
+    let inhibit = if i.percent >= s.upper {
+        true
+    } else if i.percent < s.lower {
+        false
     } else {
-        let discharge = if !i.external || i.lid_closed {
-            false
-        } else if i.percent >= s.upper {
-            true
-        } else if i.percent <= s.lower {
-            false
-        } else {
-            prev.discharge
-        } && above_floor;
-        let activity = if !i.external {
-            Activity::OnBattery
-        } else if i.lid_closed && i.percent >= s.upper {
-            Activity::LidClosed
-        } else if discharge {
-            Activity::Discharging { to: s.lower }
-        } else {
-            Activity::Charging { to: s.upper }
-        };
-        (false, discharge, activity)
+        prev.inhibit
+    };
+    let discharge = s.auto_discharge && i.external && !i.lid_closed && i.percent > s.upper && above_floor;
+    let activity = if !i.external {
+        Activity::OnBattery
+    } else if i.lid_closed && s.auto_discharge && i.percent > s.upper {
+        // Would discharge, but never with the lid closed: say so instead of "Holding at <upper>%".
+        Activity::LidClosed
+    } else if discharge {
+        Activity::Discharging { to: s.upper }
+    } else if inhibit {
+        Activity::Holding
+    } else {
+        Activity::Charging { to: s.upper }
     };
 
     Decision {
         outputs: Outputs { inhibit, discharge, light: light_for(i.external, inhibit, discharge) },
         activity,
         clear_override,
+        native_limit: None,
     }
 }
 
@@ -213,25 +209,26 @@ mod tests {
             assert_eq!((d.outputs.inhibit, d.outputs.discharge, d.activity), (inh, false, act), "pct {p} ext {ext} auto {}", st.auto_discharge);
         }
     }
-    #[test]
-    fn cycle_mode_table() {
-        let rows = [
-            (70, false, false, Some(Orange), Charging { to: 80 }),
-            (80, false, true, Some(Green), Discharging { to: 75 }),
-            (77, true, true, Some(Green), Discharging { to: 75 }),
-            (75, true, false, Some(Orange), Charging { to: 80 }),
-            (77, false, false, Some(Orange), Charging { to: 80 }),
-        ];
-        for (p, pd, dis, light, act) in rows {
-            let d = decide(&s(), Override::None, &i(p, true, false, Cycle), &prev(false, pd));
-            assert!(!d.outputs.inhibit);
-            assert_eq!((d.outputs.discharge, d.outputs.light, d.activity), (dis, light, act), "pct {p}");
+    #[test] fn native_mode_table() {
+        let d = |p, ext| decide(&s(), Override::None, &i(p, ext, false, Native), &prev(false, false));
+        for (p, ext, act) in [(85, true, Discharging { to: 80 }), (80, true, Holding), (70, true, Charging { to: 80 }), (85, false, OnBattery)] {
+            let r = d(p, ext);
+            assert_eq!((r.activity, r.native_limit), (act, Some(80)), "{p} {ext}");
+            assert_eq!(r.outputs, Outputs { inhibit: false, discharge: false, light: None });
         }
     }
-    #[test]
-    fn cycle_lid_closed_reports_not_enforced() {
-        let d = decide(&s(), Override::None, &i(82, true, true, Cycle), &prev(false, true));
-        assert_eq!((d.outputs.discharge, d.activity), (false, LidClosed));
+    #[test] fn native_full_charge_asks_for_100() {
+        let r = decide(&s(), Override::FullCharge, &i(80, true, false, Native), &prev(false, false));
+        assert_eq!((r.native_limit, r.activity, r.outputs.light), (Some(100), Charging { to: 100 }, None));
+    }
+    #[test] fn native_discharge_to_uses_chie_and_keeps_the_limit() {
+        let r = decide(&s(), Override::DischargeTo(70), &i(78, true, false, Native), &prev(false, false));
+        assert_eq!((r.outputs.discharge, r.outputs.inhibit, r.native_limit), (true, false, Some(80)));
+        let r = decide(&s(), Override::DischargeTo(70), &i(78, true, true, Native), &prev(false, true));
+        assert!(!r.outputs.discharge); // lid closed
+    }
+    #[test] fn hold_mode_has_no_native_limit() {
+        assert_eq!(decide(&s(), Override::None, &i(80, true, false, Hold), &prev(false, false)).native_limit, None);
     }
     #[test]
     fn full_charge_override_until_unplug() {
@@ -254,7 +251,7 @@ mod tests {
     }
     #[test]
     fn discharge_to_lid_closed_says_on_battery_when_unplugged() {
-        for mode in [Hold, Cycle] {
+        for mode in [Hold, Native] {
             let d = decide(&s(), Override::DischargeTo(50), &i(60, true, true, mode), &prev(false, true));
             assert_eq!((d.outputs.discharge, d.activity), (false, LidClosed), "{mode:?}");
             let d = decide(&s(), Override::DischargeTo(50), &i(60, false, true, mode), &prev(false, true));
@@ -263,13 +260,10 @@ mod tests {
     }
     #[test]
     fn never_discharges_at_or_below_floor() {
-        for (ov, mode) in [(Override::DischargeTo(5), Hold), (Override::DischargeTo(5), Cycle)] {
+        for (ov, mode) in [(Override::DischargeTo(5), Hold), (Override::DischargeTo(5), Native)] {
             let d = decide(&s(), ov, &i(10, true, false, mode), &prev(false, true));
             assert!(!d.outputs.discharge, "{mode:?}");
         }
-        let low = Settings { upper: 20, lower: 10, auto_discharge: true };
-        let d = decide(&low, Override::None, &i(10, true, false, Cycle), &prev(false, true));
-        assert!(!d.outputs.discharge);
     }
     #[test]
     fn unsupported_does_nothing() {

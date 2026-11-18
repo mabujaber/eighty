@@ -99,11 +99,20 @@ pub enum KeyState {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NativeState {
+    pub available: Vec<u8>,
+    pub limit: Option<u8>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DoctorReport {
     pub machine: MachineInfo,
     pub keys: Vec<(String, KeyState)>,
     pub status: Status,
     pub other_limiters: Vec<String>,
+    #[serde(default)]
+    pub native: Option<NativeState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

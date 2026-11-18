@@ -62,6 +62,22 @@ impl Settings {
         s.validate()?;
         Ok(s)
     }
+
+    /// Returns a copy with a native macOS limit. `lower` is kept: macOS decides when charging resumes.
+    pub fn with_native_limit(self, upper: u8, lower: Option<u8>, available: &[u8]) -> Result<Settings, String> {
+        if !available.contains(&upper) {
+            let names: Vec<String> = available.iter().map(u8::to_string).collect();
+            let list = match names.split_last() {
+                Some((last, rest)) if !rest.is_empty() => format!("{} or {}", rest.join(", "), last),
+                _ => names.join(""),
+            };
+            return Err(format!("this Mac only supports a limit of {list}%"));
+        }
+        if lower.is_some() {
+            return Err("macOS decides when charging resumes on this Mac, so there is no lower limit".into());
+        }
+        Ok(Settings { upper, ..self })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -69,6 +85,9 @@ impl Settings {
 pub struct Config {
     pub settings: Settings,
     pub accept_other_limiters: bool,
+    /// The macOS Charge Limit found before eighty first changed it.
+    #[serde(default)]
+    pub native_original: Option<u8>,
 }
 
 #[cfg(test)]
@@ -93,5 +112,16 @@ mod tests {
     #[test] fn partial_settings_fill_defaults() {
         let c: Config = toml::from_str("[settings]\nupper = 70\n").unwrap();
         assert_eq!(c.settings, Settings { upper: 70, lower: 65, auto_discharge: true });
+    }
+    #[test] fn native_limits_only_take_macos_steps() {
+        let steps = [80, 85, 90, 95, 100];
+        assert_eq!(Settings::default().with_native_limit(85, None, &steps).unwrap().upper, 85);
+        assert_eq!(Settings::default().with_native_limit(70, None, &steps).unwrap_err(),
+            "this Mac only supports a limit of 80, 85, 90, 95 or 100%");
+        assert_eq!(Settings::default().with_native_limit(80, Some(75), &steps).unwrap_err(),
+            "macOS decides when charging resumes on this Mac, so there is no lower limit");
+    }
+    #[test] fn old_config_without_native_original_loads() {
+        assert_eq!(toml::from_str::<Config>("[settings]\nupper = 80\n").unwrap().native_original, None);
     }
 }
