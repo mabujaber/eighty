@@ -72,7 +72,13 @@ Safety rules:
 - At sleep it switches discharge off, and switches it back on at wake.
 - If something else changes these keys (another limiter, or macOS), eighty reports a Conflict, switches its own discharge off and stops writing. `eighty doctor --retry` takes control again.
 - If writes don't take effect on two fresh readings in a row, it reports a fault and restores normal charging.
-- On shutdown, crash recovery and uninstall, it restores `CHTE=00000000`, `CHIE=00` and `ACLC=00`, so a removed or stopped eighty never leaves a Mac unable to charge.
+- On shutdown, crash recovery and uninstall in hold mode, it restores `CHTE=00000000`, `CHIE=00` and `ACLC=00`, so a removed or stopped eighty never leaves a Mac unable to charge.
+
+In native mode:
+
+- eighty writes `CHIE` only for an explicit `eighty discharge <percent>`. The 10% floor, lid-closed and sleep rules above still apply to it.
+- On shutdown, crash recovery and faults, it writes `CHIE=00` only. It leaves macOS's Charge Limit alone, because macOS enforces it and keeps holding while eighty is stopped.
+- `eighty uninstall` also puts back the limit you had before eighty first took control.
 
 Files:
 
