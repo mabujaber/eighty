@@ -104,6 +104,25 @@ unsafe fn describe(err: *mut NSError) -> String {
     }
 }
 
+/// The limits in `availableChargeLimitsWithError:`'s array. The array's element type
+/// isn't checked by the guard, so each element is checked here: anything but an
+/// NSNumber from 0 to 100 means the private API changed, and is an error rather than
+/// an Objective-C exception (or a wrapped value) in a root daemon.
+fn steps_of(list: &NSArray<AnyObject>) -> Result<Vec<u8>, NativeError> {
+    list.iter()
+        .map(|item| {
+            let n = item.downcast_ref::<NSNumber>().ok_or_else(|| {
+                NativeError::Call(format!("available limits: {} is not a number", item.class().name().to_string_lossy()))
+            })?;
+            let v = n.unsignedIntegerValue();
+            u8::try_from(v)
+                .ok()
+                .filter(|&p| p <= 100)
+                .ok_or_else(|| NativeError::Call(format!("available limits: {v} is not a percentage")))
+        })
+        .collect()
+}
+
 impl NativeLimit for PowerUi {
     fn supported(&mut self) -> bool {
         self.supported
@@ -114,10 +133,11 @@ impl NativeLimit for PowerUi {
         autoreleasepool(|_| {
             let mut err: *mut NSError = ptr::null_mut();
             // SAFETY: encoding verified as `@24@0:8^@16`.
-            let list: Option<Retained<NSArray<NSNumber>>> =
+            // The elements are taken as AnyObject and checked one by one in `steps_of`.
+            let list: Option<Retained<NSArray<AnyObject>>> =
                 unsafe { msg_send![client, availableChargeLimitsWithError: &mut err as *mut *mut NSError] };
             match list {
-                Some(list) => Ok(list.iter().map(|n| n.unsignedCharValue()).collect()),
+                Some(list) => steps_of(&list),
                 None => Err(NativeError::Call(unsafe { describe(err) })),
             }
         })
@@ -159,6 +179,19 @@ impl NativeLimit for PowerUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_accept_numbers_and_reject_anything_else() {
+        let (n80, n100) = (NSNumber::new_u8(80), NSNumber::new_u8(100));
+        let ok = NSArray::<AnyObject>::from_slice(&[&*n80 as &AnyObject, &*n100]);
+        assert_eq!(steps_of(&ok), Ok(vec![80, 100]));
+        let text = NSString::from_str("80");
+        let mixed = NSArray::<AnyObject>::from_slice(&[&*n80 as &AnyObject, &*text]);
+        assert!(matches!(steps_of(&mixed), Err(NativeError::Call(m)) if m.contains("not a number")));
+        let big = NSNumber::new_u64(300); // would wrap to 44 as a u8
+        let wide = NSArray::<AnyObject>::from_slice(&[&*big as &AnyObject]);
+        assert!(matches!(steps_of(&wide), Err(NativeError::Call(m)) if m.contains("300")));
+    }
 
     #[test]
     #[ignore = "needs macOS 26.4+ with MCL"]

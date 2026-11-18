@@ -256,16 +256,30 @@ fn restore_keys(smc: &mut dyn SmcIo, keys: &[(&str, u32)]) -> Vec<(String, SmcEr
     errors
 }
 
+/// What `restore_native` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeRestore {
+    /// Set the native limit back to the recorded original.
+    Restored(u8),
+    /// No original recorded, or no Charge Limit on this Mac: nothing to put back.
+    LeftAsIs,
+    /// The config (and so the recorded original) couldn't be read: the store's warning.
+    ConfigUnreadable(String),
+}
+
 /// Put the user's own native Charge Limit back (the one recorded when eighty
 /// first took control). Does nothing without a record or without Charge Limit.
-pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<Option<u8>, String> {
-    let (config, _) = store.load();
-    let Some(original) = config.native_original else { return Ok(None) };
+pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<NativeRestore, String> {
+    let (config, warning) = store.load();
+    if let Some(w) = warning {
+        return Ok(NativeRestore::ConfigUnreadable(w));
+    }
+    let Some(original) = config.native_original else { return Ok(NativeRestore::LeftAsIs) };
     if !native.supported() {
-        return Ok(None);
+        return Ok(NativeRestore::LeftAsIs);
     }
     native.set_limit(original).map_err(|e| format!("setting the native limit back to {original}%: {e}"))?;
-    Ok(Some(original))
+    Ok(NativeRestore::Restored(original))
 }
 
 #[cfg(test)]
@@ -388,13 +402,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
         store.save(&Config { native_original: Some(95), ..Config::default() }).unwrap();
         let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
-        assert_eq!(restore_native(&mut n, &store), Ok(Some(95)));
+        assert_eq!(restore_native(&mut n, &store), Ok(NativeRestore::Restored(95)));
         assert_eq!(n.limit_now(), 95);
     }
     #[test] fn restore_native_without_a_record_leaves_the_limit() {
         let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
         let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
-        assert_eq!(restore_native(&mut n, &store), Ok(None));
+        assert_eq!(restore_native(&mut n, &store), Ok(NativeRestore::LeftAsIs));
+        assert_eq!(n.writes(), Vec::<u8>::new());
+    }
+    #[test] fn restore_native_reports_an_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        std::fs::write(dir.path().join("config.toml"), "not toml [[[").unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        let Ok(NativeRestore::ConfigUnreadable(w)) = restore_native(&mut n, &store) else { panic!() };
+        assert!(w.contains("config.toml"), "{w}");
         assert_eq!(n.writes(), Vec::<u8>::new());
     }
 }
