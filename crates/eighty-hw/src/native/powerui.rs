@@ -7,7 +7,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::msg_send;
 use objc2_foundation::{NSArray, NSError, NSNumber, NSString};
 
-use super::{guard_encodings, NativeError, NativeLimit};
+use super::{guard_constructor, guard_encodings, NativeError, NativeLimit};
 
 const FRAMEWORK: &CStr = c"/System/Library/PrivateFrameworks/PowerUI.framework/PowerUI";
 const CLASS: &CStr = c"PowerUISmartChargeClient";
@@ -16,6 +16,18 @@ const CLIENT_NAME: &str = "eighty";
 extern "C" {
     // libobjc, already linked by objc2.
     fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
+}
+
+/// Type encoding of `class`'s instance method `name`, or None if it has none.
+fn type_encoding(class: &AnyClass, name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let method = class.instance_method(Sel::register(&cname))?;
+    // SAFETY: `method` is a live Method; the returned string is owned by the runtime.
+    let enc = unsafe { method_getTypeEncoding(method as *const _ as *const c_void) };
+    if enc.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(enc) }.to_string_lossy().into_owned())
 }
 
 /// Native Charge Limit through PowerUI. `new` never panics; if anything is
@@ -40,6 +52,9 @@ impl PowerUi {
             return None;
         }
         let class = AnyClass::get(CLASS)?;
+        if !guard_constructor(&|name| type_encoding(class, name)) {
+            return None;
+        }
         autoreleasepool(|_| {
             let name = NSString::from_str(CLIENT_NAME);
             // SAFETY: `initWithClientName:` is `@24@0:8@16`, taking an NSString.
@@ -54,17 +69,7 @@ impl PowerUi {
     fn probe(&self) -> bool {
         let Some(client) = &self.client else { return false };
         let class = client.class();
-        let found = |name: &str| -> Option<String> {
-            let cname = std::ffi::CString::new(name).ok()?;
-            let method = class.instance_method(Sel::register(&cname))?;
-            // SAFETY: `method` is a live Method; the returned string is owned by the runtime.
-            let enc = unsafe { method_getTypeEncoding(method as *const _ as *const c_void) };
-            if enc.is_null() {
-                return None;
-            }
-            Some(unsafe { CStr::from_ptr(enc) }.to_string_lossy().into_owned())
-        };
-        if !guard_encodings(&found) {
+        if !guard_encodings(&|name| type_encoding(class, name)) {
             return false;
         }
         autoreleasepool(|_| {

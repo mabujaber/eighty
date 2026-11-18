@@ -38,6 +38,15 @@ pub(crate) const GUARDED: [(&str, &str); 5] = [
     ("setMCLLimit:error:", "B28@0:8C16^@20"),
 ];
 
+/// The initializer, checked before the class is instantiated: sending a
+/// selector the class lacks would raise an Objective-C exception.
+pub(crate) const CONSTRUCTOR: (&str, &str) = ("initWithClientName:", "@24@0:8@16");
+
+/// True when `found` reports exactly the expected encoding for the initializer.
+pub fn guard_constructor(found: &dyn Fn(&str) -> Option<String>) -> bool {
+    found(CONSTRUCTOR.0).as_deref() == Some(CONSTRUCTOR.1)
+}
+
 /// True when `found` reports exactly the expected encoding for every guarded selector.
 pub fn guard_encodings(found: &dyn Fn(&str) -> Option<String>) -> bool {
     GUARDED
@@ -55,6 +64,13 @@ mod tests {
             .iter()
             .find(|(s, _)| *s == sel)
             .map(|(_, e)| e.to_string())));
+    }
+
+    #[test]
+    fn constructor_guard_pins_the_initializer_encoding() {
+        assert!(guard_constructor(&|sel| (sel == CONSTRUCTOR.0).then(|| CONSTRUCTOR.1.to_string())));
+        assert!(!guard_constructor(&|_| Some("@32@0:8@16@24".into())));
+        assert!(!guard_constructor(&|_| None));
     }
 
     #[test]
