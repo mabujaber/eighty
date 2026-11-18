@@ -13,3 +13,5 @@ mach2 = "0.4"
 serde.workspace = true
 core-foundation = "0.10"
 libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSValue", "NSError", "NSObject", "NSEnumerator"] }

@@ -3,3 +3,4 @@ pub mod smc;
 pub mod battery;
 pub mod machine;
 pub mod system;
+pub mod native;
