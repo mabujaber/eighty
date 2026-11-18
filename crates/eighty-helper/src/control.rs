@@ -120,6 +120,11 @@ fn light_byte(l: Light) -> u8 {
 }
 
 impl SmcControl {
+    /// Whether `CHIE` is usable, so `DischargeTo` can run from the battery.
+    pub fn can_discharge(&self) -> bool {
+        self.chie
+    }
+
     pub fn new(d: &Detection) -> SmcControl {
         let chie = d.keys.iter().any(|(k, s)| k == CHIE && *s == KeyState::Usable);
         SmcControl { mode: d.mode, light: d.light && d.mode == ControlMode::Hold, chie, last: HashMap::new() }
@@ -200,11 +205,16 @@ impl SmcControl {
     }
 
     /// Write the restore state to the present keys and forget what we wrote.
-    /// Native mode restores only `CHIE`: it never touches `CHTE` or the light.
+    /// Native mode restores only `CHIE`, and only if it is usable: it never touches
+    /// `CHTE` or the light, and a blocked `CHIE` was never ours to restore.
     pub fn restore(&mut self, smc: &mut dyn SmcIo) -> Vec<(String, SmcError)> {
         self.last.clear();
         if self.mode == ControlMode::Native {
-            restore_keys(smc, &[(CHIE, 1)])
+            if self.chie {
+                restore_keys(smc, &[(CHIE, 1)])
+            } else {
+                Vec::new()
+            }
         } else {
             restore_all(smc)
         }

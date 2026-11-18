@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use eighty_core::config::{Config, Settings};
 use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
-use eighty_core::proto::{DoctorReport, Health, Request, Response, Status};
+use eighty_core::proto::{DoctorReport, Health, NativeState, Request, Response, Status};
 use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
 use eighty_hw::native::NativeLimit;
@@ -48,8 +48,11 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// The native limit eighty last set successfully; `None` until the first write
     /// (and again after each bring-up, so the limit is reasserted).
     native_written: Option<u8>,
-    /// Clock time of the last successful `set_limit`.
+    /// Clock time of the last successful `set_limit`, or of adopting a limit changed
+    /// outside eighty: the native watchdog only judges readings `SETTLE_SECS` after it.
     native_written_at: Option<u64>,
+    /// Set while macOS charges past the native limit (calibration); never a fault.
+    native_warning: Option<String>,
     /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
     /// floor while the Mac is asleep.
     sleeping: bool,
@@ -106,6 +109,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             light_warning: None,
             native_written: None,
             native_written_at: None,
+            native_warning: None,
             sleeping: false,
             discharge_warning: None,
             restore_failures: Vec::new(),
@@ -143,6 +147,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         log(&format!("mode {:?}, light {}, keys {:?}, native steps {:?}", d.mode, d.light, d.keys, d.native_steps));
         self.control = SmcControl::new(&self.detection);
         self.native_written = None;
+        self.set_native_warning(None);
         if !limiters.is_empty() {
             self.set_health(Health::OtherLimiters(limiters));
             false
@@ -180,8 +185,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             log(&format!("native: macOS's Charge Limit was {original}% before eighty"));
             if self.config_warning.is_some() {
                 // The file on disk couldn't be read and may hold the real original:
-                // don't overwrite it.
+                // don't overwrite it now, but keep it so the next successful save has it.
                 log("native: not saving the original Charge Limit over an unreadable config file");
+                self.config.native_original = Some(original);
             } else {
                 let c = Config { native_original: Some(original), ..self.config.clone() };
                 self.save(c).map_err(|m| format!("{m}; not changing the Charge Limit without it"))?;
@@ -286,7 +292,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 (Some(changed), Some(updated)) if updated < changed + SETTLE_SECS
             ),
             mode: self.detection.mode,
-            activity: if self.health.is_ok() { self.activity } else { Activity::Paused },
+            activity: match (self.health.is_ok(), &self.native_warning) {
+                (false, _) => Activity::Paused,
+                // macOS is charging past the limit: don't contradict the battery.
+                (true, Some(_)) => Activity::Charging { to: 100 },
+                (true, None) => self.activity,
+            },
             health: self.health.clone(),
             settings: self.settings(),
             override_: self.override_,
@@ -296,6 +307,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .iter()
                 .cloned()
                 .chain(self.native_step_warning())
+                .chain(self.native_warning.iter().cloned())
                 .chain(self.light_warning.iter().cloned())
                 .chain(self.discharge_warning.iter().cloned())
                 .chain(self.restore_failures.iter().cloned())
@@ -318,11 +330,16 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     keys: self.detection.keys.clone(),
                     status: self.status(),
                     other_limiters: self.system.other_limiters(),
-                    native: None,
+                    native: self.native_state(),
                 }))
             }
             Request::SetLimits { upper, lower } => {
-                let settings = match self.config.settings.with_limits(upper, lower) {
+                let settings = if self.detection.mode == ControlMode::Native {
+                    self.config.settings.with_native_limit(upper, lower, &self.detection.native_steps)
+                } else {
+                    self.config.settings.with_limits(upper, lower)
+                };
+                let settings = match settings {
                     Ok(s) => s,
                     Err(m) => return Response::Error(m),
                 };
@@ -332,6 +349,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 self.tick();
             }
             Request::SetAutoDischarge { on } => {
+                if self.detection.mode == ControlMode::Native {
+                    return Response::Error(
+                        "macOS brings the charge down to the limit on this Mac; it can't be turned off".into(),
+                    );
+                }
                 let s = Settings { auto_discharge: on, ..self.config.settings };
                 let settings = match s.with_limits(s.upper, Some(s.lower)) {
                     Ok(s) => s,
@@ -359,6 +381,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 }
                 if self.detection.mode == ControlMode::Unsupported {
                     return Response::Error(Health::Unsupported.message());
+                }
+                if self.detection.mode == ControlMode::Native && !self.control.can_discharge() {
+                    return Response::Error(
+                        "this Mac can't run from the battery while plugged in, so `discharge` isn't available"
+                            .into(),
+                    );
                 }
                 if !self.health.is_ok() {
                     return Response::Error(self.health.message());
@@ -427,6 +455,70 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             return None;
         }
         Some(Health::NotEffective { what: what.into() })
+    }
+
+    /// Native mode, before deciding: if the Charge Limit differs from the last value
+    /// eighty set (the user changed it in System Settings), make it the configured limit
+    /// instead of setting it back. Not while `charge full` has lifted the limit, and not
+    /// before eighty's own first write since bring-up (`native_written` is `None`).
+    fn adopt_native_limit(&mut self) {
+        if self.override_ == Override::FullCharge {
+            return;
+        }
+        let Some(written) = self.native_written else { return };
+        // A failed read is left to the next `set_limit`, which reports it.
+        let Ok(now) = self.native.limit() else { return };
+        if now == written {
+            return;
+        }
+        log(&format!("native limit changed outside eighty: now {now}%"));
+        let settings = Settings { upper: now, ..self.config.settings };
+        if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
+            // Keep it for this run anyway, rather than fight the user's choice.
+            log(&format!("{m}; using {now}% until eighty restarts"));
+            self.config.settings = settings;
+        }
+        self.native_written = Some(now);
+        self.native_written_at = Some((self.clock)());
+    }
+
+    /// Native mode: macOS sometimes charges past its own limit to calibrate the
+    /// battery. Warn while a fresh reading on AC shows that; never fault or restore.
+    fn native_watchdog(&mut self, snap: &BatterySnapshot) {
+        let (Some(limit), Some(at)) = (self.native_written, self.native_written_at) else { return };
+        // A reading from before the last write or adoption settled can't be judged.
+        if !snap.update_time.is_some_and(|u| u >= at + SETTLE_SECS) {
+            return;
+        }
+        if snap.external_connected && snap.percent > limit && snap.is_charging && snap.amperage_ma > 50 {
+            self.set_native_warning(Some(format!(
+                "macOS is charging past {limit}% (it does this now and then to calibrate the battery); eighty can't stop it"
+            )));
+        } else if !snap.is_charging || snap.percent <= limit {
+            self.set_native_warning(None);
+        }
+    }
+
+    fn set_native_warning(&mut self, w: Option<String>) {
+        if w != self.native_warning {
+            match &w {
+                Some(w) => log(w),
+                None => log("native: macOS stopped charging past the limit"),
+            }
+            self.native_warning = w;
+        }
+    }
+
+    /// The doctor's view of macOS's Charge Limit; `None` where it isn't supported.
+    fn native_state(&mut self) -> Option<NativeState> {
+        if !self.native.supported() {
+            return None;
+        }
+        Some(NativeState {
+            available: self.native.available().ok()?,
+            limit: self.native.limit().ok(),
+            enabled: self.native.enabled().ok(),
+        })
     }
 
     /// Health states in which the engine keeps controlling the keys.
@@ -532,11 +624,19 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
 
         // Health is Ok here: may_control passed and BatteryUnreadable was just cleared.
-        if let Some(fault) = self.watchdog(&snap) {
-            self.set_health(fault);
-            self.restore();
-            self.set_activity(Activity::Paused);
-            return;
+        // In Native mode macOS holds the limit, so the SMC watchdog has nothing to judge;
+        // `native_watchdog` below only warns.
+        if self.detection.mode != ControlMode::Native {
+            if let Some(fault) = self.watchdog(&snap) {
+                self.set_health(fault);
+                self.restore();
+                self.set_activity(Activity::Paused);
+                return;
+            }
+        }
+
+        if self.detection.mode == ControlMode::Native {
+            self.adopt_native_limit();
         }
 
         let inputs = Inputs {
@@ -568,6 +668,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 self.native_written = Some(limit);
                 self.native_written_at = Some((self.clock)());
             }
+        }
+        if self.detection.mode == ControlMode::Native {
+            self.native_watchdog(&snap);
         }
 
         let wrote = match self.control.apply(&mut self.smc, &d.outputs) {
@@ -667,6 +770,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             .collect();
         self.set_restore_failures(failures);
         self.discharge_warning = None;
+        // Paused from here on: nothing judges the native limit until control resumes.
+        self.set_native_warning(None);
         let old = self.prev;
         self.prev = Outputs::default();
         self.note_prev_change(old);
@@ -714,7 +819,7 @@ mod tests {
     use super::*;
     use crate::system::FakeSystem;
     use eighty_core::policy::{Activity, ControlMode};
-    use eighty_core::proto::{Health, KeyState};
+    use eighty_core::proto::{Health, KeyState, NativeState};
     use eighty_hw::battery::fake::FakeBattery;
     use eighty_hw::battery::{BatteryError, BatterySnapshot};
     use eighty_hw::native::FakeNative;
@@ -1455,5 +1560,96 @@ mod tests {
         assert!(matches!(st.health, Health::WriteFailed { ref key, .. } if key == "MCL"), "{:?}", st.health);
         assert_eq!((st.activity, r.native.limit_now(), r.smc.value("CHIE")), (Activity::Paused, 80, Some(vec![0])));
         assert!(!r.smc.writes().iter().any(|(k, _)| k == "ACLC" || k == "CHTE"), "{:?}", r.smc.writes());
+    }
+    #[test] fn native_adopts_a_limit_changed_in_system_settings() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (90, 90));
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.native.writes(), vec![80]); // adopted, not overwritten
+    }
+    #[test] fn native_charging_past_the_limit_warns_without_faulting() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.clock.set(1_100); r.set(83, true, true, 2000, Some(1_090)); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!(st.health, Health::Ok);
+        assert!(st.warnings.iter().any(|w| w.starts_with("macOS is charging past 80%")), "{:?}", st.warnings);
+        assert_eq!(st.activity, Activity::Charging { to: 100 });
+        r.clock.set(1_200); r.set(83, false, true, -600, Some(1_190)); e.handle(Event::Tick);
+        assert!(e.status().warnings.is_empty());
+    }
+    #[test] fn native_limit_requests_follow_macos_steps() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 70, lower: None }), Response::Error(m) if m.starts_with("this Mac only supports")));
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        assert_eq!(r.native.limit_now(), 85);
+        assert!(matches!(e.request(0, Request::SetAutoDischarge { on: false }), Response::Error(_)));
+    }
+    #[test] fn native_doctor_reports_the_native_limit() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let Response::Doctor(d) = r.engine().request(0, Request::Doctor) else { panic!() };
+        assert_eq!(d.native, Some(NativeState { available: vec![80, 85, 90, 95, 100], limit: Some(80), enabled: Some(true) }));
+    }
+
+    // Added beyond the brief (Task 4).
+
+    /// Native rig whose `CHIE` rejects writes, so detection marks it unusable.
+    fn native_blocked_chie() -> Rig {
+        let r = Rig::native(); r.smc.insert("CHIE", "ui8 ", &[0], WriteMode::NotPrivileged); r
+    }
+    #[test] fn native_discharge_needs_a_usable_chie() {
+        let r = native_blocked_chie(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        assert_eq!(e.status().mode, ControlMode::Native);
+        assert_eq!(e.request(0, Request::DischargeTo { percent: 50 }),
+            Response::Error("this Mac can't run from the battery while plugged in, so `discharge` isn't available".into()));
+        assert_eq!(e.status().override_, Override::None);
+    }
+    #[test] fn native_restore_skips_an_unusable_chie() {
+        let r = native_blocked_chie(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        let st = e.status();
+        assert_eq!(st.health, Health::Ok);
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+        e.handle(Event::Shutdown);
+        assert!(r.smc.writes().is_empty(), "{:?}", r.smc.writes());
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+    }
+    #[test] fn native_original_is_kept_in_memory_over_an_unreadable_config() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        r.write_config("not toml [[[");
+        let mut e = r.engine();
+        assert_eq!(std::fs::read_to_string(r._dir.path().join("config.toml")).unwrap(), "not toml [[[");
+        assert_eq!(e.config.native_original, Some(100));
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        assert_eq!(r.store.load().0.native_original, Some(100));
+    }
+    #[test] fn native_adoption_waits_for_charge_full_to_end() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        e.request(0, Request::ChargeFull);
+        assert_eq!(r.native.limit_now(), 100);
+        r.native.set_externally(90); e.handle(Event::Tick);
+        assert_eq!((e.status().settings.upper, r.native.writes()), (80, vec![80, 100]));
+    }
+    #[test] fn native_watchdog_waits_for_a_fresh_reading_after_a_write() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // writes 80 at t=1000
+        r.clock.set(1_010); r.set(83, true, true, 2000, Some(1_010)); e.handle(Event::Tick);
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+        assert_eq!(e.status().activity, Activity::Discharging { to: 80 });
+    }
+    #[test] fn native_mode_never_runs_the_smc_watchdog() {
+        let r = Rig::native(); r.set(78, false, true, 0, Some(900));
+        let mut e = r.engine();
+        e.request(0, Request::DischargeTo { percent: 50 });
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        // Readings that would be CHIE strikes in Hold mode.
+        for t in [1_030, 1_090, 1_150] { r.clock.set(t); r.set(78, false, true, 0, Some(t)); e.handle(Event::Tick); }
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
     }
 }
