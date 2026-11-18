@@ -151,10 +151,11 @@ The class's selectors and type encodings, read from the runtime: `setMCLLimit:er
 - **Health.** Each tick reads `getMCLLimitWithError:` and `isMCLCurrentlyEnabled:`. A failed call is a `WriteFailed`-style fault, shown loudly. The watchdog judges native mode like hold mode: at or above the limit on AC, the battery must not be charging.
 
 **Still to verify on the M2 Max before building** (each changes the design):
-1. **Root.** Does `PowerUISmartChargeClient` work from a root process, and from the LaunchDaemon before anyone logs in? If not, the call moves to the user side (CLI / menu-bar app), and the helper only watches.
+1. **Root.** *Verified for a root process (2026-11-18):* under `sudo`, `setMCLLimit:80 error:` returned `YES` and the read-back gave `80`, so the calls live in the helper. Still open: the LaunchDaemon at boot, before anyone logs in. That is a native-mode acceptance step. If it fails there, the helper retries until the call succeeds and shows "waiting for macOS" meanwhile.
 2. **Reboot.** Does the limit survive a restart? Reports disagree: ChargeCap says macOS stores it, while JuiceBar says it lives only in PowerUIAgent's memory. If it doesn't, the helper re-applies it at boot or login.
 3. **Sleep.** Does it hold overnight on AC? It is enforced by macOS, so it should, unlike cycle mode.
-4. **Calibration.** macOS sometimes charges to 100% to recalibrate and ignores every limit while it does (AlDente issues #1842, #1846 on macOS 27). eighty can't stop it, but `status` must say so rather than claim the limit holds.
+4. **`currentChargeLimit:` reads 100** while `getMCLLimitWithError:` reads 80 and charging has stopped at the limit, both as a user and as root. Unexplained. It may be the limit in effect after a pending calibration or full charge. Use `getMCLLimitWithError:` for the setting, and log both.
+5. **Calibration.** macOS sometimes charges to 100% to recalibrate and ignores every limit while it does (AlDente issues #1842, #1846 on macOS 27). eighty can't stop it, but `status` must say so rather than claim the limit holds.
 
 ## 6. Release bar (owner's decision)
 
