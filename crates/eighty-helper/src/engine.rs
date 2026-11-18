@@ -15,6 +15,10 @@ use crate::log::log;
 use crate::store::Store;
 use crate::system::SystemProbe;
 
+/// Settled checks in a row that find eighty's native limit still unconfirmed (about
+/// two minutes, one per tick) before it is reported as `NativeUnavailable`.
+const NATIVE_UNCONFIRMED_STRIKES: u32 = 2;
+
 pub enum Event {
     Tick,
     PowerChanged,
@@ -55,6 +59,15 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// Until then a differing read may just be PowerUI lagging behind eighty's own
     /// write, so it is never adopted as the user's change.
     native_confirmed: bool,
+    /// Consecutive checks, each `SETTLE_SECS` after eighty last (re)sent its limit, that
+    /// still found it unconfirmed. At `NATIVE_UNCONFIRMED_STRIKES` it is `NativeUnavailable`.
+    native_unconfirmed: u32,
+    /// A read that differs from eighty's confirmed limit, waiting for the next check: the
+    /// same value again is adopted as the user's change, anything else drops it.
+    native_candidate: Option<u8>,
+    /// Shown in `warnings` after adopting a limit changed in System Settings, until the
+    /// next successful `SetLimits`.
+    native_notice: Option<String>,
     /// Native mode: the startup step (recording the user's original Charge Limit) is
     /// done. Until it is, eighty never sets the limit; `tick` retries it.
     native_ready: bool,
@@ -117,6 +130,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             native_written: None,
             native_written_at: None,
             native_confirmed: false,
+            native_unconfirmed: 0,
+            native_candidate: None,
+            native_notice: None,
             native_ready: false,
             native_warning: None,
             sleeping: false,
@@ -157,6 +173,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.control = SmcControl::new(&self.detection);
         self.native_written = None;
         self.native_confirmed = false;
+        self.native_unconfirmed = 0;
+        self.native_candidate = None;
         self.native_ready = false;
         self.set_native_warning(None);
         if !limiters.is_empty() {
@@ -223,7 +241,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         if !self.native_ready {
             self.native_bring_up()?;
         }
-        self.check_native_limit().map_err(unavailable)
+        self.check_native_limit()
     }
 
     /// A native step failed. `NativeUnavailable` is retried on every tick: restore the
@@ -236,6 +254,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         // made while eighty wasn't watching: confirm eighty's limit afresh (and set it
         // again if it differs) rather than adopt it.
         self.native_confirmed = false;
+        self.native_candidate = None;
         self.set_health(h);
         if !(retrying && was_retrying) || !self.restore_failures.is_empty() {
             self.restore();
@@ -352,6 +371,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .cloned()
                 .chain(self.native_step_warning())
                 .chain(self.native_warning.iter().cloned())
+                .chain(self.native_notice.iter().cloned())
                 .chain(self.light_warning.iter().cloned())
                 .chain(self.discharge_warning.iter().cloned())
                 .chain(self.restore_failures.iter().cloned())
@@ -368,12 +388,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         )
     }
 
-    /// Native mode, no override, on AC at or below the limit, and a reading fresh
-    /// enough to judge shows macOS isn't charging.
+    /// Native mode, no override, macOS confirmed eighty's limit, on AC at or below it,
+    /// and a reading fresh enough to judge shows macOS isn't charging.
     fn native_idle_below_limit(&self) -> bool {
         let Some(s) = &self.snapshot else { return false };
         let upper = self.settings().upper;
         self.detection.mode == ControlMode::Native
+            && self.native_confirmed
             && self.override_ == Override::None
             && self.activity == (Activity::Charging { to: upper })
             && s.external_connected
@@ -418,6 +439,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
                     return Response::Error(m);
                 }
+                self.native_notice = None;
                 self.tick();
             }
             Request::SetAutoDischarge { on } => {
@@ -530,35 +552,72 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     }
 
     /// Native mode, before deciding: read the Charge Limit and compare it with the last
-    /// value eighty set. A match confirms eighty's write. A difference after that
-    /// confirmation means the user changed it in System Settings: make it the configured
-    /// limit instead of setting it back (not while `charge full` has lifted the limit).
-    /// A difference before it may be PowerUI still reporting the old value, so it is
-    /// never adopted; if it lasts `SETTLE_SECS`, eighty sets its limit again.
-    fn check_native_limit(&mut self) -> Result<(), NativeError> {
+    /// value eighty set. A match confirms eighty's write.
+    ///
+    /// A difference before that confirmation may be PowerUI still reporting the old
+    /// value, so it is never adopted: once `SETTLE_SECS` have passed eighty sets its limit
+    /// again, every check, and the `NATIVE_UNCONFIRMED_STRIKES`th such check in a row is
+    /// `NativeUnavailable` (retried, like a failed call) until a read matches.
+    ///
+    /// A difference after it may be the user changing the limit in System Settings, or a
+    /// one-off odd read. The first such read is only a candidate; the same value on the
+    /// next check is adopted as the configured limit (not while `charge full` has lifted
+    /// it), and anything else drops the candidate, setting eighty's limit again if the
+    /// read still differs.
+    fn check_native_limit(&mut self) -> Result<(), Health> {
         let Some(written) = self.native_written else { return Ok(()) };
-        let now = self.native.limit()?;
+        let now = self.native.limit().map_err(unavailable)?;
         if now == written {
             self.native_confirmed = true;
+            self.native_unconfirmed = 0;
+            self.native_candidate = None;
             return Ok(());
         }
         if !self.native_confirmed {
-            let settled = self.native_written_at.is_none_or(|at| (self.clock)() >= at + SETTLE_SECS);
-            if settled {
-                log(&format!("native: macOS still reports {now}% after eighty set {written}%; setting it again"));
-                self.write_native(written)?;
-            }
-            return Ok(());
+            return self.resend_unconfirmed(written, now);
         }
         if self.override_ == Override::FullCharge {
             return Ok(());
         }
+        match self.native_candidate.take() {
+            None => {
+                log(&format!("native: macOS reports {now}%, not eighty's {written}%; checking again next tick"));
+                self.native_candidate = Some(now);
+            }
+            Some(c) if c == now => self.adopt_native_limit(written, now),
+            Some(c) => {
+                log(&format!("native: macOS reported {c}%, now {now}%; setting eighty's {written}% again"));
+                self.write_native(written).map_err(unavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Eighty's write is still unconfirmed: once it has settled, send it again, and say
+    /// so loudly if that keeps happening.
+    fn resend_unconfirmed(&mut self, written: u8, now: u8) -> Result<(), Health> {
+        let settled = self.native_written_at.is_none_or(|at| (self.clock)() >= at + SETTLE_SECS);
+        if !settled {
+            return Ok(());
+        }
+        log(&format!("native: macOS still reports {now}% after eighty set {written}%; setting it again"));
+        self.native_unconfirmed += 1;
+        self.write_native(written).map_err(unavailable)?;
+        if self.native_confirmed || self.native_unconfirmed < NATIVE_UNCONFIRMED_STRIKES {
+            return Ok(());
+        }
+        Err(Health::NativeUnavailable(format!("macOS still reports {now}% after eighty set {written}%")))
+    }
+
+    /// A limit changed outside eighty (System Settings), read twice: make it the
+    /// configured limit instead of setting it back, and say so in `status`.
+    fn adopt_native_limit(&mut self, previous: u8, now: u8) {
         log(&format!("native limit changed outside eighty: now {now}%"));
         let settings = match self.config.settings.with_native_upper(now) {
             Ok(s) => s,
             Err(m) => {
                 log(&format!("native: can't adopt {now}%: {m}"));
-                return Ok(());
+                return;
             }
         };
         if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
@@ -568,7 +627,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
         self.native_written = Some(now);
         self.native_written_at = Some((self.clock)());
-        Ok(())
+        self.native_notice = Some(if now >= 100 {
+            format!(
+                "Charge Limit changed in System Settings: now {now}% (no limit). Run `eighty limit {previous}` to go back."
+            )
+        } else {
+            format!("Charge Limit changed in System Settings: now {now}%.")
+        });
     }
 
     /// Set macOS's Charge Limit, then read it back once: a match confirms the write
@@ -576,6 +641,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     fn write_native(&mut self, limit: u8) -> Result<(), NativeError> {
         self.native.set_limit(limit)?;
         log(&format!("native: set macOS's Charge Limit to {limit}%"));
+        if self.native_written != Some(limit) {
+            // A new limit, not a re-send: its own confirmation starts from scratch.
+            self.native_unconfirmed = 0;
+        }
+        self.native_candidate = None;
         self.native_written = Some(limit);
         self.native_written_at = Some((self.clock)());
         // A failed read-back is left to the next tick's check, which reports it.
@@ -1728,6 +1798,8 @@ mod tests {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));
         let mut e = r.engine();
         r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        assert_eq!(e.status().settings.upper, 80); // one read is only a candidate
+        r.clock.set(1_120); e.handle(Event::Tick); // the same again a minute later: adopted
         assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (90, 90));
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!(r.native.writes(), vec![80]); // adopted, not overwritten
@@ -1742,7 +1814,7 @@ mod tests {
         assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (85, 85));
         assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![80, 85]));
         // A real change in System Settings after confirmation is still adopted.
-        r.native.set_externally(90); e.handle(Event::Tick);
+        r.native.set_externally(90); e.handle(Event::Tick); e.handle(Event::Tick);
         assert_eq!((e.status().settings.upper, r.native.writes()), (90, vec![80, 85]));
     }
     #[test] fn native_lagging_read_after_charge_full_ends_does_not_adopt_100() {
@@ -1774,6 +1846,7 @@ mod tests {
         let mut e = r.engine();
         assert_eq!(r.native.limit_now(), 90);
         r.native.set_externally(80); r.clock.set(1_060); e.handle(Event::Tick);
+        r.clock.set(1_120); e.handle(Event::Tick);
         let (c, warning) = r.store.load();
         assert_eq!(warning, None);
         assert_eq!((c.settings.upper, c.settings.lower, c.native_original), (80, 80, Some(100)));
@@ -1882,5 +1955,98 @@ mod tests {
         for t in [1_030, 1_090, 1_150] { r.clock.set(t); r.set(78, false, true, 0, Some(t)); e.handle(Event::Tick); }
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+    }
+
+    // Follow-up: unconfirmed writes are loud, adoption needs two identical reads.
+
+    #[test] fn native_never_confirmed_write_becomes_unavailable_then_recovers() {
+        let r = Rig::native(); r.native.freeze_reads(Some(100)); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // sets 80 at t=1000; PowerUI keeps reporting 100
+        assert_eq!(e.status().health, Health::Ok);
+        r.clock.set(1_060); e.handle(Event::Tick); // 1st settled tick still unconfirmed: set it again
+        assert_eq!((e.status().health, r.native.writes()), (Health::Ok, vec![80, 80]));
+        r.clock.set(1_120); e.handle(Event::Tick); // 2nd: loud
+        let st = e.status();
+        assert_eq!(st.health, Health::NativeUnavailable("macOS still reports 100% after eighty set 80%".into()));
+        assert_eq!(st.health.message(), "couldn't reach macOS's Charge Limit (PowerUI): macOS still reports 100% after eighty set 80%. macOS keeps its current limit; eighty is waiting for macOS and retrying.");
+        assert_eq!((st.activity, r.native.writes()), (Activity::Paused, vec![80, 80, 80]));
+        r.clock.set(1_180); e.handle(Event::Tick); // still re-sent every tick
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        assert_eq!(r.native.writes(), vec![80, 80, 80, 80]);
+        r.native.freeze_reads(None); r.clock.set(1_240); e.handle(Event::Tick); // reads catch up; no ClearFault
+        let st = e.status();
+        assert_eq!((st.health, st.settings.upper, r.native.limit_now()), (Health::Ok, 80, 80));
+        assert_eq!(r.native.writes(), vec![80, 80, 80, 80]);
+        assert_ne!(st.activity, Activity::Paused);
+    }
+    #[test] fn native_unconfirmed_write_never_shows_holding() {
+        let r = Rig::native(); r.native.freeze_reads(Some(100)); r.set(78, false, true, 0, Some(900));
+        let mut e = r.engine(); // sets 80 at t=1000, unconfirmed
+        // A reading stamped after the write settled (the battery's clock runs ahead of
+        // ours), on a tick too early to re-send: idle below the limit, but unconfirmed.
+        r.clock.set(1_010); r.set(78, false, true, 0, Some(1_030)); e.handle(Event::Tick);
+        assert_eq!(r.native.writes(), vec![80]);
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
+    }
+    #[test] fn native_one_tick_blip_is_not_adopted_and_is_reapplied() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // 80, confirmed
+        r.native.set_externally(100); r.clock.set(1_060); e.handle(Event::Tick);
+        r.native.set_externally(80); r.clock.set(1_120); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.writes()), (80, 80, vec![80]));
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+        // A blip that comes back as a third value is dropped too, and eighty's limit set again.
+        r.native.set_externally(100); r.clock.set(1_180); e.handle(Event::Tick);
+        r.native.set_externally(95); r.clock.set(1_240); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper), (80, 80));
+        assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80, 80]));
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+        r.clock.set(1_300); e.handle(Event::Tick);
+        assert_eq!((e.status().settings.upper, e.status().health, r.native.writes()), (80, Health::Ok, vec![80, 80]));
+    }
+    #[test] fn native_steady_change_is_adopted_on_second_read_with_notice() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        assert_eq!(e.status().settings.upper, 80);
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+        r.clock.set(1_120); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.writes()), (90, 90, vec![80]));
+        assert_eq!(st.warnings, vec!["Charge Limit changed in System Settings: now 90%.".to_string()]);
+        r.clock.set(1_180); e.handle(Event::Tick); // stays until the next SetLimits
+        assert_eq!(e.status().warnings.len(), 1);
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+    }
+    #[test] fn native_steady_change_to_100_says_the_limit_is_off() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        r.write_config("[settings]\nupper = 85\nlower = 80\n");
+        let mut e = r.engine();
+        r.native.set_externally(100); r.clock.set(1_060); e.handle(Event::Tick);
+        r.clock.set(1_120); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!(st.settings.upper, 100);
+        assert_eq!(st.warnings, vec!["Charge Limit changed in System Settings: now 100% (no limit). Run `eighty limit 85` to go back.".to_string()]);
+        // A failed SetLimits keeps the notice.
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 70, lower: None }), Response::Error(_)));
+        assert_eq!(e.status().warnings.len(), 1);
+    }
+    #[test] fn startup_never_adopts() {
+        let r = Rig::native(); r.set(85, false, true, 0, Some(900));
+        r.write_config("[settings]\nupper = 85\nlower = 80\n");
+        r.native.set_externally(90); // changed in System Settings while eighty was stopped
+        let mut e = r.engine();
+        assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![85]));
+        r.clock.set(1_060); e.handle(Event::Tick); r.clock.set(1_120); e.handle(Event::Tick);
+        // ClearFault re-runs startup: it re-applies too.
+        r.native.set_externally(95); e.request(0, Request::ClearFault);
+        r.clock.set(1_180); e.handle(Event::Tick); r.clock.set(1_240); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper), (85, 85));
+        assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![85, 85]));
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
     }
 }

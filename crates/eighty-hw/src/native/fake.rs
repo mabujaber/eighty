@@ -15,6 +15,8 @@ struct State {
     lag: usize,
     lag_left: usize,
     before_write: u8,
+    /// While set, every read returns this value, whatever was written.
+    frozen: Option<u8>,
 }
 
 /// Clones share state, so a test can keep a handle while the code under test owns another.
@@ -32,6 +34,7 @@ impl FakeNative {
             lag: 0,
             lag_left: 0,
             before_write: limit,
+            frozen: None,
         })))
     }
 
@@ -56,6 +59,12 @@ impl FakeNative {
     /// value from before it, as PowerUI may do for a moment.
     pub fn lag_reads(&self, n: usize) {
         self.0.borrow_mut().lag = n;
+    }
+
+    /// While `Some(v)`, every read returns `v` however often eighty writes: PowerUI
+    /// accepting `setMCLLimit` but never reporting the new value. `None` ends it.
+    pub fn freeze_reads(&self, value: Option<u8>) {
+        self.0.borrow_mut().frozen = value;
     }
 
     pub fn fail_calls(&self, fail: bool) {
@@ -91,6 +100,9 @@ impl NativeLimit for FakeNative {
     fn limit(&mut self) -> Result<u8, NativeError> {
         self.check()?;
         let mut s = self.0.borrow_mut();
+        if let Some(v) = s.frozen {
+            return Ok(v);
+        }
         if s.lag_left > 0 {
             s.lag_left -= 1;
             return Ok(s.before_write);
@@ -135,5 +147,16 @@ mod tests {
         f.set_limit(85).unwrap();
         assert_eq!([f.limit().unwrap(), f.limit().unwrap(), f.limit().unwrap()], [80, 80, 85]);
         assert_eq!(f.limit_now(), 85);
+    }
+
+    #[test]
+    fn fake_frozen_reads_ignore_writes_until_cleared() {
+        let mut f = FakeNative::new(&[80, 85, 90, 95, 100], 100);
+        f.freeze_reads(Some(100));
+        f.set_limit(80).unwrap();
+        f.set_limit(80).unwrap();
+        assert_eq!((f.limit().unwrap(), f.limit_now()), (100, 80));
+        f.freeze_reads(None);
+        assert_eq!(f.limit().unwrap(), 80);
     }
 }
