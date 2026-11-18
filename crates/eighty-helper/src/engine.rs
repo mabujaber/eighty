@@ -327,15 +327,15 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             external: s.is_some_and(|s| s.external_connected),
             charging: s.is_some_and(|s| s.is_charging),
             amperage_ma: s.map_or(0, |s| s.amperage_ma),
-            amperage_stale: matches!(
-                (self.charging_changed_at, s.and_then(|s| s.update_time)),
-                (Some(changed), Some(updated)) if updated < changed + SETTLE_SECS
-            ),
+            amperage_stale: self.reading_stale(),
             mode: self.detection.mode,
             activity: match (self.health.is_ok(), &self.native_warning) {
                 (false, _) => Activity::Paused,
                 // macOS is charging past the limit: don't contradict the battery.
                 (true, Some(_)) => Activity::Charging { to: 100 },
+                // macOS resumes charging only some way below its limit (its own
+                // hysteresis), so don't claim "Charging to <limit>%" while it isn't.
+                (true, None) if self.native_idle_below_limit() => Activity::Holding,
                 (true, None) => self.activity,
             },
             health: self.health.clone(),
@@ -354,6 +354,34 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    /// The battery reading predates the last charging switch (`SETTLE_SECS` after it).
+    fn reading_stale(&self) -> bool {
+        matches!(
+            (self.charging_changed_at, self.snapshot.as_ref().and_then(|s| s.update_time)),
+            (Some(changed), Some(updated)) if updated < changed + SETTLE_SECS
+        )
+    }
+
+    /// Native mode, no override, on AC at or below the limit, and a reading fresh
+    /// enough to judge shows macOS isn't charging.
+    fn native_idle_below_limit(&self) -> bool {
+        let Some(s) = &self.snapshot else { return false };
+        let upper = self.settings().upper;
+        self.detection.mode == ControlMode::Native
+            && self.override_ == Override::None
+            && self.activity == (Activity::Charging { to: upper })
+            && s.external_connected
+            && !s.is_charging
+            && s.percent <= upper
+            && !self.reading_stale()
+            && self.native_reading_settled(s)
+    }
+
+    /// The reading was taken `SETTLE_SECS` after eighty last set (or adopted) the native limit.
+    fn native_reading_settled(&self, snap: &BatterySnapshot) -> bool {
+        self.native_written_at.is_some_and(|at| snap.update_time.is_some_and(|u| u >= at + SETTLE_SECS))
     }
 
     fn request(&mut self, uid: u32, req: Request) -> Response {
@@ -554,9 +582,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     /// Native mode: macOS sometimes charges past its own limit to calibrate the
     /// battery. Warn while a fresh reading on AC shows that; never fault or restore.
     fn native_watchdog(&mut self, snap: &BatterySnapshot) {
-        let (Some(limit), Some(at)) = (self.native_written, self.native_written_at) else { return };
+        let Some(limit) = self.native_written else { return };
         // A reading from before the last write or adoption settled can't be judged.
-        if !snap.update_time.is_some_and(|u| u >= at + SETTLE_SECS) {
+        if !self.native_reading_settled(snap) {
             return;
         }
         if snap.external_connected && snap.percent > limit && snap.is_charging && snap.amperage_ma > 50 {
@@ -1755,6 +1783,19 @@ mod tests {
         assert_eq!(st.activity, Activity::Charging { to: 100 });
         r.clock.set(1_200); r.set(83, false, true, -600, Some(1_190)); e.handle(Event::Tick);
         assert!(e.status().warnings.is_empty());
+    }
+    #[test] fn native_below_the_limit_not_charging_shows_holding() {
+        let r = Rig::native(); r.set(78, false, true, 0, Some(900));
+        let mut e = r.engine(); // writes 80 at t=1000
+        // A reading from before the write settled can't be judged: policy's view stands.
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
+        // macOS resumes charging only some way below its limit.
+        r.clock.set(1_100); r.set(78, false, true, 0, Some(1_090)); e.handle(Event::Tick);
+        assert_eq!(e.status().activity, Activity::Holding);
+        r.clock.set(1_200); r.set(78, true, true, 1500, Some(1_190)); e.handle(Event::Tick);
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
+        r.clock.set(1_300); r.set(78, false, false, -500, Some(1_290)); e.handle(Event::Tick);
+        assert_eq!(e.status().activity, Activity::OnBattery);
     }
     #[test] fn native_limit_requests_follow_macos_steps() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));

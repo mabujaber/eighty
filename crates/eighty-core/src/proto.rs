@@ -49,7 +49,7 @@ impl Health {
     pub fn message(&self) -> String {
         match self {
             Health::Ok => "ok".to_string(),
-            Health::Unsupported => "this Mac has no SMC key eighty can use to control charging. Run `eighty doctor` and report it.".to_string(),
+            Health::Unsupported => "this Mac has no SMC key eighty can use and macOS's Charge Limit isn't available. Run `eighty doctor` and report it.".to_string(),
             Health::OtherLimiters(names) => format!(
                 "another charge limiter is installed ({}). Remove it, or run `eighty doctor --accept-other-limiters`.",
                 names.join(", ")
@@ -208,6 +208,13 @@ mod tests {
             found: "00000000".into(),
         };
         assert!(h.message().contains("macOS's own Charge Limit"));
+    }
+    #[test]
+    fn unsupported_message_names_both_paths() {
+        assert_eq!(
+            Health::Unsupported.message(),
+            "this Mac has no SMC key eighty can use and macOS's Charge Limit isn't available. Run `eighty doctor` and report it."
+        );
     }
     #[test]
     fn native_unavailable_message_says_macos_keeps_its_limit() {
