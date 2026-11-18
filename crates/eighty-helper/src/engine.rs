@@ -7,7 +7,7 @@ use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Overri
 use eighty_core::proto::{DoctorReport, Health, NativeState, Request, Response, Status};
 use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
 use eighty_hw::battery::{BatterySnapshot, BatterySource};
-use eighty_hw::native::NativeLimit;
+use eighty_hw::native::{NativeError, NativeLimit};
 use eighty_hw::smc::SmcIo;
 
 use crate::control::{chie_discharging, detect, detect_read_only, Detection, SmcControl, ACLC};
@@ -51,6 +51,10 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// Clock time of the last successful `set_limit`, or of adopting a limit changed
     /// outside eighty: the native watchdog only judges readings `SETTLE_SECS` after it.
     native_written_at: Option<u64>,
+    /// Whether a `limit()` read has shown `native_written` since eighty last wrote it.
+    /// Until then a differing read may just be PowerUI lagging behind eighty's own
+    /// write, so it is never adopted as the user's change.
+    native_confirmed: bool,
     /// Set while macOS charges past the native limit (calibration); never a fault.
     native_warning: Option<String>,
     /// Between `WillSleep` and `DidWake`: never discharge, since nothing enforces the
@@ -109,6 +113,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             light_warning: None,
             native_written: None,
             native_written_at: None,
+            native_confirmed: false,
             native_warning: None,
             sleeping: false,
             discharge_warning: None,
@@ -147,6 +152,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         log(&format!("mode {:?}, light {}, keys {:?}, native steps {:?}", d.mode, d.light, d.keys, d.native_steps));
         self.control = SmcControl::new(&self.detection);
         self.native_written = None;
+        self.native_confirmed = false;
         self.set_native_warning(None);
         if !limiters.is_empty() {
             self.set_health(Health::OtherLimiters(limiters));
@@ -457,26 +463,36 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         Some(Health::NotEffective { what: what.into() })
     }
 
-    /// Native mode, before deciding: if the Charge Limit differs from the last value
-    /// eighty set (the user changed it in System Settings), make it the configured limit
-    /// instead of setting it back. Not while `charge full` has lifted the limit, and not
-    /// before eighty's own first write since bring-up (`native_written` is `None`).
-    fn adopt_native_limit(&mut self) {
-        if self.override_ == Override::FullCharge {
-            return;
-        }
-        let Some(written) = self.native_written else { return };
-        // A failed read is left to the next `set_limit`, which reports it.
-        let Ok(now) = self.native.limit() else { return };
+    /// Native mode, before deciding: read the Charge Limit and compare it with the last
+    /// value eighty set. A match confirms eighty's write. A difference after that
+    /// confirmation means the user changed it in System Settings: make it the configured
+    /// limit instead of setting it back (not while `charge full` has lifted the limit).
+    /// A difference before it may be PowerUI still reporting the old value, so it is
+    /// never adopted; if it lasts `SETTLE_SECS`, eighty sets its limit again.
+    fn check_native_limit(&mut self) -> Result<(), NativeError> {
+        let Some(written) = self.native_written else { return Ok(()) };
+        let now = self.native.limit()?;
         if now == written {
-            return;
+            self.native_confirmed = true;
+            return Ok(());
+        }
+        if !self.native_confirmed {
+            let settled = self.native_written_at.is_none_or(|at| (self.clock)() >= at + SETTLE_SECS);
+            if settled {
+                log(&format!("native: macOS still reports {now}% after eighty set {written}%; setting it again"));
+                self.write_native(written)?;
+            }
+            return Ok(());
+        }
+        if self.override_ == Override::FullCharge {
+            return Ok(());
         }
         log(&format!("native limit changed outside eighty: now {now}%"));
         let settings = match self.config.settings.with_native_upper(now) {
             Ok(s) => s,
             Err(m) => {
                 log(&format!("native: can't adopt {now}%: {m}"));
-                return;
+                return Ok(());
             }
         };
         if let Err(m) = self.save(Config { settings, ..self.config.clone() }) {
@@ -486,6 +502,19 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
         self.native_written = Some(now);
         self.native_written_at = Some((self.clock)());
+        Ok(())
+    }
+
+    /// Set macOS's Charge Limit, then read it back once: a match confirms the write
+    /// at once; anything else leaves it for `check_native_limit` on later ticks.
+    fn write_native(&mut self, limit: u8) -> Result<(), NativeError> {
+        self.native.set_limit(limit)?;
+        log(&format!("native: set macOS's Charge Limit to {limit}%"));
+        self.native_written = Some(limit);
+        self.native_written_at = Some((self.clock)());
+        // A failed read-back is left to the next tick's check, which reports it.
+        self.native_confirmed = self.native.limit().is_ok_and(|now| now == limit);
+        Ok(())
     }
 
     /// Native mode: macOS sometimes charges past its own limit to calibrate the
@@ -642,7 +671,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
 
         if self.detection.mode == ControlMode::Native {
-            self.adopt_native_limit();
+            if let Err(err) = self.check_native_limit() {
+                self.set_health(Health::WriteFailed { key: "MCL".into(), error: err.to_string() });
+                self.restore();
+                self.set_activity(Activity::Paused);
+                return;
+            }
         }
 
         let inputs = Inputs {
@@ -664,15 +698,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
 
         if let Some(limit) = d.native_limit {
             if self.native_written != Some(limit) {
-                if let Err(err) = self.native.set_limit(limit) {
+                if let Err(err) = self.write_native(limit) {
                     self.set_health(Health::WriteFailed { key: "MCL".into(), error: err.to_string() });
                     self.restore();
                     self.set_activity(Activity::Paused);
                     return;
                 }
-                log(&format!("native: set macOS's Charge Limit to {limit}%"));
-                self.native_written = Some(limit);
-                self.native_written_at = Some((self.clock)());
             }
         }
         if self.detection.mode == ControlMode::Native {
@@ -1574,6 +1605,42 @@ mod tests {
         assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (90, 90));
         assert_eq!(e.status().health, Health::Ok);
         assert_eq!(r.native.writes(), vec![80]); // adopted, not overwritten
+    }
+    #[test] fn native_lagging_read_after_set_limits_is_not_adopted() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine(); // writes 80 at t=1000, read back as 80
+        r.native.lag_reads(2); // PowerUI still reports 80 for two reads after the next write
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
+        e.handle(Event::Tick); // reads 80 again: eighty's own write hasn't shown up yet
+        e.handle(Event::Tick); // reads 85: confirmed
+        assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (85, 85));
+        assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![80, 85]));
+        // A real change in System Settings after confirmation is still adopted.
+        r.native.set_externally(90); e.handle(Event::Tick);
+        assert_eq!((e.status().settings.upper, r.native.writes()), (90, vec![80, 85]));
+    }
+    #[test] fn native_lagging_read_after_charge_full_ends_does_not_adopt_100() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        e.request(0, Request::ChargeFull);
+        assert_eq!(r.native.limit_now(), 100);
+        r.native.lag_reads(2);
+        r.set(80, false, false, -500, Some(1_000)); e.handle(Event::Tick); // unplug: 80 again, read back as 100
+        e.handle(Event::Tick); // still reads 100
+        assert_eq!((e.status().settings.upper, r.store.load().0.settings.upper), (80, 80));
+        e.handle(Event::Tick); // reads 80: confirmed
+        assert_eq!((e.status().settings.upper, r.native.limit_now(), r.native.writes()), (80, 80, vec![80, 100, 80]));
+    }
+    #[test] fn native_unconfirmed_write_is_reissued_after_settling() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.lag_reads(2);
+        e.request(0, Request::SetLimits { upper: 85, lower: None }); // t=1000, read back as 80
+        r.clock.set(1_000 + SETTLE_SECS); e.handle(Event::Tick); // still 80 after SETTLE_SECS: set it again
+        assert_eq!(r.native.writes(), vec![80, 85, 85]);
+        assert_eq!(e.status().settings.upper, 85);
+        r.clock.set(1_100); e.handle(Event::Tick);
+        assert_eq!((e.status().settings.upper, r.native.limit_now()), (85, 85));
     }
     #[test] fn native_adoption_keeps_a_hold_era_config_loadable() {
         let r = Rig::native(); r.set(85, false, true, 0, Some(900));

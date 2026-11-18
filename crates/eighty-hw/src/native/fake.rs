@@ -11,6 +11,10 @@ struct State {
     limit: u8,
     fail: bool,
     writes: Vec<u8>,
+    /// Reads after each write that still return the value from before it.
+    lag: usize,
+    lag_left: usize,
+    before_write: u8,
 }
 
 /// Clones share state, so a test can keep a handle while the code under test owns another.
@@ -25,6 +29,9 @@ impl FakeNative {
             limit,
             fail: false,
             writes: Vec::new(),
+            lag: 0,
+            lag_left: 0,
+            before_write: limit,
         })))
     }
 
@@ -40,7 +47,15 @@ impl FakeNative {
 
     /// Changes the limit as if the user did it in System Settings (not recorded as a write).
     pub fn set_externally(&self, percent: u8) {
-        self.0.borrow_mut().limit = percent;
+        let mut s = self.0.borrow_mut();
+        s.limit = percent;
+        s.lag_left = 0;
+    }
+
+    /// From the next write on, the first `n` reads after each write still return the
+    /// value from before it, as PowerUI may do for a moment.
+    pub fn lag_reads(&self, n: usize) {
+        self.0.borrow_mut().lag = n;
     }
 
     pub fn fail_calls(&self, fail: bool) {
@@ -75,7 +90,12 @@ impl NativeLimit for FakeNative {
 
     fn limit(&mut self) -> Result<u8, NativeError> {
         self.check()?;
-        Ok(self.0.borrow().limit)
+        let mut s = self.0.borrow_mut();
+        if s.lag_left > 0 {
+            s.lag_left -= 1;
+            return Ok(s.before_write);
+        }
+        Ok(s.limit)
     }
 
     fn enabled(&mut self) -> Result<bool, NativeError> {
@@ -86,7 +106,9 @@ impl NativeLimit for FakeNative {
     fn set_limit(&mut self, percent: u8) -> Result<(), NativeError> {
         self.check()?;
         let mut s = self.0.borrow_mut();
+        s.before_write = s.limit;
         s.limit = percent;
+        s.lag_left = s.lag;
         s.writes.push(percent);
         Ok(())
     }
@@ -104,5 +126,14 @@ mod tests {
         f.set_externally(90);
         assert_eq!(f.limit().unwrap(), 90);
         assert!(!FakeNative::unsupported().supported());
+    }
+
+    #[test]
+    fn fake_lagging_reads_return_the_value_before_the_write() {
+        let mut f = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        f.lag_reads(2);
+        f.set_limit(85).unwrap();
+        assert_eq!([f.limit().unwrap(), f.limit().unwrap(), f.limit().unwrap()], [80, 80, 85]);
+        assert_eq!(f.limit_now(), 85);
     }
 }
