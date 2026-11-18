@@ -74,6 +74,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// Times the candidate was replaced by yet another value without being adopted. At
     /// `NATIVE_CANDIDATE_REPLACEMENTS` eighty sets its own limit again.
     native_candidate_replaced: u32,
+    /// A PowerUI call succeeded during the current tick: only then does `NativeUnavailable`
+    /// go back to Ok.
+    native_reached: bool,
     /// Shown in `warnings` after adopting a limit changed in System Settings, until the
     /// next successful `SetLimits`.
     native_notice: Option<String>,
@@ -142,6 +145,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             native_unconfirmed: 0,
             native_candidate: None,
             native_candidate_replaced: 0,
+            native_reached: false,
             native_notice: None,
             native_ready: false,
             native_warning: None,
@@ -224,6 +228,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
         if self.config.native_original.is_none() {
             let original = self.native.limit().map_err(unavailable)?;
+            self.native_reached = true;
             log(&format!("native: macOS's Charge Limit was {original}% before eighty"));
             if self.config_warning.is_some() {
                 // The file on disk couldn't be read and may hold the real original:
@@ -369,6 +374,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 // macOS resumes charging only some way below its limit (its own
                 // hysteresis), so don't claim "Charging to <limit>%" while it isn't.
                 (true, None) if self.native_idle_below_limit() => Activity::Holding,
+                // Holding at exactly the limit (from `decide`) also needs macOS to have
+                // confirmed eighty's limit, with no other reading pending.
+                (true, None) if self.activity == Activity::Holding && self.native_unsure() => {
+                    Activity::Charging { to: self.settings().upper }
+                }
                 (true, None) => self.activity,
             },
             health: self.health.clone(),
@@ -416,6 +426,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             && self.native_reading_settled(s)
     }
 
+    /// Native mode, and macOS hasn't confirmed eighty's limit or reports another value
+    /// not yet adopted.
+    fn native_unsure(&self) -> bool {
+        self.detection.mode == ControlMode::Native && (!self.native_confirmed || self.native_candidate.is_some())
+    }
+
     /// The reading was taken `SETTLE_SECS` after eighty last set (or adopted) the native limit.
     fn native_reading_settled(&self, snap: &BatterySnapshot) -> bool {
         self.native_written_at.is_some_and(|at| snap.update_time.is_some_and(|u| u >= at + SETTLE_SECS))
@@ -452,8 +468,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     return Response::Error(m);
                 }
                 self.native_notice = None;
-                // The user's explicit choice wins over a reading not yet adopted.
+                // The user's explicit choice wins over a reading not yet adopted, even
+                // when it is the limit eighty already had: forget the last write so this
+                // tick writes it again.
                 self.clear_native_candidate();
+                if self.detection.mode == ControlMode::Native {
+                    self.native_written = None;
+                }
                 self.tick();
             }
             Request::SetAutoDischarge { on } => {
@@ -604,6 +625,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             return Ok(());
         }
         let now = self.native.limit().map_err(unavailable)?;
+        self.native_reached = true;
         if now == written {
             self.native_confirmed = true;
             self.native_unconfirmed = 0;
@@ -689,6 +711,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     /// at once; anything else leaves it for `check_native_limit` on later ticks.
     fn write_native(&mut self, limit: u8) -> Result<(), NativeError> {
         self.native.set_limit(limit)?;
+        self.native_reached = true;
         log(&format!("native: set macOS's Charge Limit to {limit}%"));
         if self.native_written != Some(limit) {
             // A new limit, not a re-send: its own confirmation starts from scratch.
@@ -861,6 +884,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
 
         if self.detection.mode == ControlMode::Native {
+            self.native_reached = false;
             if let Err(h) = self.native_prepare() {
                 self.native_failed(h);
                 return;
@@ -893,8 +917,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             }
         }
         if self.detection.mode == ControlMode::Native {
-            // Every native step this tick succeeded: macOS is reachable again.
-            if matches!(self.health, Health::NativeUnavailable(_)) {
+            // Every native step this tick succeeded, and at least one PowerUI call was
+            // made: macOS is reachable again.
+            if self.native_reached && matches!(self.health, Health::NativeUnavailable(_)) {
                 self.set_health(Health::Ok);
             }
             self.native_watchdog(&snap);
@@ -2155,5 +2180,42 @@ mod tests {
         assert_eq!((st.settings.upper, r.store.load().0.settings.upper), (85, 85));
         assert_eq!((r.native.limit_now(), r.native.writes()), (85, vec![85, 85]));
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+    #[test] fn native_set_limits_to_the_current_value_overrides_a_pending_candidate() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick); // candidate 90
+        r.clock.set(1_110);
+        assert!(matches!(e.request(0, Request::SetLimits { upper: 80, lower: None }), Response::Status(_)));
+        assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80, 80]));
+        r.clock.set(1_170); e.handle(Event::Tick); r.clock.set(1_230); e.handle(Event::Tick);
+        let st = e.status();
+        assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.limit_now()), (80, 80, 80));
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+    #[test] fn native_at_the_limit_shows_holding_only_when_confirmed() {
+        // A reading pending as a candidate.
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        assert_eq!(e.status().activity, Activity::Holding);
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        assert_eq!(e.status().activity, Activity::Charging { to: 80 });
+        // eighty's own write not yet confirmed.
+        let r = Rig::native(); r.native.freeze_reads(Some(100)); r.set(80, false, true, 0, Some(900));
+        assert_eq!(r.engine().status().activity, Activity::Charging { to: 80 });
+    }
+    #[test] fn native_unavailable_stays_until_macos_answers() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.fail_calls(true);
+        e.request(0, Request::ChargeFull); // writing 100 fails
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)));
+        // Unplugged: charge full ends and 80 is already written, so nothing calls PowerUI.
+        r.set(80, false, false, -500, Some(1_000)); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::NativeUnavailable(_)), "{:?}", e.status().health);
+        assert_eq!(e.status().override_, Override::None);
+        r.native.fail_calls(false); e.handle(Event::Tick);
+        assert_eq!(e.status().health, Health::Ok);
+        assert_eq!((r.native.limit_now(), r.native.writes()), (80, vec![80]));
     }
 }
