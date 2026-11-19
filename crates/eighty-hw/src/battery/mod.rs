@@ -5,7 +5,7 @@ mod parse;
 pub mod fake;
 
 pub use ioreg::IoRegBattery;
-pub use parse::{parse_snapshot, Prop};
+pub use parse::{pack_temperature, parse_snapshot, Prop, PACK_TEMPERATURE};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BatterySnapshot {
@@ -13,7 +13,8 @@ pub struct BatterySnapshot {
     pub is_charging: bool,
     pub external_connected: bool,
     pub amperage_ma: i32,
-    /// macOS 27 no longer reports `Temperature` on some Macs (seen on an M2 Max).
+    /// From `AppleSmartBattery`, or on macOS 27 from its `AppleSmartBatteryPack` entries.
+    /// `None` if neither reports it.
     pub temperature_c: Option<f32>,
     pub cycle_count: Option<u32>,
     /// When macOS last refreshed these readings (Unix seconds, `UpdateTime`).
