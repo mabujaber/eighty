@@ -6,6 +6,7 @@ Task 7 of [Plan 2b](../superpowers/plans/2026-11-19-eighty-02b-native-mode.md). 
 |---|---|---|---|
 | M5 Pro (Mac17,8) | 26.6.2 (25G83) | hold (`CHTE` + `CHIE`), regression only | **Passed**, 2026-11-19 |
 | M2 Max (Mac14,6) | 27.2 (26B123) | native (macOS Charge Limit) | Not run yet |
+| M5 Pro (Mac17,8) | 27.2.1 (26B131) | native (macOS Charge Limit) | In progress, 2026-11-19 |
 
 ## M5 Pro, hold mode regression
 
@@ -26,6 +27,31 @@ Build: `feat/helper` at `01c5439`. Setup: macOS Charge Limit 100%, Optimized Cha
 | 8 | `eighty limit 80`, then `sudo eighty uninstall` | Pass | 08:11:22 `Discharging { to: 80 }`. 08:11:34 `shutting down; restoring charging`. Printed `restore: native limit left as is` and `charging restored; eighty uninstalled`. Helper, plist, process and socket gone; config and log kept. Probe at 08:12:35: `CHTE=00000000`, `CHIE=00`, `ACLC=04`. Charging at +3.7 A from 93% |
 
 Not run (code paths unchanged since plan 2, or optional): sleep, reboot, permissions, `kill -9`, `charge full`, `discharge <n>`.
+
+## M5 Pro, native mode (macOS 27.2.1)
+
+Updating this M5 from 26.6.2 to 27.2.1 removed `CHTE`, so it can no longer use hold mode. The read-only and `--write-test` probe runs showed `CHTE` missing and `CHIE` Verified. The light test ended in `RestoreFailed` (ACLC read back `04`), but it had read `03` again by the next check, so it looks like a timing issue. Nobody watched the light during that run, so the green/orange light check on 27.2.1 is unconfirmed (native mode leaves the light to macOS). `cargo test -p eighty-hw native -- --ignored` passed (`powerui_reads_on_this_mac`, no root). Build: `feat/helper` at `1f70f1e`, with `target/release` from `01c5439` (only docs changed since). Before the run, System Settings showed a Charge Limit of 100%. No other limiter was installed. Times are UTC.
+
+| Step | Check | Result | Evidence |
+|---|---|---|---|
+| 1 | `sudo eighty install`, `eighty status`, `eighty doctor` | Pass | 09:40:52 log: `mode Native, light false, keys [CHTE Missing, CHIE Usable, ACLC Usable], native steps [80, 85, 90, 95, 100]`, `native: macOS's Charge Limit was 100% before eighty`, `native: set macOS's Charge Limit to 80%`. Status: `Mode native (macOS Charge Limit) · MagSafe light: macOS`, `Limit 80% (held by macOS)`. Doctor: `Native 80%`, `Health ok`, `Limiters none`. Config gained `native_original = 100` |
+| 3 | Above the limit | Pass | At 100% on AC: `State Discharging to 80%`. ioreg at 09:41:44 showed `InstantAmperage` −603 mA with `ExternalConnected = Yes`, and the probe read `CHIE=00` and `ACLC=03`, so the discharge came from macOS, not from eighty. Status still showed 0 mA until macOS's next battery reading |
+| 2 | `eighty limit 85` | Pass | 09:42:45 `native: set macOS's Charge Limit to 85%`, `Discharging { to: 85 }`. Status `Limit 85% (held by macOS)`, `discharging 869 mA · on AC` |
+| 2 | `eighty limit 70` | Pass | Refused: "this Mac only supports a limit of 80, 85, 90, 95 or 100%" |
+| 2 | `eighty limit 80 75` | Pass | Refused: "macOS decides when charging resumes on this Mac, so there is no lower limit" |
+| 2 | Set 80% in System Settings | Pass | 09:44:52 `native: macOS reports 80%, not eighty's 85%; checking again next tick`. 09:45:52 `native limit changed outside eighty: now 80%`. Status `Limit 80%` and `Warning Charge Limit changed in System Settings: now 80%.` Config `upper = 80` |
+| 2 | A brief change: 90% in System Settings, then back to 80% before the next check | Pass | 09:48:52 `native: macOS reports 90%, not eighty's 80%; checking again next tick`. The owner set 80% again. After that: no adoption and no write by eighty (no further native lines). Doctor `Native 80%`, `Health ok`, status `Limit 80%` |
+| 2 | Three changes without a steady value (90 → 85 → 95 → 90, each right after the helper logged the previous one) | Pass | 09:54:52 `macOS reports 90%, not eighty's 80%`. 09:55:52 `macOS reported 90%, now 85%`. 09:56:52 `macOS reported 85%, now 95%`. 09:57:52 `native: macOS's reading keeps changing (now 90%); setting eighty's 80% again`, `native: set macOS's Charge Limit to 80%`. Doctor `Native 80%`, `Health ok`, config `upper = 80` (nothing adopted) |
+| 1 | Reboot (owner restart, FileVault on) | Pass, with a small margin | 09:59:47 `shutting down; restoring charging` (no PowerUI write at shutdown). Kernel boot 10:00:05. The helper started at 10:01:01 and in the same second logged `native: set macOS's Charge Limit to 80%`, before Finder started (10:01:03). loginwindow started at 10:01:00, so the helper ran about when the session started, not long before it. No `NativeUnavailable`: PowerUI answered on the first try. After boot: doctor `Native 80%`, `Health ok`, status `Limit 80% (held by macOS)` |
+| 5 | Does macOS keep the limit across a reboot without the helper? | Yes, macOS keeps it | `sudo launchctl disable system/io.github.mabujaber.eighty.helper`. 10:10:07 the helper stopped (`shutting down`). Kernel boot 10:10:25. The helper did not run after boot (no process, no new log lines). System Settings showed a Charge Limit of 80% (owner). So eighty's write at boot only backs up what macOS has already stored |
+| 5 | Re-enable the helper and reboot | Pass | `sudo launchctl enable …`, reboot. At 10:15:08 the helper started, then `native: set macOS's Charge Limit to 80%`. Status at 10:25: 96%, `discharging 438 mA · on AC`, doctor `Native 80%`, `Health ok` |
+| — | `sudo -u nobody eighty limit 85` / `status` | Pass | Refused: "permission denied: only an admin (sudo) or the logged-in user can change eighty". Status works. The CLI was copied to `/tmp/eighty-cli` first, because `nobody` can't get into the home folder (`drwxr-x---`) |
+| 4 | `eighty charge full` | Pass | 10:29:14 `native: set macOS's Charge Limit to 100%`, `Charging { to: 100 }`. Doctor `Native 100%`. Status `96% · charging 3630 mA`, `Override charge to 100% until unplugged`. Minor: status still says `Limit 80% (held by macOS)` while macOS's limit is 100% (wording only) |
+| 4 | Unplug | Pass | 10:31:14 `override FullCharge finished`, `native: set macOS's Charge Limit to 80%`, `OnBattery`. Doctor `Native 80%`, `Health ok`. Status has no Override line, `Limit 80%`. Config unchanged (`upper = 80`) |
+| 4 | `eighty discharge 94` on battery (charger not plugged in by mistake) | Note | The CLI was run on battery. No override was logged and none was active after plugging in (the helper logged `Discharging { to: 80 }` at 10:34:43 with `CHIE=00`). The command had to be run again on AC. Check what the CLI prints for `discharge` on battery |
+| 4 | `eighty discharge 94` on AC, at 96% | Pass | 10:35:16 `outputs inhibit=false discharge=true`, `Discharging { to: 94 }`. Probe `CHIE=08`. Status `Override discharge to 94%`. The shown % lagged the actual charge: 20 min later it still showed 96% while `AppleRawCurrentCapacity` had dropped from 8212 to 7935 mAh (−552 mA) |
+| — | Sleep during the discharge override | Pass | 11:01:00 `sleep: macOS is going to sleep`, `outputs … discharge=false` (CHIE `00` while asleep). 11:04:22 woke (HID), `outputs … discharge=true`. The override survived (status still `Override discharge to 94%`, at 95%). It slept again 11:05:31–11:07:55, and the same thing happened |
+| 4 | Discharge reaches 94% | Pass | 11:08:06 `override DischargeTo(94) finished`, `outputs … discharge=false`, `activity Discharging { to: 80 }`. Probe `CHIE=00`. ioreg `InstantAmperage` −621 mA with `ExternalConnected = Yes`, so macOS took over and carries on to its 80% Charge Limit. Status: `94%`, `Discharging to 80%`, no Override line |
 
 ## M2 Max, native mode
 
