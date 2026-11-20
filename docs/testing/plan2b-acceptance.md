@@ -57,20 +57,43 @@ Updating this M5 from 26.6.2 to 27.2.1 removed `CHTE`, so it can no longer use h
 | 6 | `sudo eighty uninstall` | Pass | Printed `restore: wrote CHTE=00000000, CHIE=00, ACLC=00 to every key present`, `restore: native limit back to 100%`, `charging restored; eighty uninstalled`. 06:53:34 `shutting down; restoring charging`. Helper binary, LaunchDaemon plist, process and `/var/run/eighty.sock` gone; config and log kept. Probe: `CHTE` missing, `CHIE=00`, `ACLC=04` (charging). Next battery reading (06:54:17): charging at +4227 mA from 80%, `NotChargingReason = 0`. System Settings: Charge Limit 100% (owner), the value before eighty |
 | — | After uninstall: `cargo build --release` at `235cc83`, `cargo test -p eighty-hw battery -- --ignored` | Pass | `reads_real_battery` and `reads_real_temperature` pass. The probe prints `27.2 °C` (was `temp n/a`) |
 
-### Not done on the M5 Pro
+### Extra native-mode checks on the M5 Pro (2026-11-20)
 
-The helper is uninstalled. These were optional or depend on macOS:
+Checks that neither Mac had run in native mode. Build: `feat/helper` at `e1866ee`, `cargo build --release` (includes the temperature change). Before install, eighty was uninstalled and macOS's Charge Limit was 100%. The config from the last uninstall was still there, with `native_original = 100`.
 
-| Step | Check | Expected |
+| Check | Result | Evidence |
 |---|---|---|
-| — | If macOS charges past the limit (calibration) | Status shows the warning and doesn't claim Holding (§5.6 item 5). Record it only if it happens |
-| — | Optional: `sudo ./target/release/eighty-probe --write-test`, watching the MagSafe light | Green for 15 s, then orange for 15 s. ACLC may still end in `RestoreFailed` until the probe fix lands |
+| Install with a config left by an earlier uninstall | Pass, but see finding 1 | 06:57:27 started, `native: set macOS's Charge Limit to 80%`. No `Charge Limit was N% before eighty` line: the old `native_original = 100` was reused, not read again |
+| Reinstall over a running install | Pass | 06:57:59 `shutting down`, 06:58:04 new helper, `set … 80%`. Config kept `native_original = 100` |
+| `charge full`, then `charge auto` (still on AC) | Pass | 06:58:46 `set … 100%`, `Charging { to: 100 }`, doctor `Native 100%`. 06:58:49 `set … 80%`, `Discharging { to: 80 }`, doctor `Native 80%` |
+| `auto-discharge off` / `on` | Pass | Both refused, exit 1: "macOS brings the charge down to the limit on this Mac; it can't be turned off". Config unchanged. Minor: the same message for `on` reads oddly |
+| `logs`, `doctor --retry` | Pass | `logs` prints the last lines. `--retry` re-ran detection (06:58:52 `mode Native …`, `set … 80%`), `Health ok` |
+| `kill -9` the helper while holding | Pass | launchd restarted it at 06:59:27 (new pid, no `shutting down` line). Doctor `Native 80%`, `Health ok`, `CHIE=00`, `native_original = 100` |
+| `kill -9` during `discharge 81` (CHIE=08) | Pass | 06:59:47 `outputs … discharge=true`, probe `CHIE=08`. Killed. 07:00:37 restart: probe `CHIE=00`, override gone (in memory only), `Discharging to 80%` by macOS, `Health ok`. Nothing in the log says CHIE was cleared at startup |
+| `discharge 79` on battery | Pass | Unplugged: printed `Discharging to 79%`, `Override discharge to 79%`, exit 0. 07:01:24 `outputs … discharge=true`, probe `CHIE=08`. Yesterday's "nothing happened" did not reproduce (its CLI output wasn't kept) |
+| Plug in during that discharge | Pass (better than the known limitation) | With `CHIE=08`, macOS 27.2.1 still reported `ExternalConnected = Yes` and `AppleRawExternalConnected = Yes`, and status said `on AC`. On macOS 26 `CHIE=08` hid the adapter; on 27.2.1 it doesn't |
+| `charge auto` ends a discharge override | Pass | 07:03:20 `outputs … discharge=false`, `Discharging { to: 80 }`, probe `CHIE=00` |
+| Helper CPU and memory | Pass | 0.04 s CPU in 2 min 53 s, with commands sent during that time. `top`: 0.0% CPU, 3.6 MB, no idle wakeups |
+| `sudo eighty uninstall` after all of the above | Pass | `restore: native limit back to 100%`, `charging restored; eighty uninstalled`. Helper, plist, process and socket gone. `CHIE=00`, charging at +3.6 A |
+| Probe `--write-test`, light watched | Pass | `ACLC WriteAccepted`, no `RestoreFailed` (the light was already orange from charging, so the restore matched). The owner saw green for 15 s, then orange. `CHIE` gave `CannotVerify("battery is already discharging")`: the first battery reading was still from before the uninstall (CHIE was verified on 2026-11-19). The probe printed `28.1 °C` |
+| macOS charges past the limit (calibration) | Didn't happen | Not seen on either Mac |
 
-Follow-ups found during this run (code, not tests), all fixed on 2026-11-20:
+### Findings and follow-ups (code)
+
+Follow-ups found on 2026-11-19, all fixed in `4d0ab06`:
 
 - Probe: ACLC restore reads back too early (`RestoreFailed`, read `04` after writing `03`). **Fixed:** the light is treated as firmware-owned. Its restore counts once the original value is written back, and the read-back is no longer judged.
 - Status during `charge full` still says `Limit 80% (held by macOS)` while macOS's limit is 100%. **Fixed:** it now says `Limit 80% (lifted to 100% until unplugged)`.
 - `eighty discharge 94` run on battery left no override and no log line. **Fixed:** it is refused with "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already", like `charge full`.
+
+Still open, from the extra checks above (2026-11-20):
+
+1. **`native_original` survives uninstall.** Uninstall restores it but leaves it in the kept config. If the user changes the Charge Limit while eighty is uninstalled and then reinstalls, eighty keeps the old value and the next uninstall overwrites the user's newer choice. Fix: clear `native_original` after a successful restore.
+2. **Startup doesn't log a cleared CHIE.** After a crash with `CHIE=08`, the restart clears it silently. A line like `startup: CHIE was 08; cleared` would make crashes visible in the log.
+3. **`auto-discharge on`** in native mode is refused with "can't be turned off". Accept it as a no-op, or word the message for both.
+4. **CHIE no longer hides the adapter on macOS 27.2.1** (M5). The "effective external" latch is only needed on macOS 26. Keep it, and note it in the spec.
+
+Note: the `discharge 79` on battery row above was run on `e1866ee`, before `4d0ab06`. Since `4d0ab06`, `discharge` on battery is refused with "plug in first".
 
 ## M2 Max, native mode
 
