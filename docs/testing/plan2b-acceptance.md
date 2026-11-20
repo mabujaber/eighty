@@ -6,7 +6,7 @@ Task 7 of [Plan 2b](../superpowers/plans/2026-11-19-eighty-02b-native-mode.md). 
 |---|---|---|---|
 | M5 Pro (Mac17,8) | 26.6.2 (25G83) | hold (`CHTE` + `CHIE`), regression only | **Passed**, 2026-11-19 |
 | M2 Max (Mac14,6) | 27.2 (26B123) | native (macOS Charge Limit) | **Passed**, 2026-11-19/20 |
-| M5 Pro (Mac17,8) | 27.2.1 (26B131) | native (macOS Charge Limit) | In progress, 2026-11-19 |
+| M5 Pro (Mac17,8) | 27.2.1 (26B131) | native (macOS Charge Limit) | **Passed**, 2026-11-19 to 2026-11-20 |
 
 ## M5 Pro, hold mode regression
 
@@ -54,16 +54,16 @@ Updating this M5 from 26.6.2 to 27.2.1 removed `CHTE`, so it can no longer use h
 | 4 | Discharge reaches 94% | Pass | 11:08:06 `override DischargeTo(94) finished`, `outputs … discharge=false`, `activity Discharging { to: 80 }`. Probe `CHIE=00`. ioreg `InstantAmperage` −621 mA with `ExternalConnected = Yes`, so macOS took over and carries on to its 80% Charge Limit. Status: `94%`, `Discharging to 80%`, no Override line |
 | 3 | On AC at 80% for 10+ minutes | Pass | 12:34 at 81%, −1369 mA, `CHIE=00` (macOS discharging). 12:37:39 `activity Holding`. 12:38 at 80%, −528 mA (last step / stale reading). From 12:39: 0 mA, `IsCharging = No`, `ExternalConnected = Yes`. Still `Holding at 80%` and `not charging · on AC` at 12:56 (about 19 min). Light green (owner) |
 | 5 | Plugged in overnight, lid closed (no external displays) | Pass | 19:50 UTC: 80%, AC, `Holding at 80%`, `CHIE=00`. The helper logged `sleep` at 19:54:08 and `wake` at 06:50:17 (about 11 h), nothing in between: no activity change, no fault. macOS's power log for the night: 17 DarkWakes, every reading `Using AC (Charge:80%)` (44 of 44). Morning: 80%, `not charging · on AC`, `Holding at 80%`, doctor `Native 80%`, `Health ok`, `CHIE=00`, `ACLC=03` |
+| 6 | `sudo eighty uninstall` | Pass | Printed `restore: wrote CHTE=00000000, CHIE=00, ACLC=00 to every key present`, `restore: native limit back to 100%`, `charging restored; eighty uninstalled`. 06:53:34 `shutting down; restoring charging`. Helper binary, LaunchDaemon plist, process and `/var/run/eighty.sock` gone; config and log kept. Probe: `CHTE` missing, `CHIE=00`, `ACLC=04` (charging). Next battery reading (06:54:17): charging at +4227 mA from 80%, `NotChargingReason = 0`. System Settings: Charge Limit 100% (owner), the value before eighty |
+| — | After uninstall: `cargo build --release` at `235cc83`, `cargo test -p eighty-hw battery -- --ignored` | Pass | `reads_real_battery` and `reads_real_temperature` pass. The probe prints `27.2 °C` (was `temp n/a`) |
 
-### Still to do on the M5 Pro
+### Not done on the M5 Pro
 
-The helper installed for these tests is the `01c5439` build. Keep it until the list is done. The temperature change (`AppleSmartBatteryPack`) is not in it.
+The helper is uninstalled. These were optional or depend on macOS:
 
 | Step | Check | Expected |
 |---|---|---|
 | — | If macOS charges past the limit (calibration) | Status shows the warning and doesn't claim Holding (§5.6 item 5). Record it only if it happens |
-| 6 | `sudo eighty uninstall` (last) | Prints `restore: native limit back to 100%`. System Settings shows 100%. Probe: `CHIE=00`. Helper, plist, process and socket gone |
-| — | After uninstall: `cargo build --release`, then `cargo test -p eighty-hw battery -- --ignored` | `reads_real_temperature` passes. The probe prints a temperature, not `temp n/a` |
 | — | Optional: `sudo ./target/release/eighty-probe --write-test`, watching the MagSafe light | Green for 15 s, then orange for 15 s. ACLC may still end in `RestoreFailed` until the probe fix lands |
 
 Follow-ups found during this run (code, not tests):
