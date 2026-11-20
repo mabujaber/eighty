@@ -59,6 +59,10 @@ pub fn render_status(s: &Status) -> String {
     let power = if s.external { "on AC" } else { "on battery" };
     line(&mut out, "Battery", &format!("{}% · {} · {}", s.percent, charging_part, power));
     let limit_text = match s.mode {
+        // `charge full` sets macOS's limit to 100% until unplugged; the setting stays.
+        ControlMode::Native if s.override_ == Override::FullCharge => {
+            format!("{}% (lifted to 100% until unplugged)", s.settings.upper)
+        }
         ControlMode::Native => format!("{}% (held by macOS)", s.settings.upper),
         _ => {
             let auto = if s.settings.auto_discharge { "auto-discharge on" } else { "auto-discharge off" };
@@ -232,6 +236,19 @@ mod tests {
         assert!(out.contains("Limit     80% (held by macOS)\n"), "{out}");
         assert!(out.contains("Mode      native (macOS Charge Limit) · MagSafe light: macOS\n"), "{out}");
         assert!(!out.contains("resumes below") && !out.contains("auto-discharge"), "{out}");
+    }
+
+    #[test]
+    fn native_charge_full_says_the_limit_is_lifted() {
+        let s = Status {
+            mode: ControlMode::Native,
+            activity: Activity::Charging { to: 100 },
+            override_: Override::FullCharge,
+            ..st()
+        };
+        let out = render_status(&s);
+        assert!(out.contains("Limit     80% (lifted to 100% until unplugged)\n"), "{out}");
+        assert!(!out.contains("held by macOS"), "{out}");
     }
 
     fn native_doctor(limit: Option<u8>) -> String {

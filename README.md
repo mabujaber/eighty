@@ -44,7 +44,7 @@ Mode      hold (CHTE) · MagSafe light: yes
 | `eighty limit <upper> [lower]` | Set the limit (20–100). Charging resumes below `lower`, which defaults to `upper − 5`. In native mode only 80, 85, 90, 95 and 100 (no limit) work, and there is no lower limit |
 | `eighty auto-discharge on\|off` | When the battery is above the limit on AC, run from battery until it is back at the limit (hold mode only; in native mode macOS does it and it can't be turned off) |
 | `eighty charge full` | Charge to 100% once. It ends when you unplug. `eighty charge auto` ends it now |
-| `eighty discharge <percent>` | Run from battery on AC down to `percent`, then hold |
+| `eighty discharge <percent>` | Run from battery on AC down to `percent`, then hold. Needs the charger plugged in |
 | `eighty doctor [--retry]` | Check SMC support and helper health. `--retry` clears a recorded fault |
 | `eighty logs` | The last lines of the helper log |
 | `sudo eighty uninstall [--purge]` | Stop the helper, restore normal charging and remove it. `--purge` also deletes settings and logs |

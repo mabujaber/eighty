@@ -168,7 +168,11 @@ fn test_one(
 
     let mut guard = RestoreGuard::new(smc);
     let written_at = now();
-    let mut verdict = match guard.write_tracked(key, c.on) {
+    // The firmware drives the light too, so its restore can't be judged by a read.
+    let write = |g: &mut RestoreGuard, v: &[u8]| {
+        if c.role == Role::Light { g.write_tracked_firmware_owned(key, v) } else { g.write_tracked(key, v) }
+    };
+    let mut verdict = match write(&mut guard, c.on) {
         Err(SmcError::NotPrivileged) => Some(Verdict::Blocked),
         Err(e) => Some(Verdict::WriteFailed(e.to_string())),
         Ok(()) => None,
@@ -179,7 +183,7 @@ fn test_one(
     if verdict.is_none() {
         let mut ok = settle(cfg.settle, cancel, sleep);
         if ok && c.role == Role::Light {
-            ok = match guard.write_tracked(key, c.off) {
+            ok = match write(&mut guard, c.off) {
                 Ok(()) => settle(cfg.settle, cancel, sleep),
                 Err(e) => {
                     verdict = Some(Verdict::WriteFailed(e.to_string()));

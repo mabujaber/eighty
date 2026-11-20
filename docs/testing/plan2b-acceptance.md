@@ -66,11 +66,11 @@ The helper is uninstalled. These were optional or depend on macOS:
 | — | If macOS charges past the limit (calibration) | Status shows the warning and doesn't claim Holding (§5.6 item 5). Record it only if it happens |
 | — | Optional: `sudo ./target/release/eighty-probe --write-test`, watching the MagSafe light | Green for 15 s, then orange for 15 s. ACLC may still end in `RestoreFailed` until the probe fix lands |
 
-Follow-ups found during this run (code, not tests):
+Follow-ups found during this run (code, not tests), all fixed on 2026-11-20:
 
-- Probe: ACLC restore reads back too early (`RestoreFailed`, read `04` after writing `03`). Wait and re-read, or treat the light as firmware-owned.
-- Status during `charge full` still says `Limit 80% (held by macOS)` while macOS's limit is 100%.
-- `eighty discharge 94` run on battery left no override and no log line. Check what the CLI prints, and make it say so if it does nothing.
+- Probe: ACLC restore reads back too early (`RestoreFailed`, read `04` after writing `03`). **Fixed:** the light is treated as firmware-owned. Its restore counts once the original value is written back, and the read-back is no longer judged.
+- Status during `charge full` still says `Limit 80% (held by macOS)` while macOS's limit is 100%. **Fixed:** it now says `Limit 80% (lifted to 100% until unplugged)`.
+- `eighty discharge 94` run on battery left no override and no log line. **Fixed:** it is refused with "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already", like `charge full`.
 
 ## M2 Max, native mode
 
@@ -102,5 +102,5 @@ Build: `feat/helper` at `98668dd` (includes the `AppleSmartBatteryPack` temperat
 
 Notes:
 
-- The `Charge Limit changed in System Settings: now 80%.` warning from 17:17 was still shown at 17:49 and cleared only at the reboot. Check whether it should time out or clear after the next `eighty limit`.
+- The `Charge Limit changed in System Settings: now 80%.` warning from 17:17 was still shown at 17:49 and cleared only at the reboot. **Fixed 2026-11-20:** it now clears 10 minutes after the change (or at the next `eighty limit`). A change to 100% ("no limit") still stays until the next `eighty limit`.
 - Right after boot, status can say `Holding at 80%` for about a minute while macOS tops up at about 1.7 A. It stays within the limit, so it is not the §5.6 item 5 case.

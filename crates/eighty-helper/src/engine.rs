@@ -23,6 +23,9 @@ const NATIVE_UNCONFIRMED_STRIKES: u32 = 2;
 const NATIVE_ADOPT_AFTER_SECS: u64 = TICK_SECS - SETTLE_SECS;
 /// Candidates replaced in a row (the read keeps changing) before eighty sets its limit again.
 const NATIVE_CANDIDATE_REPLACEMENTS: u32 = 3;
+/// How long `status` shows that a limit changed in System Settings was adopted. A change
+/// to 100% ("no limit") stays until the next `eighty limit`, since the Mac isn't limiting.
+const NATIVE_NOTICE_SECS: u64 = 10 * 60;
 
 pub enum Event {
     Tick,
@@ -78,8 +81,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// go back to Ok.
     native_reached: bool,
     /// Shown in `warnings` after adopting a limit changed in System Settings, until the
-    /// next successful `SetLimits`.
-    native_notice: Option<String>,
+    /// next successful `SetLimits` or, unless it is the "no limit" notice, until the
+    /// first tick at or after the given time (`NATIVE_NOTICE_SECS` after adoption).
+    native_notice: Option<(String, Option<u64>)>,
     /// Native mode: the startup step (recording the user's original Charge Limit) is
     /// done. Until it is, eighty never sets the limit; `tick` retries it.
     native_ready: bool,
@@ -391,7 +395,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .cloned()
                 .chain(self.native_step_warning())
                 .chain(self.native_warning.iter().cloned())
-                .chain(self.native_notice.iter().cloned())
+                .chain(self.native_notice_text())
                 .chain(self.light_warning.iter().cloned())
                 .chain(self.discharge_warning.iter().cloned())
                 .chain(self.restore_failures.iter().cloned())
@@ -520,6 +524,14 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 }
                 if !self.health.is_ok() {
                     return Response::Error(self.health.message());
+                }
+                // Like `charge full`: started unplugged, it would do nothing visible now and
+                // latch "unplugged" once the charger is connected (see `tick`).
+                if !self.snapshot.as_ref().is_some_and(|s| s.external_connected) {
+                    return Response::Error(
+                        "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already"
+                            .into(),
+                    );
                 }
                 self.override_ = Override::DischargeTo(percent);
                 self.tick();
@@ -699,12 +711,20 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.native_written = Some(now);
         self.native_written_at = Some((self.clock)());
         self.native_notice = Some(if now >= 100 {
-            format!(
-                "Charge Limit changed in System Settings: now {now}% (no limit). Run `eighty limit {previous}` to go back."
+            (
+                format!(
+                    "Charge Limit changed in System Settings: now {now}% (no limit). Run `eighty limit {previous}` to go back."
+                ),
+                None,
             )
         } else {
-            format!("Charge Limit changed in System Settings: now {now}%.")
+            (format!("Charge Limit changed in System Settings: now {now}%."), Some((self.clock)() + NATIVE_NOTICE_SECS))
         });
+    }
+
+    /// The adoption notice, while it is still shown (`tick` drops it once it times out).
+    fn native_notice_text(&self) -> Option<String> {
+        self.native_notice.as_ref().map(|(text, _)| text.clone())
     }
 
     /// Set macOS's Charge Limit, then read it back once: a match confirms the write
@@ -785,6 +805,11 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     }
 
     fn tick(&mut self) {
+        if let Some((_, Some(until))) = self.native_notice {
+            if (self.clock)() >= until {
+                self.native_notice = None;
+            }
+        }
         // Always read the battery, even when paused, so status shows current numbers.
         let mut snap = self.battery.snapshot();
         if let Ok(s) = &mut snap {
@@ -1696,6 +1721,16 @@ mod tests {
         assert_eq!(req(&mut e, 501, Request::ChargeFull), Response::Error("plug in first: a full charge needs the charger".into()));
         assert_eq!(e.status().override_, Override::None);
     }
+    #[test] fn discharge_needs_the_charger() {
+        for r in [Rig::hold(), Rig::native()] {
+            r.set(90, false, false, -400, Some(900)); let mut e = r.engine();
+            assert_eq!(
+                req(&mut e, 501, Request::DischargeTo { percent: 85 }),
+                Response::Error("plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already".into())
+            );
+            assert_eq!(e.status().override_, Override::None);
+        }
+    }
     #[test] fn discharge_below_floor_rejected() {
         let r = Rig::hold(); r.set(70, true, true, 1200, Some(900)); let mut e = r.engine();
         assert!(matches!(req(&mut e, 501, Request::DischargeTo { percent: 9 }), Response::Error(_)));
@@ -2148,10 +2183,21 @@ mod tests {
         let st = e.status();
         assert_eq!((st.settings.upper, r.store.load().0.settings.upper, r.native.writes()), (90, 90, vec![80]));
         assert_eq!(st.warnings, vec!["Charge Limit changed in System Settings: now 90%.".to_string()]);
-        r.clock.set(1_180); e.handle(Event::Tick); // stays until the next SetLimits
+        r.clock.set(1_180); e.handle(Event::Tick);
         assert_eq!(e.status().warnings.len(), 1);
         assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
         assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+    }
+    #[test] fn native_change_notice_times_out() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        r.native.set_externally(90); r.clock.set(1_060); e.handle(Event::Tick);
+        r.clock.set(1_120); e.handle(Event::Tick); // adopted at 1_120
+        r.clock.set(1_120 + NATIVE_NOTICE_SECS - 1);
+        assert_eq!(e.status().warnings.len(), 1);
+        r.clock.set(1_120 + NATIVE_NOTICE_SECS); e.handle(Event::Tick);
+        assert!(e.status().warnings.is_empty(), "{:?}", e.status().warnings);
+        assert_eq!(e.status().settings.upper, 90);
     }
     #[test] fn native_steady_change_to_100_says_the_limit_is_off() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));
@@ -2162,8 +2208,9 @@ mod tests {
         let st = e.status();
         assert_eq!(st.settings.upper, 100);
         assert_eq!(st.warnings, vec!["Charge Limit changed in System Settings: now 100% (no limit). Run `eighty limit 85` to go back.".to_string()]);
-        // A failed SetLimits keeps the notice.
+        // A failed SetLimits keeps the notice, and so does time: the Mac isn't limiting.
         assert!(matches!(e.request(0, Request::SetLimits { upper: 70, lower: None }), Response::Error(_)));
+        r.clock.set(1_120 + 10 * NATIVE_NOTICE_SECS); e.handle(Event::Tick);
         assert_eq!(e.status().warnings.len(), 1);
     }
     #[test] fn startup_never_adopts() {
