@@ -13,7 +13,7 @@
 **Scope split (builder's call).** The spec covers four subsystems, so the work is split into separate plans that each produce working software:
 - **Plan 2 (this):** helper + CLI, installed with `sudo eighty install` as a plain LaunchDaemon. That's enough to run on the owner's two Macs.
 - **Plan 3:** Eighty.app menu bar, `SMAppService` registration replacing `eighty install`, notifications, first-run flow, and detecting macOS's native Charge Limit / Optimized Charging.
-- **Plan 4:** calibration (+ smart resume), overheat protection (incl. a temperature source on macOS 27), zones, sleep dark-wakes, full clamshell support, and the PowerUI/MCL backend.
+- **Plan 4:** calibration (+ smart resume), overheat protection, zones, sleep dark-wakes, full clamshell support, and the PowerUI/MCL backend. *Update (2026-11-20):* the PowerUI/MCL backend shipped early as native mode (Plan 2b), and the macOS 27 temperature source is done (`AppleSmartBatteryPack`, `0b0b2c1`). Plan 4 also shows the battery temperature in `eighty status` and `eighty doctor` (spec §2), uses it for overheat protection (including how to pause charging in native mode), and decides on the SMC `TB0T`–`TB2T` keys as a backup source (spec §5.3).
 - **Plan 5:** signing, notarization, GitHub Actions, the Homebrew cask, and the 2–5 Mac release bar.
 
 ## Global Constraints
