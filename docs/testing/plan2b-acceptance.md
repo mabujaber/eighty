@@ -5,7 +5,7 @@ Task 7 of [Plan 2b](../superpowers/plans/2026-11-19-eighty-02b-native-mode.md). 
 | Mac | macOS | Mode | Status |
 |---|---|---|---|
 | M5 Pro (Mac17,8) | 26.6.2 (25G83) | hold (`CHTE` + `CHIE`), regression only | **Passed**, 2026-11-19 |
-| M2 Max (Mac14,6) | 27.2 (26B123) | native (macOS Charge Limit) | In progress, 2026-11-19 (overnight and uninstall left) |
+| M2 Max (Mac14,6) | 27.2 (26B123) | native (macOS Charge Limit) | **Passed**, 2026-11-19/20 |
 | M5 Pro (Mac17,8) | 27.2.1 (26B131) | native (macOS Charge Limit) | In progress, 2026-11-19 |
 
 ## M5 Pro, hold mode regression
@@ -95,16 +95,11 @@ Build: `feat/helper` at `98668dd` (includes the `AppleSmartBatteryPack` temperat
 | 1 | Reboot (owner restart) | Pass, with a small margin | 19:07:55 `shutting down; restoring charging`. Kernel boot 19:08:16, loginwindow 19:08:31. The helper started at 19:08:32 and in the same second logged `native: set macOS's Charge Limit to 80%`, before Finder and Dock (19:08:35). No `NativeUnavailable`. After boot: doctor `Native 80%`, `Health ok`, status `78% · charging`, `Charging to 80%`, then 19:10:46 `Holding` |
 | 5 | Does macOS keep the limit across a reboot without the helper? | Yes, macOS keeps it | `sudo launchctl disable system/io.github.mabujaber.eighty.helper` (the running helper keeps running until the restart). 19:11:53 `shutting down`. Kernel boot 19:12:11. No helper process and no new log lines after boot. System Settings showed 80% (owner). ioreg: 80%, `InstantAmperage` 0, `IsCharging = No`, `pmset` `AC attached; not charging` |
 | 5 | Re-enable the helper and reboot | Pass | `sudo launchctl enable …`, reboot. Kernel boot 19:14:44, loginwindow 19:15:03, helper 19:15:04 with `native: set macOS's Charge Limit to 80%` and `Holding`, Finder 19:15:07. Doctor `Native 80%`, `Health ok`. Right after boot ioreg showed +1760 mA, `IsCharging = Yes` at 80% while status said `Holding at 80%`. By 19:16:56 it read 0 mA, `IsCharging = No`, and it never went past 80%: a short top-up by macOS after boot (also seen with the helper disabled) |
+| 5 | Plugged in overnight, lid closed | Pass | 19:23:00 `OnBattery`, 19:23:04 `Holding` (a 4 s unplug before the lid closed). Then only sleep/wake lines: short dark wakes 19:24–20:30, asleep 20:30:41 → 06:50:30 (about 10 h 20 min). No `Charging`, no Conflict, no native lines. Morning: `80% · not charging · on AC`, `Holding at 80%`, `InstantAmperage` 0, `IsCharging = No`, doctor `Native 80%`, `Health ok`, probe `CHIE=00`, `ACLC=03`, `24.9 °C`. In cycle mode this Mac reached 100% overnight (finding G) |
+| — | macOS charges past the limit (calibration) | Didn't happen | Not seen during the run or overnight |
+| 6 | `sudo eighty uninstall` | Pass | 06:51:28 `shutting down; restoring charging`, `eighty-helper stopped`. Printed `restore: native limit back to 100%` and `charging restored; eighty uninstalled`. System Settings 100% (owner). Helper, plist, process and socket gone; config and log kept. Probe: `CHTE` missing, `CHIE=00`, `ACLC=04`. 06:52:18 charging at +4288 mA from 81% |
 
 Notes:
 
 - The `Charge Limit changed in System Settings: now 80%.` warning from 17:17 was still shown at 17:49 and cleared only at the reboot. Check whether it should time out or clear after the next `eighty limit`.
 - Right after boot, status can say `Holding at 80%` for about a minute while macOS tops up at about 1.7 A. It stays within the limit, so it is not the §5.6 item 5 case.
-
-### Still to do on the M2 Max
-
-| Step | Check | Expected |
-|---|---|---|
-| 5 | Plugged in overnight, lid closed | About 80% in the morning (§5.6 item 3). Record the % and the log lines from the night |
-| — | If macOS charges past the limit (calibration) | Status shows the warning and doesn't claim Holding (§5.6 item 5). Record it only if it happens |
-| 6 | `sudo eighty uninstall` (last) | Prints `restore: native limit back to 100%`. System Settings shows 100%. Probe: `CHIE=00` |

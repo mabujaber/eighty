@@ -4,7 +4,7 @@ Keep your Apple Silicon Mac's battery at 80%, for free.
 
 eighty is a charge limiter written in Rust. A small root helper stops charging at your limit, can run the Mac from battery while it is plugged in to bring the charge down, and turns the MagSafe light green when the limit is reached. It always hands charging back to macOS when it stops or is uninstalled.
 
-> **Status: pre-release.** Hold mode passes hardware acceptance on an M5 Pro running macOS 26.6.2 ([results](docs/testing/plan2-acceptance.md)). Native mode on the M2 Max running macOS 27.2 is awaiting hardware acceptance: the earlier M2 Max run tested cycle mode, which has since been removed. The menu-bar app, signed builds and Homebrew come later. For now you build from source.
+> **Status: pre-release.** Hold mode passes hardware acceptance on an M5 Pro running macOS 26.6.2 ([results](docs/testing/plan2-acceptance.md)). Native mode passes hardware acceptance on an M2 Max running macOS 27.2 ([results](docs/testing/plan2b-acceptance.md)). The menu-bar app, signed builds and Homebrew come later. For now you build from source.
 
 ## Install
 
