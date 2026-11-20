@@ -53,6 +53,7 @@ Updating this M5 from 26.6.2 to 27.2.1 removed `CHTE`, so it can no longer use h
 | — | Sleep during the discharge override | Pass | 11:01:00 `sleep: macOS is going to sleep`, `outputs … discharge=false` (CHIE `00` while asleep). 11:04:22 woke (HID), `outputs … discharge=true`. The override survived (status still `Override discharge to 94%`, at 95%). It slept again 11:05:31–11:07:55, and the same thing happened |
 | 4 | Discharge reaches 94% | Pass | 11:08:06 `override DischargeTo(94) finished`, `outputs … discharge=false`, `activity Discharging { to: 80 }`. Probe `CHIE=00`. ioreg `InstantAmperage` −621 mA with `ExternalConnected = Yes`, so macOS took over and carries on to its 80% Charge Limit. Status: `94%`, `Discharging to 80%`, no Override line |
 | 3 | On AC at 80% for 10+ minutes | Pass | 12:34 at 81%, −1369 mA, `CHIE=00` (macOS discharging). 12:37:39 `activity Holding`. 12:38 at 80%, −528 mA (last step / stale reading). From 12:39: 0 mA, `IsCharging = No`, `ExternalConnected = Yes`. Still `Holding at 80%` and `not charging · on AC` at 12:56 (about 19 min). Light green (owner) |
+| 5 | Plugged in overnight, lid closed (no external displays) | Pass | 19:50 UTC: 80%, AC, `Holding at 80%`, `CHIE=00`. The helper logged `sleep` at 19:54:08 and `wake` at 06:50:17 (about 11 h), nothing in between: no activity change, no fault. macOS's power log for the night: 17 DarkWakes, every reading `Using AC (Charge:80%)` (44 of 44). Morning: 80%, `not charging · on AC`, `Holding at 80%`, doctor `Native 80%`, `Health ok`, `CHIE=00`, `ACLC=03` |
 
 ### Still to do on the M5 Pro
 
@@ -60,7 +61,6 @@ The helper installed for these tests is the `01c5439` build. Keep it until the l
 
 | Step | Check | Expected |
 |---|---|---|
-| 5 | Plugged in overnight, lid closed | About 80% in the morning (§5.6 item 3). Record the % and the log lines from the night |
 | — | If macOS charges past the limit (calibration) | Status shows the warning and doesn't claim Holding (§5.6 item 5). Record it only if it happens |
 | 6 | `sudo eighty uninstall` (last) | Prints `restore: native limit back to 100%`. System Settings shows 100%. Probe: `CHIE=00`. Helper, plist, process and socket gone |
 | — | After uninstall: `cargo build --release`, then `cargo test -p eighty-hw battery -- --ignored` | `reads_real_temperature` passes. The probe prints a temperature, not `temp n/a` |
