@@ -127,3 +127,13 @@ Notes:
 
 - The `Charge Limit changed in System Settings: now 80%.` warning from 17:17 was still shown at 17:49 and cleared only at the reboot. **Fixed 2026-11-20:** it now clears 10 minutes after the change (or at the next `eighty limit`). A change to 100% ("no limit") still stays until the next `eighty limit`.
 - Right after boot, status can say `Holding at 80%` for about a minute while macOS tops up at about 1.7 A. It stays within the limit, so it is not the §5.6 item 5 case.
+
+### Follow-up fixes on the M2 Max (2026-11-20)
+
+Build `4d0ab06`, installed at 07:01:48 over the kept config. Times are UTC.
+
+| Check | Result | Evidence |
+|---|---|---|
+| `eighty discharge 70` on battery | Pass | Refused: "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already". No override and no log line. (Run on AC first by mistake: accepted, as it should be, 07:02:18 and 07:05:08) |
+| `eighty charge full` | Pass | 07:05:38 `native: set macOS's Charge Limit to 100%`. Status `Limit 85% (lifted to 100% until unplugged)`. Unplug at 07:06:51: `override FullCharge finished`, `set … to 85%` |
+| The warning after a change in System Settings times out | Pass | Set 85%: 07:03:48 `macOS reports 85%…`, 07:04:48 `native limit changed outside eighty: now 85%`. Warning shown until at least 07:07:13. At 07:15:04 it was gone, with `Limit 85% (held by macOS)` and config `upper = 85` |
