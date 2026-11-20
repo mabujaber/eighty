@@ -23,6 +23,9 @@ const NATIVE_UNCONFIRMED_STRIKES: u32 = 2;
 const NATIVE_ADOPT_AFTER_SECS: u64 = TICK_SECS - SETTLE_SECS;
 /// Candidates replaced in a row (the read keeps changing) before eighty sets its limit again.
 const NATIVE_CANDIDATE_REPLACEMENTS: u32 = 3;
+/// Logged when startup (or fault recovery) finds `CHIE` left discharging and clears it.
+const STALE_DISCHARGE_CLEARED: &str =
+    "startup: CHIE was left discharging (after a crash or a fault); cleared it";
 /// How long `status` shows that a limit changed in System Settings was adopted. A change
 /// to 100% ("no limit") stays until the next `eighty limit`, since the Mac isn't limiting.
 const NATIVE_NOTICE_SECS: u64 = 10 * 60;
@@ -207,6 +210,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             let was_discharging = chie_discharging(&mut self.smc);
             self.restore();
             if was_discharging && !chie_discharging(&mut self.smc) {
+                log(STALE_DISCHARGE_CLEARED);
                 // This clears a CHIE=08 left behind, so macOS may still report the
                 // adapter missing for a moment: open the same window as after our own
                 // discharge stops. CHIE=08 is only set while plugged in (or by a
@@ -481,12 +485,15 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 }
                 self.tick();
             }
-            Request::SetAutoDischarge { on } => {
-                if self.detection.mode == ControlMode::Native {
+            // macOS always brings the charge down to its own limit: `on` is already true.
+            Request::SetAutoDischarge { on } if self.detection.mode == ControlMode::Native => {
+                if !on {
                     return Response::Error(
                         "macOS brings the charge down to the limit on this Mac; it can't be turned off".into(),
                     );
                 }
+            }
+            Request::SetAutoDischarge { on } => {
                 let s = Settings { auto_discharge: on, ..self.config.settings };
                 let settings = match s.with_limits(s.upper, Some(s.lower)) {
                     Ok(s) => s,
@@ -1230,8 +1237,18 @@ mod tests {
     }
     #[test] fn startup_recovers_stale_discharge() {
         let r = Rig::hold(); r.smc.insert("CHIE", "ui8 ", &[8], WriteMode::Accept); r.set(60, false, true, -400, Some(900));
+        crate::log::take_captured();
         let _e = r.engine();
         assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        // Said in the log, so a crash that left the Mac discharging is visible afterwards.
+        let logged = crate::log::take_captured();
+        assert!(logged.iter().any(|l| l == STALE_DISCHARGE_CLEARED), "{logged:?}");
+    }
+    #[test] fn startup_without_a_stale_discharge_says_nothing_about_it() {
+        let r = Rig::hold(); r.set(60, false, true, -400, Some(900));
+        crate::log::take_captured();
+        let _e = r.engine();
+        assert!(!crate::log::take_captured().iter().any(|l| l == STALE_DISCHARGE_CLEARED));
     }
     #[test] fn startup_restores_before_deciding() {
         // Unplugged below the limit: the decision leaves the light alone (light: None),
@@ -2000,6 +2017,16 @@ mod tests {
         assert!(matches!(e.request(0, Request::SetLimits { upper: 85, lower: None }), Response::Status(_)));
         assert_eq!(r.native.limit_now(), 85);
         assert!(matches!(e.request(0, Request::SetAutoDischarge { on: false }), Response::Error(_)));
+    }
+    #[test] fn native_auto_discharge_on_is_already_true() {
+        // macOS always brings the charge down to its limit: `on` is a no-op, `off` is refused.
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900));
+        let mut e = r.engine();
+        let before = r.store.load().0;
+        assert!(matches!(e.request(0, Request::SetAutoDischarge { on: true }), Response::Status(_)));
+        assert_eq!(r.store.load().0, before);
+        assert!(matches!(e.request(0, Request::SetAutoDischarge { on: false }),
+            Response::Error(m) if m == "macOS brings the charge down to the limit on this Mac; it can't be turned off"));
     }
     #[test] fn native_doctor_reports_the_native_limit() {
         let r = Rig::native(); r.set(80, false, true, 0, Some(900));

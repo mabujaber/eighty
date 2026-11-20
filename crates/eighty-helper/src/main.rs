@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use clap::Parser;
 use eighty_core::paths::{CONFIG_DIR, SOCKET_PATH};
-use eighty_helper::control::{restore_all, restore_native, NativeRestore};
+use eighty_helper::control::{restore_all, restore_native};
 use eighty_helper::engine::{Deps, Engine, Event};
 use eighty_helper::log::log;
 use eighty_helper::ipc;
@@ -58,8 +58,7 @@ fn restore_everything(print: impl Fn(&str)) -> anyhow::Result<usize> {
     let mut failed = restore(&print)?;
     let store = Store::new(PathBuf::from(CONFIG_DIR));
     match restore_native(&mut PowerUi::new(), &store) {
-        Ok(NativeRestore::Restored(n)) => print(&format!("restore: native limit back to {n}%")),
-        Ok(NativeRestore::LeftAsIs) => print("restore: native limit left as is"),
+        Ok(r) => print(&r.message()),
         // Includes an unreadable config: the original couldn't be put back.
         Err(e) => {
             print(&e.message());

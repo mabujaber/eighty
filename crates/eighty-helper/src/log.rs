@@ -3,8 +3,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Write `<UTC timestamp> <msg>` to stderr.
 pub fn log(msg: &str) {
+    #[cfg(test)]
+    CAPTURED.with(|c| c.borrow_mut().push(msg.to_string()));
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     eprintln!("{} {msg}", utc(now));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every line logged on this thread (tests run one per thread).
+    static CAPTURED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lines logged on this thread since the last call, without timestamps.
+#[cfg(test)]
+pub fn take_captured() -> Vec<String> {
+    CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Format Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.

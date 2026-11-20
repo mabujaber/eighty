@@ -86,12 +86,12 @@ Follow-ups found on 2026-11-19, all fixed in `4d0ab06`:
 - Status during `charge full` still says `Limit 80% (held by macOS)` while macOS's limit is 100%. **Fixed:** it now says `Limit 80% (lifted to 100% until unplugged)`.
 - `eighty discharge 94` run on battery left no override and no log line. **Fixed:** it is refused with "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already", like `charge full`.
 
-Still open, from the extra checks above (2026-11-20):
+Found in the extra checks above (2026-11-20), all fixed in the next commit:
 
-1. **`native_original` survives uninstall.** Uninstall restores it but leaves it in the kept config. If the user changes the Charge Limit while eighty is uninstalled and then reinstalls, eighty keeps the old value and the next uninstall overwrites the user's newer choice. Fix: clear `native_original` after a successful restore.
-2. **Startup doesn't log a cleared CHIE.** After a crash with `CHIE=08`, the restart clears it silently. A line like `startup: CHIE was 08; cleared` would make crashes visible in the log.
-3. **`auto-discharge on`** in native mode is refused with "can't be turned off". Accept it as a no-op, or word the message for both.
-4. **CHIE no longer hides the adapter on macOS 27.2.1** (M5). The "effective external" latch is only needed on macOS 26. Keep it, and note it in the spec.
+1. **`native_original` survives uninstall.** Uninstall restores it but leaves it in the kept config. If the user changes the Charge Limit while eighty is uninstalled and then reinstalls, eighty keeps the old value and the next uninstall overwrites the user's newer choice. **Fixed:** `--restore` removes `native_original` from the config once the limit is back. If that save fails, the limit still counts as restored and the message says the record couldn't be cleared.
+2. **Startup doesn't log a cleared CHIE.** After a crash with `CHIE=08`, the restart clears it silently. A line like `startup: CHIE was 08; cleared` would make crashes visible in the log. **Fixed:** startup logs `startup: CHIE was left discharging (after a crash or a fault); cleared it`.
+3. **`auto-discharge on`** in native mode is refused with "can't be turned off". **Fixed:** `on` is accepted and changes nothing; `off` is still refused.
+4. **CHIE no longer hides the adapter on macOS 27.2.1** (M5). The "effective external" latch is only needed on macOS 26. Keep it. **Done:** noted in the spec (§5.6).
 
 Note: the `discharge 79` on battery row above was run on `e1866ee`, before `4d0ab06`. Since `4d0ab06`, `discharge` on battery is refused with "plug in first".
 

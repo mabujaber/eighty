@@ -1,6 +1,7 @@
 //! SMC control: key detection, applying desired outputs, conflict check, restore.
 use std::collections::HashMap;
 
+use eighty_core::config::Config;
 use eighty_core::policy::{ControlMode, Light, Outputs};
 use eighty_core::proto::{Health, KeyState};
 use eighty_hw::native::NativeLimit;
@@ -259,10 +260,26 @@ fn restore_keys(smc: &mut dyn SmcIo, keys: &[(&str, u32)]) -> Vec<(String, SmcEr
 /// What `restore_native` did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeRestore {
-    /// Set the native limit back to the recorded original.
+    /// Set the native limit back to the recorded original, and forgot the record.
     Restored(u8),
+    /// Set it back, but the record couldn't be removed from the config (why). The
+    /// limit is restored either way, so this isn't a failure.
+    RestoredKept(u8, String),
     /// No original recorded, or no Charge Limit on this Mac: nothing to put back.
     LeftAsIs,
+}
+
+impl NativeRestore {
+    /// The line `--restore` prints.
+    pub fn message(&self) -> String {
+        match self {
+            NativeRestore::Restored(n) => format!("restore: native limit back to {n}%"),
+            NativeRestore::RestoredKept(n, e) => {
+                format!("restore: native limit back to {n}% (couldn't clear it from the config: {e})")
+            }
+            NativeRestore::LeftAsIs => "restore: native limit left as is".into(),
+        }
+    }
 }
 
 /// Why `restore_native` couldn't put the user's limit back. Either way `--restore`
@@ -290,6 +307,10 @@ impl NativeRestoreError {
 
 /// Put the user's own native Charge Limit back (the one recorded when eighty
 /// first took control). Does nothing without a record or without Charge Limit.
+///
+/// Once it is back, the record is removed from the config, which outlives an
+/// uninstall: a later install records the limit the user has then, instead of
+/// reusing this one.
 pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<NativeRestore, NativeRestoreError> {
     let (config, warning) = store.load();
     if let Some(w) = warning {
@@ -302,14 +323,17 @@ pub fn restore_native(native: &mut dyn NativeLimit, store: &Store) -> Result<Nat
     native
         .set_limit(original)
         .map_err(|e| NativeRestoreError::SetFailed(format!("setting the native limit back to {original}%: {e}")))?;
-    Ok(NativeRestore::Restored(original))
+    match store.save(&Config { native_original: None, ..config }) {
+        Ok(()) => Ok(NativeRestore::Restored(original)),
+        Err(e) => Ok(NativeRestore::RestoredKept(original, e.to_string())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use eighty_hw::native::FakeNative;
-    use eighty_core::config::Config;
+    use eighty_core::config::Settings;
     use eighty_hw::smc::fake::{FakeSmc, WriteMode};
 
     fn no_native() -> FakeNative { FakeNative::unsupported() }
@@ -427,6 +451,37 @@ mod tests {
         let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
         assert_eq!(restore_native(&mut n, &store), Ok(NativeRestore::Restored(95)));
         assert_eq!(n.limit_now(), 95);
+    }
+    #[test] fn restore_native_forgets_the_original_once_restored() {
+        // The config outlives an uninstall. If the record stayed, a later install would
+        // reuse it and the next uninstall would overwrite a limit the user chose since.
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        let settings = Settings { upper: 85, lower: 85, auto_discharge: true };
+        store.save(&Config { settings, native_original: Some(95), ..Config::default() }).unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        assert_eq!(restore_native(&mut n, &store), Ok(NativeRestore::Restored(95)));
+        let (c, warning) = store.load();
+        assert_eq!((warning, c.native_original, c.settings), (None, None, settings));
+        // A second restore has nothing left to put back.
+        assert_eq!(restore_native(&mut n, &store), Ok(NativeRestore::LeftAsIs));
+        assert_eq!(n.writes(), vec![95]);
+    }
+    #[test] fn restore_native_keeps_the_original_when_the_set_fails() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        store.save(&Config { native_original: Some(95), ..Config::default() }).unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80); n.fail_calls(true);
+        assert!(restore_native(&mut n, &store).is_err());
+        assert_eq!(store.load().0.native_original, Some(95));
+    }
+    #[test] fn restore_native_reports_a_record_it_could_not_clear() {
+        let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
+        store.save(&Config { native_original: Some(95), ..Config::default() }).unwrap();
+        // A directory in the temp file's place makes the save fail.
+        std::fs::create_dir(dir.path().join("config.toml.tmp")).unwrap();
+        let mut n = FakeNative::new(&[80, 85, 90, 95, 100], 80);
+        let Ok(r @ NativeRestore::RestoredKept(95, _)) = restore_native(&mut n, &store) else { panic!() };
+        assert_eq!(n.limit_now(), 95);
+        assert!(r.message().starts_with("restore: native limit back to 95% (couldn't clear it from the config: "), "{}", r.message());
     }
     #[test] fn restore_native_without_a_record_leaves_the_limit() {
         let dir = tempfile::tempdir().unwrap(); let store = Store::new(dir.path().into());
