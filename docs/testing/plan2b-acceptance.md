@@ -77,6 +77,7 @@ Checks that neither Mac had run in native mode. Build: `feat/helper` at `e1866ee
 | `sudo eighty uninstall` after all of the above | Pass | `restore: native limit back to 100%`, `charging restored; eighty uninstalled`. Helper, plist, process and socket gone. `CHIE=00`, charging at +3.6 A |
 | Probe `--write-test`, light watched | Pass | `ACLC WriteAccepted`, no `RestoreFailed` (the light was already orange from charging, so the restore matched). The owner saw green for 15 s, then orange. `CHIE` gave `CannotVerify("battery is already discharging")`: the first battery reading was still from before the uninstall (CHIE was verified on 2026-11-19). The probe printed `28.1 °C` |
 | macOS charges past the limit (calibration) | Didn't happen | Not seen on either Mac |
+| Uninstall forgets the original (`921fdae`, release build) | Pass | Starting from a stale `native_original = 100` left by the old uninstall: install, then uninstall printed `restore: native limit back to 100%` and the config no longer had `native_original`. The owner set the Charge Limit to 90% in System Settings. Install at 07:16:40 logged `native: macOS's Charge Limit was 90% before eighty`, config `native_original = 90`. Uninstall printed `restore: native limit back to 90%`, System Settings 90% (owner), config without `native_original` |
 
 ### Findings and follow-ups (code)
 
