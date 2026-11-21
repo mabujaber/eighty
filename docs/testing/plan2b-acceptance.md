@@ -130,12 +130,18 @@ Notes:
 - The `Charge Limit changed in System Settings: now 80%.` warning from 17:17 was still shown at 17:49 and cleared only at the reboot. **Fixed 2026-11-20:** it now clears 10 minutes after the change (or at the next `eighty limit`). A change to 100% ("no limit") still stays until the next `eighty limit`.
 - Right after boot, status can say `Holding at 80%` for about a minute while macOS tops up at about 1.7 A. It stays within the limit, so it is not the §5.6 item 5 case.
 
-### Follow-up fixes on the M2 Max (2026-11-20)
+### Follow-up fixes on the M2 Max (2026-11-20/21)
 
-Build `4d0ab06`, installed at 07:01:48 over the kept config. Times are UTC.
+Build `4d0ab06`, installed at 07:01:48 over the kept config; from the reinstall row on, `d5206f2`. Times are UTC.
 
 | Check | Result | Evidence |
 |---|---|---|
 | `eighty discharge 70` on battery | Pass | Refused: "plug in first: `discharge` runs the Mac from its battery while it's on the charger; on battery it's discharging already". No override and no log line. (Run on AC first by mistake: accepted, as it should be, 07:02:18 and 07:05:08) |
 | `eighty charge full` | Pass | 07:05:38 `native: set macOS's Charge Limit to 100%`. Status `Limit 85% (lifted to 100% until unplugged)`. Unplug at 07:06:51: `override FullCharge finished`, `set … to 85%` |
 | The warning after a change in System Settings times out | Pass | Set 85%: 07:03:48 `macOS reports 85%…`, 07:04:48 `native limit changed outside eighty: now 85%`. Warning shown until at least 07:07:13. At 07:15:04 it was gone, with `Limit 85% (held by macOS)` and config `upper = 85` |
+| Reinstall with `d5206f2` (includes `921fdae`) | Pass | 2026-11-20 07:17:29 the old helper stopped (`restoring charging`), 07:17:30 the new one started and set the Charge Limit to 85% (the kept config). The installed helper matched the release build byte for byte. Doctor `Native 85%`, `Health ok` |
+| Probe `--write-test`, light watched | Pass | 2026-11-20, helper installed and macOS discharging to its limit. `ACLC WriteAccepted`, no `RestoreFailed`, light green then orange (owner), `ACLC=03` again afterwards, helper `Health ok`. `CHIE` gave `CannotVerify("battery is already discharging")` (macOS was discharging to the limit). This Mac never showed the `RestoreFailed` case, so it only shows nothing broke |
+| `discharge 87` on AC, at 88% | Pass | 2026-11-20 07:32:34 `discharge=true`, probe `CHIE=08`, `Override discharge to 87%`. 07:35:54 `override DischargeTo(87) finished`, `CHIE=00`, −494 mA with `ExternalConnected = Yes` (macOS carries on to 80%) |
+| `discharge 85` right after unplugging | Accepted (known gap) | 07:42:26 accepted with status `on AC`: the helper hadn't logged `OnBattery` yet, so it still trusted its last on-AC reading, and with `CHIE=08` this Mac reports the adapter as disconnected either way (bug A), so the unplug stays hidden until the discharge stops. After `charge auto` at 07:44:20 (`CHIE=00`), 07:44:26 `OnBattery`, and `discharge 85` at 07:44:30 was refused (exit 1, `CHIE=00`). Harmless: such a discharge drains the battery as being unplugged does, down to the target or the 10% floor |
+| Retest, on AC: `discharge 78` at 80% | Pass | 2026-11-21 19:51:29 accepted, `discharge=true`, `CHIE=08`. Sleep 19:55:43 → `discharge=false`; wake 20:00:40 → `discharge=true` in the same second, override kept. 20:17:20 `override DischargeTo(78) finished`, `CHIE=00`, `Charging { to: 80 }` (it showed 80% while the raw charge was already 77.8%, so it ran until macOS's shown percentage caught up) |
+| Retest, on battery: `discharge 70` after `OnBattery` | Pass | 20:17:53 `activity OnBattery`. The command was refused: "plug in first: …". No log line, status `On battery`, no Override, `CHIE=00` |
