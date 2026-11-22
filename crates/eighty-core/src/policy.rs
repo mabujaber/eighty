@@ -127,6 +127,10 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
             let (inhibit, discharge, light, activity) = discharge_step(s, i, n);
             return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override, native_limit: nl(s.upper) };
         }
+        Override::Calibrate(CalStep::Discharge) if !i.external => {
+            // On battery there is nothing to discharge towards; write nothing.
+            return Decision { outputs: Outputs::default(), activity: Activity::OnBattery, clear_override, native_limit: nl(i.native_lowest) };
+        }
         Override::Calibrate(step @ CalStep::Discharge) => {
             let (inhibit, discharge, light, activity) = discharge_step(s, i, CAL_LOW);
             let activity = match activity {
@@ -320,6 +324,14 @@ mod tests {
         let d = decide(&s(), ov, &i(60, false, true, Hold), &prev(false, true));
         assert_eq!(d.activity, OnBattery);
         assert!(!d.clear_override);
+    }
+    #[test]
+    fn calibrate_discharge_on_battery_writes_nothing() {
+        for mode in [Hold, Native] {
+            let d = decide(&s(), Override::Calibrate(CalStep::Discharge), &i(60, false, false, mode), &prev(true, true));
+            assert_eq!((d.outputs.discharge, d.outputs.inhibit, d.activity, d.clear_override), (false, false, OnBattery, false), "{mode:?}");
+            assert_eq!(d.native_limit, if mode == Native { Some(80) } else { None });
+        }
     }
     #[test]
     fn calibrate_never_discharges_at_floor() {
