@@ -1,6 +1,7 @@
 //! eighty: command-line client for the eighty charge-limit helper.
 use clap::{Parser, Subcommand, ValueEnum};
 use eighty_cli::install;
+use eighty_cli::schedule_args::parse_schedule;
 use eighty_cli::client::{call, ClientError};
 use eighty_cli::render::{render_doctor, render_status};
 use eighty_core::paths::{LOG_PATH, SOCKET_PATH};
@@ -29,6 +30,17 @@ enum ChargeMode {
 }
 
 #[derive(Subcommand)]
+enum CalAction {
+    /// Stop a running calibration and return to the limit.
+    Cancel,
+    /// Set or clear the calibration schedule: every <N> days [at HH:MM] | off
+    Schedule {
+        #[arg(trailing_var_arg = true, required = true)]
+        words: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Show battery, limit and helper state.
     Status {
@@ -43,6 +55,11 @@ enum Cmd {
     Charge { mode: ChargeMode },
     /// Discharge to the given percentage.
     Discharge { percent: u8 },
+    /// Run a full calibration cycle now (15% → 100% → 1 h → limit).
+    Calibrate {
+        #[command(subcommand)]
+        action: Option<CalAction>,
+    },
     /// Diagnose SMC support and helper health.
     Doctor {
         #[arg(long)]
@@ -193,6 +210,15 @@ fn main() -> ExitCode {
         Cmd::Charge { mode: ChargeMode::Full } => expect_status(Request::ChargeFull),
         Cmd::Charge { mode: ChargeMode::Auto } => expect_status(Request::ChargeAuto),
         Cmd::Discharge { percent } => expect_status(Request::DischargeTo { percent }),
+        Cmd::Calibrate { action: None } => expect_status(Request::Calibrate),
+        Cmd::Calibrate { action: Some(CalAction::Cancel) } => expect_status(Request::CalibrateCancel),
+        Cmd::Calibrate { action: Some(CalAction::Schedule { words }) } => match parse_schedule(&words) {
+            Ok(req) => expect_status(req),
+            Err(m) => {
+                eprintln!("{m}");
+                ExitCode::from(2)
+            }
+        },
         Cmd::Doctor { json, retry, accept_other_limiters } => doctor(json, retry, accept_other_limiters),
         Cmd::Logs { lines } => logs(lines),
         Cmd::Install => finish(install::install()),
