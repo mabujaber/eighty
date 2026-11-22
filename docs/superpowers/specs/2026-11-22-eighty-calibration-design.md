@@ -15,13 +15,14 @@ A calibration runs the battery through one full cycle: down to a low charge, up 
 
 1. **This plan: calibration + smart resume.**
 2. Overheat protection, plus battery temperature in `status`/`doctor`.
-3. Homebrew release (old Plan 5: signing, notarization, CI, tap).
-4. Menu-bar app (old Plan 3: Eighty.app, `SMAppService`, notifications).
+3. Clamshell levels (BattOpt Pro parity): discharge and calibrate with the lid closed by keeping the Mac awake (level 1), optionally with the external display on (level 2).
+4. Homebrew release (old Plan 5: signing, notarization, CI, tap).
+5. Menu-bar app (old Plan 3: Eighty.app, `SMAppService`, notifications).
 
 Dropped from scope:
 - **Zones** (Wi-Fi profiles). Dropped by the owner.
 - **Sleep dark wakes.** Native mode uses macOS's own Charge Limit, which macOS enforces while asleep. The overnight runs on both Macs held 80% through maintenance wakes. Charging *up to* the limit while asleep wasn't tested separately; the owner accepted it as covered by macOS (`docs/testing/plan2b-acceptance.md`, last section).
-- **Clamshell work.** Done. The only open check is native mode with external displays, which needs no code.
+- **Clamshell sleep checks.** Done for holding the limit. The only open check is native mode with external displays, which needs no code. BattOpt's lid-closed discharge/calibration is item 3 above.
 
 The parent spec gets a short note recording these changes (§2 and the Plan 2 scope note).
 
