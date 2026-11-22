@@ -517,8 +517,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
 
     /// Native mode in a fault, unless PowerUI itself is failing (`NativeUnavailable`): if
     /// eighty last set a Charge Limit other than the user's (a calibration's 100%, even
-    /// one cancelled or abandoned since), set the user's back, so a fault never leaves the
-    /// Mac uncapped. Tried every faulted tick until it succeeds; logged once per attempt.
+    /// one cancelled or abandoned since), or doesn't know what it is (`None`, e.g. a fault on
+    /// the first tick after a restart mid-calibration), set the user's, so a fault never
+    /// leaves the Mac uncapped. Tried every faulted tick until it succeeds; logged once per attempt.
     fn fault_restore_native(&mut self) {
         let upper = self.settings().upper;
         // Never before the original Charge Limit is on record (native mode's startup step).
@@ -526,7 +527,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             && !matches!(self.health, Health::NativeUnavailable(_))
             && self.config.native_original.is_some()
             && self.override_ != Override::FullCharge
-            && self.native_written.is_some_and(|x| x != upper);
+            && self.native_written.is_none_or(|x| x != upper);
         if !wanted {
             self.native_fault_restore = None;
             return;
@@ -864,14 +865,17 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     Some(n) => CalibrationConfig {
                         every_days: Some(n),
                         at,
-                        // The first run is N days after the schedule is turned on; changing
-                        // N or the time later doesn't move that start.
-                        set_at: match (self.config.calibration.every_days, self.config.calibration.set_at) {
-                            (Some(_), Some(t)) => Some(t),
-                            _ => Some((self.clock)()),
-                        },
-                        last_scheduled_due: None,
-                        ..self.config.calibration.clone()
+                        // The first run is N days after the schedule is turned on. Changing N
+                        // or the time later moves neither that start nor a due time already
+                        // taken (`next_due` skips past it), so an edit never runs one at once.
+                        ..match (self.config.calibration.every_days, self.config.calibration.set_at) {
+                            (Some(_), Some(_)) => self.config.calibration.clone(),
+                            _ => CalibrationConfig {
+                                set_at: Some((self.clock)()),
+                                last_scheduled_due: None,
+                                ..self.config.calibration.clone()
+                            },
+                        }
                     },
                     None => CalibrationConfig { every_days: None, ..self.config.calibration.clone() },
                 };
@@ -3017,5 +3021,35 @@ mod tests {
         r.clock.set(1_180); e.handle(Event::Tick);
         assert_eq!(r.native.limit_now(), 80);
         assert!(matches!(e.status().health, Health::Conflict { .. }));
+    }
+
+    // Task 7 fix round 2.
+
+    #[test] fn fault_on_first_tick_after_restart_restores_native_limit() {
+        let r = Rig::native_with(FakeNative::new(&[80, 85, 90, 95, 100], 100));
+        let r = Rig { fallible: true, ..r }; r.set(90, true, true, 1000, Some(900));
+        drop(r.engine()); // records macOS's original Charge Limit
+        assert!(r.store.load().0.native_original.is_some());
+        r.native.set_externally(100); // left at 100 by a calibration before the restart
+        save_cal_step(&r, CalStep::Charge);
+        r.fail.set(true);
+        let e = r.engine();
+        assert!(matches!(e.status().health, Health::BatteryUnreadable(_)));
+        assert_eq!(r.native.limit_now(), 80);
+        assert_eq!(cal_step(&e), Some(CalStep::Charge));
+        assert!(r._dir.path().join("calibration.toml").exists());
+    }
+    #[test] fn editing_a_schedule_keeps_a_consumed_due() {
+        let (r, mut e, due) = scheduled_native(true);
+        r.clock.set(due); e.handle(Event::Tick);
+        assert_eq!(e.status().calibration.map(|c| c.scheduled), Some(true));
+        req(&mut e, 501, Request::CalibrateCancel);
+        r.clock.set(due + 60);
+        let Response::Status(s) =
+            req(&mut e, 501, Request::SetCalibrationSchedule { every_days: Some(7), at: Some("09:00".into()) })
+        else { panic!() };
+        assert!(s.schedule.unwrap().next_due.unwrap() > due + 60);
+        r.clock.set(due + 120); e.handle(Event::Tick);
+        assert_eq!(cal_step(&e), None);
     }
 }
