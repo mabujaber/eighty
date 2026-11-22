@@ -45,9 +45,15 @@ Mode      hold (CHTE) · MagSafe light: yes
 | `eighty auto-discharge on\|off` | When the battery is above the limit on AC, run from battery until it is back at the limit (hold mode only; in native mode macOS always does it, so `on` changes nothing and `off` is refused) |
 | `eighty charge full` | Charge to 100% once. It ends when you unplug. `eighty charge auto` ends it now |
 | `eighty discharge <percent>` | Run from battery on AC down to `percent`, then hold. Needs the charger plugged in |
+| `eighty calibrate` | Run a full calibration now (see below) |
+| `eighty calibrate cancel` | Stop a calibration and go back to your limit |
+| `eighty calibrate schedule every <N> days [at HH:MM]` | Run a calibration every N days (7–90) at that time (default 10:00). The first run is N days after you turn it on |
+| `eighty calibrate schedule off` | Turn the schedule off |
 | `eighty doctor [--retry]` | Check SMC support and helper health. `--retry` clears a recorded fault |
 | `eighty logs` | The last lines of the helper log |
 | `sudo eighty uninstall [--purge]` | Stop the helper, restore normal charging and remove it. `--purge` also deletes settings and logs |
+
+A calibration runs the battery through one full cycle: down to 15%, up to 100%, an hour at full, then back to your limit. It helps the battery gauge relearn its capacity. It takes several hours, so keep the Mac on the charger with the lid open. If you unplug, close the lid, sleep or reboot, it pauses and carries on from the step it reached. While it runs, `eighty status` shows the step. A Charge Limit changed in System Settings during a calibration is set back, and a fault puts your limit back on macOS's Charge Limit until it clears. Details: [calibration design](docs/superpowers/specs/2026-11-22-eighty-calibration-design.md).
 
 Changing settings needs an admin (`sudo`) or the user logged in at the console. Anyone can read the status.
 
@@ -83,6 +89,7 @@ In native mode:
 Files:
 
 - Settings: `/Library/Application Support/eighty/config.toml`
+- Running calibration: `/Library/Application Support/eighty/calibration.toml` (only while one runs)
 - Log: `/Library/Logs/eighty/helper.log`
 - Socket: `/var/run/eighty.sock`
 

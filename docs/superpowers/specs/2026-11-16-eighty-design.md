@@ -38,6 +38,8 @@ Repo: https://github.com/mabujaber/eighty
 4. Release publicly through **Homebrew**: a cask for the signed and notarized app, which also installs the CLI.
 5. **Fail loudly.** If eighty can't control charging on a machine (unknown firmware, keys missing, write rejected), it says so in the CLI, the menu bar and a notification. It never lets the battery quietly reach 100% while showing "limited".
 
+> **Note (2026-11-22): scope changes.** Zones are dropped. Sleep dark wakes are dropped for native mode, because macOS enforces its own Charge Limit while asleep ([acceptance note](../../testing/plan2b-acceptance.md)). The plan order is now: calibration with smart resume, overheat protection, clamshell levels, the Homebrew release, then the menu-bar app. See the [calibration design](2026-11-22-eighty-calibration-design.md).
+
 ## 3. Non-goals
 
 - Intel Macs and macOS releases older than what current Apple Silicon firmware needs. The minimum is the builder's call, but macOS 14+ is a reasonable floor.
