@@ -60,6 +60,8 @@ pub struct SmcParam {
 extern "C" {
     pub fn IOServiceMatching(name: *const c_char) -> *mut c_void;
     pub fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> IoObject;
+    pub fn IOServiceGetMatchingServices(main_port: u32, matching: *mut c_void, existing: *mut IoObject) -> KernReturn;
+    pub fn IOIteratorNext(iterator: IoObject) -> IoObject;
     pub fn IOServiceOpen(service: IoObject, owning_task: u32, typ: u32, connect: *mut IoObject) -> KernReturn;
     pub fn IOServiceClose(connect: IoObject) -> KernReturn;
     pub fn IOObjectRelease(object: IoObject) -> KernReturn;
@@ -71,6 +73,12 @@ extern "C" {
         output: *mut c_void,
         output_size: *mut usize,
     ) -> KernReturn;
+    pub fn IORegistryEntryCreateCFProperty(
+        entry: IoObject,
+        key: *const c_void,
+        allocator: *const c_void,
+        options: u32,
+    ) -> *const c_void;
     pub fn IORegistryEntryCreateCFProperties(
         entry: IoObject,
         properties: *mut *mut c_void,
