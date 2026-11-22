@@ -144,6 +144,7 @@ pub fn advance(c: &mut Calibration, i: &CalInputs) -> CalOutcome {
                         .last_kick_at
                         .map_or(c.step_started_at, |k| k.max(c.step_started_at));
                     if i.external
+                        && i.percent < 100
                         && !i.charging
                         && i.settled
                         && i.now.saturating_sub(since) >= CAL_KICK_SECS
@@ -270,6 +271,11 @@ mod tests {
         let mut c = in_step(CalStep::Charge, 1000, 40);
         let mut i = at(1301, 40, true);
         i.settled = false;
+        assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
+        // At 100% but not yet reported full: never kick.
+        let mut c = in_step(CalStep::Charge, 1000, 99);
+        let mut i = at(1301, 100, true);
+        i.fully_charged = Some(false);
         assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
     }
 
