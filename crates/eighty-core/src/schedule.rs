@@ -34,12 +34,16 @@ pub fn parse_at(s: &str) -> Result<NaiveTime, String> {
     NaiveTime::parse_from_str(s, "%H:%M").map_err(|_| format!("time must be HH:MM, e.g. 10:00 (got {s})"))
 }
 
-/// The next scheduled calibration time (Unix s), or None when no schedule is set.
+/// The next scheduled calibration time (Unix s), or None when no schedule is set
+/// (or it is invalid: `every_days = 0` would never get past a consumed due time).
 pub fn next_due(
     c: &CalibrationConfig,
     to_local: impl Fn(u64) -> NaiveDateTime,
     from_local: impl Fn(NaiveDateTime) -> u64,
 ) -> Option<u64> {
+    if c.validate().is_err() {
+        return None;
+    }
     let n = u64::from(c.every_days?);
     let at = match &c.at {
         Some(s) => parse_at(s).ok()?,
@@ -86,6 +90,13 @@ mod tests {
     #[test] fn custom_at_is_used() {
         let c = CalibrationConfig { at: Some("07:30".into()), ..cfg() };
         assert_eq!(next_due(&c, loc, utc), Some(ts(2026, 12, 22, 7, 30)));
+    }
+    #[test] fn invalid_config_has_no_due() {
+        // every_days = 0 would otherwise never get past a consumed due time.
+        let c = CalibrationConfig { every_days: Some(0), last_scheduled_due: Some(ts(2026, 11, 22, 10, 0)), ..cfg() };
+        assert_eq!(next_due(&c, loc, utc), None);
+        let c = CalibrationConfig { at: Some("25:00".into()), ..cfg() };
+        assert_eq!(next_due(&c, loc, utc), None);
     }
     #[test] fn validate_ranges() {
         let v = |n| CalibrationConfig { every_days: Some(n), ..Default::default() }.validate();
