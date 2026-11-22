@@ -10,7 +10,7 @@ use clap::Parser;
 use eighty_hw::battery::{BatterySource, IoRegBattery};
 use eighty_hw::smc::SmcConnection;
 use eighty_probe::catalog::CANDIDATES;
-use eighty_probe::machine::MachineInfo;
+use eighty_hw::machine::MachineInfo;
 use eighty_probe::reads::probe_reads;
 use eighty_probe::report::{render_text, ProbeReport};
 use eighty_probe::writes::{any_restore_failed, run_write_tests, WriteResult, WriteTestConfig};

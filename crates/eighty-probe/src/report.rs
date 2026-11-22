@@ -5,7 +5,7 @@ use eighty_hw::battery::BatterySnapshot;
 use serde::Serialize;
 
 use crate::catalog::Role;
-use crate::machine::MachineInfo;
+use eighty_hw::machine::MachineInfo;
 use crate::reads::{KeyReading, ReadStatus};
 use crate::writes::{Verdict, WriteResult};
 
@@ -88,7 +88,7 @@ pub fn render_text(r: &ProbeReport) -> String {
 mod tests {
     use super::*;
     use crate::catalog::Role;
-    use crate::machine::MachineInfo;
+    use eighty_hw::machine::MachineInfo;
     use crate::reads::{KeyReading, ReadStatus};
     use crate::writes::{Verdict, WriteResult};
 

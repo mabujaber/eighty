@@ -53,7 +53,7 @@ After the run, the Mac was charging again at 2871 mA. A read-only run afterwards
 ### Notes from this run
 
 1. **No key can stop charging on macOS 27.2.** `CHTE` and the legacy keys are gone, and the firmware limit registers are blocked. eighty can still hold a limit with `CHIE` alone: turn it on at the upper limit, so the Mac runs from its battery, and off at the lower limit, so the charger takes over again. The battery cycles gently between the two limits; it doesn't sit still the way it does with `CHTE`. The other option on macOS 27 is Apple's own charge limit (PowerUI / MCL, battery#474), which only supports fixed steps.
-2. **macOS 27 doesn't report `Temperature`** in `AppleSmartBattery`. The probe originally failed to read the battery at all, until temperature (and cycle count, as a precaution) became optional (`1e32ead`). eighty's overheat protection needs another temperature source on macOS 27.
+2. **macOS 27 doesn't report `Temperature`** in `AppleSmartBattery`. The probe originally failed to read the battery at all, until temperature (and cycle count, as a precaution) became optional (`1e32ead`). *Update (2026-11-19):* the temperature moved, it wasn't removed. macOS 27 reports it in the `BatteryData` of each `AppleSmartBatteryPack` entry, one level below `AppleSmartBattery`, in the same unit (hundredths of a °C). eighty now reads it there when the top-level value is missing (the hottest pack wins). The SMC keys `TB0T`/`TB1T`/`TB2T` (`flt`, °C, readable without root) also report it on the M5 Pro under 27.2.1, but they aren't used.
 3. **A `battery` leftover was here too.** `brew uninstall` removed its files, but `com.battery.app` was still registered with launchd. It wasn't running (exit `-15`). `launchctl remove com.battery.app` cleared it.
 
 ## Comparison
@@ -64,7 +64,7 @@ After the run, the Mac was charging again at 2871 mA. A read-only run afterwards
 | Run from battery on AC | `CHIE` | `CHIE` |
 | MagSafe light | `ACLC` | `ACLC` |
 | Firmware limit keys (`bf*`) | empty or missing | blocked for root |
-| Battery temperature | reported | **not reported** |
+| Battery temperature | reported | only on `AppleSmartBatteryPack` → `BatteryData` |
 
 **For Plan 2:** `CHIE` works on both Macs, so it's the backbone that works on both. Where `CHTE` exists, use it to hold the battery still at the limit. Where it doesn't, alternate `CHIE` on and off between the upper and lower limits. `eighty doctor` should say which mode is active.
 

@@ -23,6 +23,19 @@ fn boolean(props: &HashMap<String, Prop>, name: &'static str) -> Result<bool, Ba
     }
 }
 
+/// Not a macOS property: the reader stores the hottest `AppleSmartBatteryPack`
+/// temperature under this name (hundredths of a °C, like `Temperature`).
+pub const PACK_TEMPERATURE: &str = "eighty.PackTemperature";
+
+/// The hottest pack temperature (hundredths of a °C), from each pack's `BatteryData`.
+/// macOS 27 reports temperature only there, not on `AppleSmartBattery` itself.
+pub fn pack_temperature(packs: &[HashMap<String, Prop>]) -> Option<i64> {
+    packs
+        .iter()
+        .filter_map(|p| ["Temperature", "VirtualTemperature"].into_iter().find_map(|k| int(p, k).ok()))
+        .max()
+}
+
 pub fn parse_snapshot(props: &HashMap<String, Prop>) -> Result<BatterySnapshot, BatteryError> {
     let cur = int(props, "CurrentCapacity")?;
     let max = int(props, "MaxCapacity")?;
@@ -36,7 +49,7 @@ pub fn parse_snapshot(props: &HashMap<String, Prop>) -> Result<BatterySnapshot, 
         is_charging: boolean(props, "IsCharging")?,
         external_connected: boolean(props, "ExternalConnected")?,
         amperage_ma: int(props, "Amperage")? as i32,
-        temperature_c: ["Temperature", "VirtualTemperature"]
+        temperature_c: ["Temperature", "VirtualTemperature", PACK_TEMPERATURE]
             .into_iter()
             .find_map(|k| int(props, k).ok())
             .map(|t| t as f32 / 100.0),
@@ -108,6 +121,42 @@ mod tests {
         assert_eq!(parse_snapshot(&p).unwrap().temperature_c, None);
         p.insert("VirtualTemperature".into(), Prop::Int(2990));
         assert_eq!(parse_snapshot(&p).unwrap().temperature_c, Some(29.9));
+    }
+
+    #[test]
+    fn pack_temperature_is_the_fallback() {
+        let mut p = base(81, 100, 0);
+        p.remove("Temperature");
+        p.insert(PACK_TEMPERATURE.into(), Prop::Int(2839));
+        assert_eq!(parse_snapshot(&p).unwrap().temperature_c, Some(28.39));
+    }
+
+    #[test]
+    fn top_level_temperature_wins_over_pack() {
+        let mut p = base(81, 100, 0);
+        p.insert(PACK_TEMPERATURE.into(), Prop::Int(2839));
+        assert_eq!(parse_snapshot(&p).unwrap().temperature_c, Some(30.5));
+    }
+
+    #[test]
+    fn pack_temperature_takes_the_hottest_pack() {
+        let packs = [
+            props(&[("Temperature", Prop::Int(2839))]),
+            props(&[("Temperature", Prop::Int(3120))]),
+        ];
+        assert_eq!(pack_temperature(&packs), Some(3120));
+    }
+
+    #[test]
+    fn pack_temperature_falls_back_to_virtual() {
+        let packs = [props(&[("VirtualTemperature", Prop::Int(2990))])];
+        assert_eq!(pack_temperature(&packs), Some(2990));
+    }
+
+    #[test]
+    fn pack_temperature_none_without_readings() {
+        assert_eq!(pack_temperature(&[]), None);
+        assert_eq!(pack_temperature(&[props(&[("CycleCount", Prop::Int(1))])]), None);
     }
 
     #[test]
