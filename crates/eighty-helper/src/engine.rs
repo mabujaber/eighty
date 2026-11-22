@@ -405,6 +405,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .chain(self.restore_failures.iter().cloned())
                 .collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            calibration: None,
+            schedule: None,
         }
     }
 
@@ -546,6 +548,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             Request::ClearFault => {
                 self.clear_native_candidate();
                 self.clear_fault();
+            }
+            Request::Calibrate | Request::CalibrateCancel | Request::SetCalibrationSchedule { .. } => {
+                return Response::Error("not implemented yet".into());
             }
             Request::AcceptOtherLimiters => {
                 if let Err(m) = self.save(Config { accept_other_limiters: true, ..self.config.clone() }) {

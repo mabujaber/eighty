@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
+use eighty_core::calibration::Calibration;
 use eighty_core::config::Config;
 
 pub struct Store {
@@ -41,21 +42,88 @@ impl Store {
     }
 
     pub fn save(&self, c: &Config) -> io::Result<()> {
-        fs::DirBuilder::new().recursive(true).mode(0o755).create(&self.dir)?;
         let text = toml::to_string_pretty(c).map_err(io::Error::other)?;
-        let tmp = self.dir.join("config.toml.tmp");
+        self.write_atomic("config.toml", &text)
+    }
+
+    fn write_atomic(&self, name: &str, text: &str) -> io::Result<()> {
+        fs::DirBuilder::new().recursive(true).mode(0o755).create(&self.dir)?;
+        let tmp = self.dir.join(format!("{name}.tmp"));
         let mut f = fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        fs::rename(&tmp, self.file())
+        fs::rename(&tmp, self.dir.join(name))
+    }
+
+    fn calibration_file(&self) -> PathBuf {
+        self.dir.join("calibration.toml")
+    }
+
+    /// Missing: `(None, None)`. Unreadable or invalid: the file is deleted and a warning returned.
+    pub fn load_calibration(&self) -> (Option<Calibration>, Option<String>) {
+        let path = self.calibration_file();
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return (None, None),
+            Err(e) => return (None, Some(Self::drop_warning(&path, &e.to_string()))),
+        };
+        match toml::from_str::<Calibration>(&text) {
+            Ok(c) => (Some(c), None),
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                (None, Some(Self::drop_warning(&path, &e.to_string())))
+            }
+        }
+    }
+
+    fn drop_warning(path: &std::path::Path, reason: &str) -> String {
+        format!("ignoring {}: {}; calibration dropped", path.display(), reason.trim())
+    }
+
+    pub fn save_calibration(&self, c: &Calibration) -> io::Result<()> {
+        let text = toml::to_string_pretty(c).map_err(io::Error::other)?;
+        self.write_atomic("calibration.toml", &text)
+    }
+
+    pub fn clear_calibration(&self) {
+        let _ = fs::remove_file(self.calibration_file());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eighty_core::calibration::CalStep;
     use eighty_core::config::Settings;
 
+    fn cal() -> Calibration {
+        Calibration {
+            step: CalStep::Charge, started_at: 100, scheduled: true, step_started_at: 200,
+            held_secs: 30, last_progress_at: 250, best_percent: 14,
+            last_tick: Some((260, true)), last_kick_at: None,
+        }
+    }
+    #[test]
+    fn calibration_save_load_clear() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::new(d.path().join("eighty"));
+        assert_eq!(st.load_calibration(), (None, None));
+        st.save_calibration(&cal()).unwrap();
+        assert_eq!(st.load_calibration(), (Some(cal()), None));
+        st.clear_calibration();
+        assert_eq!(st.load_calibration(), (None, None));
+        st.clear_calibration();
+    }
+    #[test]
+    fn invalid_calibration_file_is_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::new(d.path().into());
+        std::fs::write(d.path().join("calibration.toml"), "garbage [[[").unwrap();
+        let (c, w) = st.load_calibration();
+        assert_eq!(c, None);
+        assert!(w.unwrap().contains("calibration.toml"));
+        assert!(!d.path().join("calibration.toml").exists());
+    }
     #[test]
     fn missing_config_is_defaults_without_warning() {
         let d = tempfile::tempdir().unwrap();

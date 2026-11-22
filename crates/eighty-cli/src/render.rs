@@ -150,6 +150,8 @@ mod tests {
             light_supported: true,
             warnings: vec![],
             version: "0.1.0".into(),
+            calibration: None,
+            schedule: None,
         }
     }
 

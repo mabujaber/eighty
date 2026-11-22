@@ -1,4 +1,5 @@
 //! IPC protocol between the CLI and the helper: one JSON message per line.
+use crate::calibration::{CalStep, CalWait};
 use crate::config::Settings;
 use crate::policy::{Activity, ControlMode, Override};
 use eighty_hw::machine::MachineInfo;
@@ -20,6 +21,10 @@ pub enum Request {
     DischargeTo { percent: u8 },
     ClearFault,
     AcceptOtherLimiters,
+    Calibrate,
+    CalibrateCancel,
+    /// `every_days: None` turns the schedule off.
+    SetCalibrationSchedule { every_days: Option<u16>, at: Option<String> },
 }
 
 impl Request {
@@ -92,6 +97,31 @@ pub struct Status {
     pub light_supported: bool,
     pub warnings: Vec<String>,
     pub version: String,
+    #[serde(default)]
+    pub calibration: Option<CalibrationStatus>,
+    #[serde(default)]
+    pub schedule: Option<ScheduleStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CalibrationStatus {
+    pub step: CalStep,
+    pub held_secs: u64,
+    pub waiting: Option<CalWait>,
+    pub scheduled: bool,
+    pub started_at: u64,
+    /// The Charge Limit eighty asks macOS for in this step (native mode only).
+    #[serde(default)]
+    pub native_limit: Option<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ScheduleStatus {
+    pub every_days: Option<u16>,
+    pub at: String,
+    pub next_due: Option<u64>,
+    pub last_calibrated: Option<u64>,
+    pub waiting: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -121,6 +151,7 @@ pub struct DoctorReport {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // one short-lived value per request; boxing would churn every call site
 pub enum Response {
     Status(Status),
     Doctor(Box<DoctorReport>),
@@ -179,6 +210,26 @@ mod tests {
         assert!(Request::ChargeAuto.is_mutating());
     }
     #[test]
+    fn old_status_json_without_calibration_parses() {
+        let s = Status {
+            percent: 80, external: true, charging: false, amperage_ma: 0, amperage_stale: false,
+            mode: ControlMode::Hold, activity: Activity::Holding, health: Health::Ok,
+            settings: Settings::default(), override_: Override::None, light_supported: true,
+            warnings: vec![], version: "0.1.0".into(), calibration: None, schedule: None,
+        };
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("calibration");
+        v.as_object_mut().unwrap().remove("schedule");
+        let back: Status = serde_json::from_value(v).unwrap();
+        assert!(back.calibration.is_none() && back.schedule.is_none());
+    }
+    #[test]
+    fn calibration_requests_are_mutating() {
+        assert!(Request::Calibrate.is_mutating());
+        assert!(Request::CalibrateCancel.is_mutating());
+        assert!(Request::SetCalibrationSchedule { every_days: None, at: None }.is_mutating());
+    }
+    #[test]
     fn status_json_names_override_field() {
         let s = Status {
             percent: 80,
@@ -194,6 +245,8 @@ mod tests {
             light_supported: true,
             warnings: vec![],
             version: "0.1.0".into(),
+            calibration: None,
+            schedule: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["override"], serde_json::json!({ "DischargeTo": 50 }));
