@@ -20,6 +20,8 @@ pub struct BatterySnapshot {
     /// When macOS last refreshed these readings (Unix seconds, `UpdateTime`).
     /// macOS refreshes about once a minute, so a reading can be up to ~60 s old.
     pub update_time: Option<u64>,
+    /// macOS sets this at the end of a charge; 100% is shown earlier.
+    pub fully_charged: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]

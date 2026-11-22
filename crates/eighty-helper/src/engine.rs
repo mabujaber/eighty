@@ -1151,6 +1151,7 @@ mod tests {
                     temperature_c: None,
                     cycle_count: None,
                     update_time: None,
+                    fully_charged: None,
                 })),
                 fallible: false,
                 chie_hides_ac: false,
