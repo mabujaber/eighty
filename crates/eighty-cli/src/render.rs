@@ -19,6 +19,7 @@ fn activity_text(s: &Status) -> String {
         Activity::Charging { to } => format!("Charging to {to}%"),
         Activity::Holding => format!("Holding at {}%", s.percent),
         Activity::Discharging { to } => format!("Discharging to {to}%"),
+        Activity::Calibrating { step } => format!("Calibrating: step {}/4", step.number()),
         Activity::OnBattery => "On battery".to_string(),
         Activity::LidClosed if s.mode == ControlMode::Hold => {
             let to = match s.override_ {
@@ -81,6 +82,7 @@ pub fn render_status(s: &Status) -> String {
         Override::None => {}
         Override::FullCharge => line(&mut out, "Override", "charge to 100% until unplugged"),
         Override::DischargeTo(p) => line(&mut out, "Override", &format!("discharge to {p}%")),
+        Override::Calibrate(_) => {}
     }
     for w in &s.warnings {
         line(&mut out, "Warning", w);

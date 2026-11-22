@@ -1,5 +1,6 @@
 //! Pure charge policy: given settings, override, readings and the previous
 //! outputs, decide what the helper should write this tick. No I/O.
+use crate::calibration::{CalStep, CAL_LOW};
 use crate::{Settings, HARD_FLOOR};
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,8 @@ pub enum Override {
     None,
     FullCharge,
     DischargeTo(u8),
+    /// A calibration run is in `step`; set by the helper engine, never cleared by `decide`.
+    Calibrate(CalStep),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +41,7 @@ pub enum Activity {
     Charging { to: u8 },
     Holding,
     Discharging { to: u8 },
+    Calibrating { step: CalStep },
     OnBattery,
     LidClosed,
     Paused,
@@ -48,6 +52,8 @@ pub struct Inputs {
     pub external: bool,
     pub lid_closed: bool,
     pub mode: ControlMode,
+    /// Lowest native charge-limit step below 100 (callers pass 80 when unknown).
+    pub native_lowest: u8,
 }
 
 pub struct Decision {
@@ -68,11 +74,28 @@ fn light_for(external: bool, inhibit: bool, discharge: bool) -> Option<Light> {
     }
 }
 
+/// Outputs for "discharge towards `n`" (shared by `DischargeTo` and calibration's discharge step).
+/// Returns (inhibit, discharge, light, activity); the light is already `None` in Native mode.
+fn discharge_step(s: &Settings, i: &Inputs, n: u8) -> (bool, bool, Option<Light>, Activity) {
+    let hold = i.mode == ControlMode::Hold;
+    let native = i.mode == ControlMode::Native;
+    let (inhibit, discharge, light, activity) = if i.lid_closed {
+        // "Lid closed: holding" only makes sense on the charger.
+        let activity = if i.external { Activity::LidClosed } else { Activity::OnBattery };
+        (hold, false, light_for(i.external, hold, false), activity)
+    } else if i.percent <= HARD_FLOOR {
+        // Final guard: never discharge at or below the floor; charge normally.
+        (false, false, light_for(i.external, false, false), Activity::Charging { to: s.upper })
+    } else {
+        (hold, true, if native { None } else { Some(Light::Green) }, Activity::Discharging { to: n })
+    };
+    (inhibit, discharge, if native { None } else { light }, activity)
+}
+
 pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decision {
     if i.mode == ControlMode::Unsupported {
         return Decision { outputs: Outputs::default(), activity: Activity::Paused, clear_override: false, native_limit: None };
     }
-    let hold = i.mode == ControlMode::Hold;
     let native = i.mode == ControlMode::Native;
     let nl = |n: u8| if native { Some(n) } else { None };
     let above_floor = i.percent > HARD_FLOOR;
@@ -101,18 +124,25 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
             };
         }
         Override::DischargeTo(n) => {
-            let (inhibit, discharge, light, activity) = if i.lid_closed {
-                // "Lid closed: holding" only makes sense on the charger.
-                let activity = if i.external { Activity::LidClosed } else { Activity::OnBattery };
-                (hold, false, light_for(i.external, hold, false), activity)
-            } else if !above_floor {
-                // Final guard: never discharge at or below the floor; charge normally.
-                (false, false, light_for(i.external, false, false), Activity::Charging { to: s.upper })
-            } else {
-                (hold, true, if native { None } else { Some(Light::Green) }, Activity::Discharging { to: n })
-            };
-            let light = if native { None } else { light };
+            let (inhibit, discharge, light, activity) = discharge_step(s, i, n);
             return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override, native_limit: nl(s.upper) };
+        }
+        Override::Calibrate(step @ CalStep::Discharge) => {
+            let (inhibit, discharge, light, activity) = discharge_step(s, i, CAL_LOW);
+            let activity = match activity {
+                Activity::LidClosed | Activity::OnBattery => activity,
+                _ if !i.external => Activity::OnBattery,
+                _ => Activity::Calibrating { step },
+            };
+            return Decision { outputs: Outputs { inhibit, discharge, light }, activity, clear_override, native_limit: nl(i.native_lowest) };
+        }
+        Override::Calibrate(step) => {
+            return Decision {
+                outputs: Outputs { inhibit: false, discharge: false, light: if native { None } else { Some(Light::System) } },
+                activity: Activity::Calibrating { step },
+                clear_override,
+                native_limit: nl(100),
+            };
         }
         Override::None => {}
     }
@@ -162,6 +192,7 @@ pub fn decide(s: &Settings, ov: Override, i: &Inputs, prev: &Outputs) -> Decisio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibration::CalStep;
     use crate::Settings;
     use Activity::*;
     use ControlMode::*;
@@ -169,7 +200,7 @@ mod tests {
 
     fn s() -> Settings { Settings::default() }
     fn i(percent: u8, external: bool, lid_closed: bool, mode: ControlMode) -> Inputs {
-        Inputs { percent, external, lid_closed, mode }
+        Inputs { percent, external, lid_closed, mode, native_lowest: 80 }
     }
     fn prev(inhibit: bool, discharge: bool) -> Outputs { Outputs { inhibit, discharge, light: None } }
 
@@ -271,6 +302,40 @@ mod tests {
         for (ov, mode) in [(Override::DischargeTo(5), Hold), (Override::DischargeTo(5), Native)] {
             let d = decide(&s(), ov, &i(10, true, false, mode), &prev(false, true));
             assert!(!d.outputs.discharge, "{mode:?}");
+        }
+    }
+    #[test]
+    fn calibrate_discharge_step_native_limit_is_lowest() {
+        let d = decide(&s(), Override::Calibrate(CalStep::Discharge), &i(60, true, false, Native), &prev(false, false));
+        assert!(d.outputs.discharge);
+        assert_eq!(d.native_limit, Some(80));
+        assert_eq!(d.activity, Calibrating { step: CalStep::Discharge });
+        assert!(!d.clear_override);
+    }
+    #[test]
+    fn calibrate_discharge_lid_closed_holds() {
+        let ov = Override::Calibrate(CalStep::Discharge);
+        let d = decide(&s(), ov, &i(60, true, true, Hold), &prev(false, true));
+        assert_eq!((d.outputs.discharge, d.outputs.inhibit, d.activity), (false, true, LidClosed));
+        let d = decide(&s(), ov, &i(60, false, true, Hold), &prev(false, true));
+        assert_eq!(d.activity, OnBattery);
+        assert!(!d.clear_override);
+    }
+    #[test]
+    fn calibrate_never_discharges_at_floor() {
+        for mode in [Hold, Native] {
+            let d = decide(&s(), Override::Calibrate(CalStep::Discharge), &i(10, true, false, mode), &prev(false, true));
+            assert!(!d.outputs.discharge, "{mode:?}");
+            assert!(!d.clear_override);
+        }
+    }
+    #[test]
+    fn calibrate_charge_and_hold_lift_to_100() {
+        for step in [CalStep::Charge, CalStep::Hold] {
+            let d = decide(&s(), Override::Calibrate(step), &i(90, false, false, Native), &prev(false, false));
+            assert_eq!((d.native_limit, d.clear_override, d.activity), (Some(100), false, Calibrating { step }));
+            let d = decide(&s(), Override::Calibrate(step), &i(90, false, false, Hold), &prev(true, false));
+            assert_eq!((d.outputs.inhibit, d.outputs.light, d.native_limit, d.clear_override), (false, Some(Light::System), None, false));
         }
     }
     #[test]

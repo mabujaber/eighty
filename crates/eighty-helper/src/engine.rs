@@ -928,6 +928,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             external: snap.external_connected,
             lid_closed: self.system.lid_closed(),
             mode: self.detection.mode,
+            // A later task replaces this with the real lowest native step.
+            native_lowest: 80,
         };
         let mut d = decide(&self.settings(), self.override_, &inputs, &self.prev);
         if d.clear_override {
