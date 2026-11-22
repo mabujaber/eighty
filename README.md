@@ -47,13 +47,13 @@ Mode      hold (CHTE) · MagSafe light: yes
 | `eighty discharge <percent>` | Run from battery on AC down to `percent`, then hold. Needs the charger plugged in |
 | `eighty calibrate` | Run a full calibration now (see below) |
 | `eighty calibrate cancel` | Stop a calibration and go back to your limit |
-| `eighty calibrate schedule every <N> days [at HH:MM]` | Run a calibration every N days (7–90) at that time (default 10:00). The first run is N days after you turn it on |
+| `eighty calibrate schedule every <N> days [at HH:MM]` | Run a calibration every N days (7–90) at that time (default 10:00). The first run is N days after you turn it on, or after the last calibration if that is later. While `charge full` or `discharge` runs, a due run waits for it |
 | `eighty calibrate schedule off` | Turn the schedule off |
 | `eighty doctor [--retry]` | Check SMC support and helper health. `--retry` clears a recorded fault |
 | `eighty logs` | The last lines of the helper log |
 | `sudo eighty uninstall [--purge]` | Stop the helper, restore normal charging and remove it. `--purge` also deletes settings and logs |
 
-A calibration runs the battery through one full cycle: down to 15%, up to 100%, an hour at full, then back to your limit. It helps the battery gauge relearn its capacity. It takes several hours, so keep the Mac on the charger with the lid open. If you unplug, close the lid, sleep or reboot, it pauses and carries on from the step it reached. While it runs, `eighty status` shows the step. A Charge Limit changed in System Settings during a calibration is set back, and a fault puts your limit back on macOS's Charge Limit until it clears. Details: [calibration design](docs/superpowers/specs/2026-11-22-eighty-calibration-design.md).
+A calibration runs the battery through one full cycle: down to 15%, up to 100%, an hour at full, then back to your limit. It helps the battery gauge relearn its capacity. It takes several hours, so keep the Mac on the charger with the lid open. Closing the lid, sleeping or rebooting pauses it, and it carries on from the step it reached. Unplugging pauses steps 2 and 3 (charging and the hour at full); step 1 keeps going on battery. While it runs, `eighty status` shows the step. A Charge Limit changed in System Settings during a calibration is set back, and a fault puts your limit back on macOS's Charge Limit until it clears. Details: [calibration design](docs/superpowers/specs/2026-11-22-eighty-calibration-design.md).
 
 Changing settings needs an admin (`sudo`) or the user logged in at the console. Anyone can read the status.
 
@@ -82,8 +82,8 @@ Safety rules:
 
 In native mode:
 
-- eighty writes `CHIE` only for an explicit `eighty discharge <percent>`. The 10% floor, lid-closed and sleep rules above still apply to it.
-- On shutdown, crash recovery and faults, it writes `CHIE=00` only. It leaves macOS's Charge Limit alone, because macOS enforces it and keeps holding while eighty is stopped.
+- eighty writes `CHIE` only for an explicit `eighty discharge <percent>` and for step 1 of a calibration (down to 15%). The 10% floor, lid-closed and sleep rules above still apply to both.
+- On shutdown, crash recovery and faults, it writes `CHIE=00`. Otherwise it leaves macOS's Charge Limit as it is, because macOS enforces it and keeps holding while eighty is stopped. The exception is a calibration that lifted the limit: a fault, or stopping the helper mid-calibration, puts your limit back (the calibration carries on once eighty runs again). With another limiter installed, eighty doesn't touch the Charge Limit at all unless a calibration is loaded.
 - `eighty uninstall` also puts back the limit you had before eighty first took control.
 
 Files:

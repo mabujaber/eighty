@@ -33,7 +33,7 @@ enum ChargeMode {
 enum CalAction {
     /// Stop a running calibration and return to the limit.
     Cancel,
-    /// Set or clear the calibration schedule: every <N> days [at HH:MM] | off
+    /// Set or clear the calibration schedule: every <N> days [at HH:MM] | off (time defaults to 10:00)
     Schedule {
         #[arg(trailing_var_arg = true, required = true)]
         words: Vec<String>,

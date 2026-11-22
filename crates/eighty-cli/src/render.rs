@@ -50,7 +50,7 @@ where
 {
     let mut parts = Vec::new();
     if let Some(l) = sc.last_calibrated {
-        parts.push(format!("Last {}", fmt_date(l, tz)));
+        parts.push(format!("Last calibrated {}", fmt_date(l, tz)));
     }
     match (sc.next_due, sc.every_days) {
         (Some(t), Some(d)) => parts.push(format!("next {} (every {d} days)", fmt_time(t, tz))),
@@ -58,8 +58,9 @@ where
         (None, Some(d)) => parts.push(format!("every {d} days at {}", sc.at)),
         (None, None) => {}
     }
+    // The helper's text already says "scheduled calibration waiting: …".
     if let Some(w) = &sc.waiting {
-        parts.push(format!("scheduled calibration waiting: {w}"));
+        parts.push(w.clone());
     }
     if parts.is_empty() {
         None
@@ -281,13 +282,13 @@ mod tests {
         };
         let s = Status { schedule: Some(sc.clone()), ..st() };
         let out = render_status_tz(&s, &chrono::Utc);
-        assert!(out.contains("Calibrate Last 2026-11-22 · next 2026-12-22 10:00 (every 30 days)\n"), "{out}");
+        assert!(out.contains("Calibrate Last calibrated 2026-11-22 · next 2026-12-22 10:00 (every 30 days)\n"), "{out}");
         let s = Status {
-            schedule: Some(ScheduleStatus { last_calibrated: None, waiting: Some("plug in".into()), ..sc }),
+            schedule: Some(ScheduleStatus { last_calibrated: None, waiting: Some("scheduled calibration waiting: charge full or discharge is running".into()), ..sc }),
             ..st()
         };
         let out = render_status_tz(&s, &chrono::Utc);
-        assert!(out.contains("Calibrate next 2026-12-22 10:00 (every 30 days) · scheduled calibration waiting: plug in\n"), "{out}");
+        assert!(out.contains("Calibrate next 2026-12-22 10:00 (every 30 days) · scheduled calibration waiting: charge full or discharge is running\n"), "{out}");
         let s = Status { schedule: Some(ScheduleStatus { every_days: None, at: "10:00".into(), next_due: None, last_calibrated: None, waiting: None }), ..st() };
         assert!(!render_status_tz(&s, &chrono::Utc).contains("Calibrate"));
     }
