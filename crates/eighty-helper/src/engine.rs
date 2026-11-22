@@ -146,6 +146,9 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     cal_notice: Option<String>,
     /// Why a due scheduled calibration couldn't start, shown in `status` until it does.
     cal_schedule_wait: Option<String>,
+    /// The user's limit `fault_restore_native` failed to set back and keeps retrying (so
+    /// it logs only the first attempt).
+    native_fault_restore: Option<u8>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y, N> {
@@ -210,6 +213,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             cal_saved_at: 0,
             cal_notice: None,
             cal_schedule_wait: None,
+            native_fault_restore: None,
         };
         e.bring_up();
         e.tick();
@@ -397,6 +401,22 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.cal_wait = None;
         self.store.clear_calibration();
         log(&format!("calibration: {why}"));
+        self.consume_overdue_schedule();
+    }
+
+    /// A schedule that came due while a calibration ran (e.g. an on-demand one, later
+    /// cancelled or abandoned) counts as taken: it doesn't start a second run at once.
+    fn consume_overdue_schedule(&mut self) {
+        let Some(due) = next_due(&self.config.calibration, to_local, from_local) else { return };
+        if due > (self.clock)() {
+            return;
+        }
+        log("calibration: the scheduled calibration that came due meanwhile is skipped");
+        let calibration = CalibrationConfig { last_scheduled_due: Some(due), ..self.config.calibration.clone() };
+        if let Err(m) = self.save(Config { calibration: calibration.clone(), ..self.config.clone() }) {
+            log(&format!("{m}; the skipped schedule is remembered until eighty restarts"));
+            self.config.calibration = calibration;
+        }
     }
 
     /// Run the calibration one tick on (`eighty_core::calibration::advance`) and act on
@@ -483,28 +503,46 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.cal_saved_at = now;
     }
 
-    /// A fault this tick: pause the calibration in its step. In native mode, unless PowerUI
-    /// itself is failing (`NativeUnavailable`), also put the user's limit back on macOS's
-    /// Charge Limit, so a fault never leaves the Mac uncapped at 100%. Once the fault
-    /// clears, the calibration's own limit is set again. Called on every tick that ends
-    /// in a fault.
+    /// A fault this tick: pause the calibration in its step, and put the user's limit back
+    /// on macOS's Charge Limit (`fault_restore_native`). Once the fault clears, the
+    /// calibration's own limit is set again. Called on every tick that ends in a fault.
     fn calibration_faulted(&mut self, snap: Option<&BatterySnapshot>) {
         // A due schedule can't start now either; this records why for `status`.
         self.maybe_start_scheduled();
-        if self.calibration.is_none() {
-            return;
+        if self.calibration.is_some() {
+            self.advance_calibration(snap, true);
         }
-        self.advance_calibration(snap, true);
+        self.fault_restore_native();
+    }
+
+    /// Native mode in a fault, unless PowerUI itself is failing (`NativeUnavailable`): if
+    /// eighty last set a Charge Limit other than the user's (a calibration's 100%, even
+    /// one cancelled or abandoned since), set the user's back, so a fault never leaves the
+    /// Mac uncapped. Tried every faulted tick until it succeeds; logged once per attempt.
+    fn fault_restore_native(&mut self) {
         let upper = self.settings().upper;
         // Never before the original Charge Limit is on record (native mode's startup step).
-        if self.detection.mode == ControlMode::Native
+        let wanted = self.detection.mode == ControlMode::Native
             && !matches!(self.health, Health::NativeUnavailable(_))
             && self.config.native_original.is_some()
-            && self.native_written != Some(upper)
-        {
-            log(&format!("calibration: paused by a fault; setting macOS's Charge Limit back to {upper}%"));
-            // A failure is tried again next tick; the fault is already reported.
-            let _ = self.write_native(upper);
+            && self.override_ != Override::FullCharge
+            && self.native_written.is_some_and(|x| x != upper);
+        if !wanted {
+            self.native_fault_restore = None;
+            return;
+        }
+        let first = self.native_fault_restore != Some(upper);
+        if first {
+            log(&format!("native: eighty is paused by a fault; setting macOS's Charge Limit back to {upper}%"));
+        }
+        match self.write_native(upper) {
+            Ok(()) => self.native_fault_restore = None,
+            Err(e) => {
+                if first {
+                    log(&format!("native: couldn't set the Charge Limit back to {upper}%: {e}; trying again each tick"));
+                }
+                self.native_fault_restore = Some(upper);
+            }
         }
     }
 
@@ -826,7 +864,12 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     Some(n) => CalibrationConfig {
                         every_days: Some(n),
                         at,
-                        set_at: Some((self.clock)()),
+                        // The first run is N days after the schedule is turned on; changing
+                        // N or the time later doesn't move that start.
+                        set_at: match (self.config.calibration.every_days, self.config.calibration.set_at) {
+                            (Some(_), Some(t)) => Some(t),
+                            _ => Some((self.clock)()),
+                        },
                         last_scheduled_due: None,
                         ..self.config.calibration.clone()
                     },
@@ -2903,5 +2946,76 @@ mod tests {
         assert!(waiting.starts_with("scheduled calibration waiting:"), "{waiting}");
         assert_eq!(waiting, format!("scheduled calibration waiting: {}", h.message()));
         assert_eq!(r.store.load().0.calibration.last_scheduled_due, None);
+    }
+
+    // Task 7 fix round 1.
+
+    /// Native rig at 60% with a 7-day schedule set at 1_000; returns its first due time.
+    fn scheduled_native(external: bool) -> (Rig, TestEngine, u64) {
+        let r = Rig::native(); r.set(60, external, external, if external { 1000 } else { -500 }, Some(900));
+        let mut e = r.engine();
+        req(&mut e, 501, Request::SetCalibrationSchedule { every_days: Some(7), at: None });
+        let due = e.status().schedule.unwrap().next_due.unwrap();
+        (r, e, due)
+    }
+    #[test] fn cancelling_a_manual_calibration_consumes_an_overdue_schedule() {
+        let (r, mut e, due) = scheduled_native(true);
+        assert!(matches!(req(&mut e, 501, Request::Calibrate), Response::Status(_)));
+        r.clock.set(due + 60); r.set(55, false, true, -800, Some(due + 50)); e.handle(Event::Tick);
+        assert_eq!(e.status().calibration.map(|c| c.scheduled), Some(false));
+        let Response::Status(s) = req(&mut e, 501, Request::CalibrateCancel) else { panic!() };
+        assert_eq!(s.calibration, None);
+        assert_eq!((r.smc.value("CHIE"), r.native.limit_now()), (Some(vec![0]), 80));
+        assert_eq!(r.store.load().0.calibration.last_scheduled_due, Some(due));
+        r.clock.set(due + 120); e.handle(Event::Tick);
+        assert_eq!(cal_step(&e), None);
+    }
+    #[test] fn abandoning_a_manual_calibration_consumes_an_overdue_schedule() {
+        let (r, mut e, due) = scheduled_native(false);
+        r.clock.set(due - 3_600);
+        assert!(matches!(req(&mut e, 501, Request::Calibrate), Response::Status(_)));
+        let t = due - 3_600 + 86_400;
+        r.clock.set(t); e.handle(Event::Tick);
+        assert_eq!(cal_step(&e), None);
+        assert!(e.status().warnings.iter().any(|w| w.starts_with("calibration abandoned: no progress in step 1/4")));
+        assert_eq!(r.store.load().0.calibration.last_scheduled_due, Some(due));
+        r.clock.set(t + 60); e.handle(Event::Tick);
+        assert_eq!(cal_step(&e), None);
+        assert_eq!(r.native.limit_now(), 80);
+    }
+    #[test] fn changing_an_active_schedule_keeps_its_start() {
+        let (r, mut e, due) = scheduled_native(true);
+        r.clock.set(5_000);
+        req(&mut e, 501, Request::SetCalibrationSchedule { every_days: Some(8), at: None });
+        let saved = r.store.load().0.calibration;
+        assert_eq!((saved.every_days, saved.set_at), (Some(8), Some(1_000)));
+        assert_eq!(e.status().schedule.unwrap().next_due, Some(due + 86_400));
+        // Off, then on again: counts from now.
+        req(&mut e, 501, Request::SetCalibrationSchedule { every_days: None, at: None });
+        r.clock.set(9_000);
+        req(&mut e, 501, Request::SetCalibrationSchedule { every_days: Some(7), at: None });
+        assert_eq!(r.store.load().0.calibration.set_at, Some(9_000));
+    }
+    #[test] fn fault_restore_retries_after_the_calibration_is_cancelled() {
+        let r = Rig::native(); r.set(90, true, true, 1000, Some(900));
+        save_cal_step(&r, CalStep::Charge);
+        let mut e = r.engine();
+        assert_eq!(r.native.limit_now(), 100);
+        r.native.fail_calls(true);
+        r.smc.insert("CHIE", "ui8 ", &[8], WriteMode::Accept);
+        crate::log::take_captured();
+        r.clock.set(1_060); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
+        assert_eq!(r.native.limit_now(), 100);
+        assert!(matches!(req(&mut e, 501, Request::CalibrateCancel), Response::Status(_)));
+        r.clock.set(1_120); e.handle(Event::Tick);
+        assert_eq!((cal_step(&e), r.native.limit_now()), (None, 100));
+        // Logged once, not every tick.
+        let logged = crate::log::take_captured();
+        assert_eq!(logged.iter().filter(|l| l.contains("setting macOS's Charge Limit back to 80%")).count(), 1, "{logged:?}");
+        r.native.fail_calls(false);
+        r.clock.set(1_180); e.handle(Event::Tick);
+        assert_eq!(r.native.limit_now(), 80);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
     }
 }

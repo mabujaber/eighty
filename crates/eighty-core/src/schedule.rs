@@ -49,7 +49,12 @@ pub fn next_due(
         Some(s) => parse_at(s).ok()?,
         None => NaiveTime::from_hms_opt(10, 0, 0)?,
     };
-    let anchor = c.last_calibrated.or(c.set_at)?;
+    // Counts from the later of the last calibration and turning the schedule on, so the
+    // first automatic run is never right away.
+    let anchor = match (c.last_calibrated, c.set_at) {
+        (Some(a), Some(b)) => a.max(b),
+        (a, b) => a.or(b)?,
+    };
     let mut date = to_local(anchor).date().checked_add_days(Days::new(n))?;
     let mut due = from_local(date.and_time(at));
     while c.last_scheduled_due.is_some_and(|d| due <= d) {
@@ -79,6 +84,10 @@ mod tests {
     #[test] fn after_a_calibration_counts_from_it() {
         let c = CalibrationConfig { last_calibrated: Some(ts(2026, 12, 1, 18, 0)), ..cfg() };
         assert_eq!(next_due(&c, loc, utc), Some(ts(2026, 12, 31, 10, 0)));
+    }
+    #[test] fn old_calibration_doesnt_make_a_new_schedule_due_at_once() {
+        let c = CalibrationConfig { every_days: Some(7), last_calibrated: Some(ts(2026, 9, 23, 18, 0)), ..cfg() };
+        assert_eq!(next_due(&c, loc, utc), Some(ts(2026, 11, 29, 10, 0)));
     }
     #[test] fn consumed_due_is_skipped() {
         let c = CalibrationConfig { last_scheduled_due: Some(ts(2026, 12, 22, 10, 0)), ..cfg() };
