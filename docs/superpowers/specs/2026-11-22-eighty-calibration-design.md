@@ -132,6 +132,16 @@ macOS shows 100% before the battery is truly full. Step 2 ends only when the cha
   Last calibrated 2026-11-22 · next 2026-12-22 10:00
   ```
 
+### 7.8 Checked against prior art (2026-11-22)
+
+- **`battery` (actuallymentor):** has no calibration. Nothing to match.
+- **BattOpt** (README and CHANGELOG; its code isn't public): discharge to 15% → charge to 100% → 1-hour rest → discharge to the limit; `calibrate` / `calibrate stop`; smart resume pauses on unplug and resumes on replug. This design matches all of that. Step 1 also keeps going on battery.
+- **Schedule form (owner's decision):** keep `every <N> days [at HH:MM]` for this release. BattOpt's forms (fixed days of the month, e.g. the 6th and 21st at 21:30, or every N weeks on a weekday) can come in a later release.
+- **Charging must actually start in step 2.** BattOpt's changelog fixed a macOS 27 bug where charging to 100% sometimes didn't start after the discharge to 15%. Step 2 checks, on a settled reading, that the battery is charging (or already full). If it isn't, it sets the Charge Limit to 100 again (native) or clears inhibit again (hold), and logs it. That counts toward the 24-hour give-up rule.
+- **Calibration log:** every calibration start, step change, pause, resume, finish, cancel and abandon goes in the helper log with a `calibration:` prefix. A separate history file (BattOpt has one) is left for later.
+- **Real vs shown percentage:** BattOpt can act on the raw percentage. eighty uses the shown percentage, as everywhere else.
+- **Clamshell levels (BattOpt Pro):** BattOpt can discharge or calibrate with the lid closed by keeping the Mac awake (level 1), optionally with the external display on (level 2). This design keeps eighty's current rule: no forced discharge with the lid closed, so a docked Mac with the lid shut pauses in step 1. Lid-closed support is a separate item (see §2).
+
 ## 8. Testing
 
 - Pure-policy unit tests for every step × (AC, battery, lid closed, asleep, fault) and each mode.
