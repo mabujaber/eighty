@@ -1,4 +1,5 @@
 //! Shared types for the eighty helper and CLI. No hardware or OS calls.
+pub mod calibration;
 pub mod config;
 pub mod limiters;
 pub mod paths;
