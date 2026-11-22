@@ -5,6 +5,7 @@ pub mod limiters;
 pub mod paths;
 pub mod policy;
 pub mod proto;
+pub mod schedule;
 
 pub use config::{Config, Settings};
 

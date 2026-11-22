@@ -29,7 +29,7 @@ impl Store {
         };
         let parsed = toml::from_str::<Config>(&text)
             .map_err(|e| e.to_string())
-            .and_then(|c| c.settings.validate().map(|_| c));
+            .and_then(|c| c.settings.validate().and_then(|_| c.calibration.validate()).map(|_| c));
         match parsed {
             Ok(c) => (c, None),
             Err(reason) => (Config::default(), Some(Self::warn(&path, &reason))),
@@ -65,7 +65,7 @@ mod tests {
     fn save_then_load() {
         let d = tempfile::tempdir().unwrap();
         let st = Store::new(d.path().join("eighty"));
-        let c = Config { settings: Settings { upper: 70, lower: 60, auto_discharge: false }, accept_other_limiters: true, native_original: Some(100) };
+        let c = Config { settings: Settings { upper: 70, lower: 60, auto_discharge: false }, accept_other_limiters: true, native_original: Some(100), ..Config::default() };
         st.save(&c).unwrap();
         assert_eq!(st.load(), (c, None));
     }
@@ -79,6 +79,14 @@ mod tests {
             assert_eq!(c, Config::default());
             assert!(w.unwrap().contains("config.toml"));
         }
+    }
+    #[test]
+    fn invalid_schedule_falls_back_with_warning() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "[calibration]\nevery_days = 3\n").unwrap();
+        let (c, w) = Store::new(d.path().into()).load();
+        assert_eq!(c, Config::default());
+        assert!(w.unwrap().contains("every 7 to 90 days"));
     }
     #[test]
     fn partial_settings_load_with_lower_derived() {
