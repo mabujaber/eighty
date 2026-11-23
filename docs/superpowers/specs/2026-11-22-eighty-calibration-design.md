@@ -77,6 +77,8 @@ The current step and its progress (step, step start time, hold time accumulated)
 | Asleep | `CHIE` off while asleep (existing rule), resumes on wake | Continues | Continues (time on AC while asleep counts) |
 | Reboot / crash / reinstall | Resumes the saved step at startup, after the usual startup recovery | same | same |
 
+A reboot or shutdown in steps 2–3 leaves macOS's Charge Limit at 100% while eighty is down: the helper tries to put the user's limit back when it stops, but macOS has already closed PowerUI by then (seen in acceptance check 4: "Couldn't communicate with a helper application"). The helper sets the right limit again when it resumes after boot. Restoring it from macOS's shutdown notice instead is possible but untested.
+
 *Claude's calls (from the builder check):*
 - **Step 3 after the charge drops.** If the charge falls below 95% during step 3 (e.g. unplugged and used), the calibration goes back to step 2 and the hold clock resets. "Hold at full" means at full.
 - **Sleep in step 3.** Time asleep counts toward the hold only if the Mac was on AC both when it went to sleep and when it woke. The helper can't see what happened in between.

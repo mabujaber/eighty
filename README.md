@@ -83,7 +83,7 @@ Safety rules:
 In native mode:
 
 - eighty writes `CHIE` only for an explicit `eighty discharge <percent>` and for step 1 of a calibration (down to 15%). The 10% floor, lid-closed and sleep rules above still apply to both.
-- On shutdown, crash recovery and faults, it writes `CHIE=00`. Otherwise it leaves macOS's Charge Limit as it is, because macOS enforces it and keeps holding while eighty is stopped. The exception is a calibration that lifted the limit: a fault, or stopping the helper mid-calibration, puts your limit back (the calibration carries on once eighty runs again). With another limiter installed, eighty doesn't touch the Charge Limit at all unless a calibration is loaded.
+- On shutdown, crash recovery and faults, it writes `CHIE=00`. Otherwise it leaves macOS's Charge Limit as it is, because macOS enforces it and keeps holding while eighty is stopped. The exception is a calibration that lifted the limit: a fault, or stopping the helper mid-calibration, puts your limit back (the calibration carries on once eighty runs again). A shutdown or reboot during steps 2–3 can't do this, because macOS has already closed the Charge Limit service by then, so macOS keeps 100% until eighty starts after boot and resumes. With another limiter installed, eighty doesn't touch the Charge Limit at all unless a calibration is loaded.
 - `eighty uninstall` also puts back the limit you had before eighty first took control.
 
 Files:
