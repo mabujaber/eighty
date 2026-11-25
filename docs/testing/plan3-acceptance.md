@@ -4,7 +4,7 @@ Task 10 of [Plan 3](../superpowers/plans/2026-11-22-eighty-03-calibration.md). D
 
 | Mac | macOS | Mode | Status |
 |---|---|---|---|
-| M5 Pro (Mac17,8) | | native | Not run |
+| M5 Pro (Mac17,8) | 27.2.1 (26B131) | native | In progress, 2026-11-25 (build `a54049e`) |
 | M2 Max (Mac14,6) | 27.2 (26B123) | native | **Passed**, 2026-11-22 to 2026-11-23 (build `89d6a71`), one finding (check 4) |
 
 ## Setup
@@ -60,3 +60,14 @@ Build: `feat/calibration` at `89d6a71`. Installed helper SHA-256 matches `target
 | 4 | Pass, with a finding | Final run: started at 15% on battery, 12:57:01 `calibration: started`, then at once `step 2/4: charging to 100%`, `set macOS's Charge Limit to 100%`. Plugged in; owner rebooted during step 2. 13:54:33 `calibration: helper stopping; putting the 80% limit back until it resumes`, then **`native: couldn't set the Charge Limit back to 80%: Couldn’t communicate with a helper application.`** (PowerUI was already gone during shutdown). 13:55:22 `eighty-helper 0.1.0 starting`, `calibration: resuming step 2/4`, `set macOS's Charge Limit to 100%`. `calibration.toml` kept across the reboot. Status `Calibrating: step 2/4, charging to 100% (now 92%)`, doctor `Native 100%`, `Health ok` at 13:58. Finding: on a shutdown or reboot the limit isn't put back, so if eighty didn't start again macOS would keep 100% |
 
 Final run after check 6 (2026-11-23, UTC). Unplugged at 100% at 15:38 (macOS power log) and used on battery. 17:17:07 `calibration: step 2/4: charging to 100%`: the charge fell below 95% during the hold, so the run went back to step 2 as designed. Plugged in at 56% at 21:15:21; in the same second `calibration: charging hasn't started; asking macOS again` and `set macOS's Charge Limit to 100%` (the stall check fired on hours of no progress while on battery: harmless but noisy). 22:40:46 `step 3/4: holding at 100% for 1 h` (hold clock reset). 23:41:17 `calibration: finished; back to the 80% limit`, `set macOS's Charge Limit to 80%`. Status `Discharging to 80%`, `Calibrate Last calibrated 2026-11-24` (local date), doctor `Native 80%`, `Health ok`, `calibration.toml` gone.
+
+### M5 Pro (Mac17,8), macOS 27.2.1 (26B131), native mode
+
+Build: `feat/calibration` at `a54049e` (same code as `89d6a71`; later commits are docs only). Installed helper SHA-256 matches `target/release/eighty-helper` (`d867cf86…`). No other limiter (`Limiters none`). Times are UTC, 2026-11-25. The Mac runs with two external LG displays.
+
+| # | Result | Evidence |
+|---|---|---|
+| 1 | Pass | 09:46:45 `eighty-helper 0.1.0 starting`, `mode Native, light false, keys [CHTE Missing, CHIE Usable, ACLC Usable], native steps [80, 85, 90, 95, 100]`, `native: macOS's Charge Limit was 80% before eighty`, `set … to 80%`, `activity Holding`. Status `Mode native (macOS Charge Limit)`, `Holding at 80%`. Doctor `Limiters none`, `Native 80%`, `Health ok` |
+| Extra: lid closed in step 1 | Pass | Started with the lid closed (clamshell). 09:47:02 `calibration: started (step 1/4, discharging to 15%)`, `activity LidClosed`. State `Calibrating: step 1/4, paused: lid closed, macOS may charge up to 80% meanwhile`. `calibration.toml` present (`step = "discharge"`, `best_percent = 80`) |
+| 2 | Pass | Lid opened about 09:48:40. 09:48:45 `outputs inhibit=false discharge=true light=None`, `activity Calibrating { step: Discharge }`. State `Calibrating: step 1/4, discharging to 15% (now 80%)`. Probe `CHIE=08`, `ACLC=04`. `status --json` `native_limit: 80`. `pmset`: "No adapter attached", `AppleRawExternalConnected = No` (CHIE hides the adapter, as on the M2). Raw charge 6897 (09:48:59) → 6811 mAh (09:52:19), about −1.8 A |
+| 3 | Pass | Unplugged about 09:56, plugged in about 09:59:45 (owner). While unplugged: State `step 1/4, discharging to 15% (now 80%)`, no `paused`, no new log lines; raw 6760 → 6734 mAh. After plugging in (09:59:52): same State, `CHIE=08`, raw 6696 mAh, discharging about 1 A. Status kept `on AC` throughout (last trusted reading, by design). The unplug was about 4 min, not 5 |
