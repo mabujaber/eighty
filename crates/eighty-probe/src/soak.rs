@@ -14,13 +14,17 @@ extern "C" fn on_signal(_: libc::c_int) {
 }
 
 /// Makes SIGINT, SIGTERM and SIGHUP end the soak loop (checked each second)
-/// instead of killing the process, so `CHIE` is restored.
+/// instead of killing the process, so `CHIE` is restored. SIGQUIT (Ctrl-\\) and
+/// SIGTSTP (Ctrl-Z) are ignored: they would kill or suspend the probe with
+/// `CHIE=08` still written.
 pub fn install_stop_handler() {
     // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
     unsafe {
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
         }
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
     }
 }
 
