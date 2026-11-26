@@ -299,6 +299,7 @@ mod tests {
             temperature_c: Some(30.0),
             cycle_count: Some(1),
             update_time: None,
+            fully_charged: None,
         }
     }
 

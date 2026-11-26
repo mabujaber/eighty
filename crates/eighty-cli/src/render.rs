@@ -1,6 +1,73 @@
 //! Plain-text rendering of status and doctor output.
+use chrono::{Local, TimeZone};
+use eighty_core::calibration::{CalStep, CalWait, CAL_HOLD_SECS, CAL_LOW};
 use eighty_core::policy::{Activity, ControlMode, Override};
-use eighty_core::proto::{DoctorReport, KeyState, NativeState, Status};
+use eighty_core::proto::{CalibrationStatus, DoctorReport, KeyState, NativeState, ScheduleStatus, Status};
+use std::fmt::Display;
+
+/// `YYYY-MM-DD HH:MM` in the given timezone (the CLI passes `Local`).
+pub fn fmt_time<Tz: TimeZone>(secs: u64, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+    match tz.timestamp_opt(secs, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => "unknown time".to_string(),
+    }
+}
+
+fn fmt_date<Tz: TimeZone>(secs: u64, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    fmt_time(secs, tz).chars().take(10).collect()
+}
+
+fn calibration_text(s: &Status, c: &CalibrationStatus) -> String {
+    let n = c.step.number();
+    let tail = match c.waiting {
+        Some(CalWait::PlugIn) => "paused: plug in to continue".to_string(),
+        Some(CalWait::LidClosed) => match c.native_limit {
+            Some(l) => format!("paused: lid closed, macOS may charge up to {l}% meanwhile"),
+            None => "paused: lid closed".to_string(),
+        },
+        Some(CalWait::Fault) => "paused: eighty isn't limiting (see above)".to_string(),
+        None => match c.step {
+            CalStep::Discharge => format!("discharging to {CAL_LOW}% (now {}%)", s.percent),
+            CalStep::Charge => format!("charging to 100% (now {}%)", s.percent),
+            CalStep::Hold => {
+                format!("holding at 100% ({} of {} min)", c.held_secs / 60, CAL_HOLD_SECS / 60)
+            }
+        },
+    };
+    format!("Calibrating: step {n}/4, {tail}")
+}
+
+fn schedule_text<Tz: TimeZone>(sc: &ScheduleStatus, tz: &Tz) -> Option<String>
+where
+    Tz::Offset: Display,
+{
+    let mut parts = Vec::new();
+    if let Some(l) = sc.last_calibrated {
+        parts.push(format!("Last calibrated {}", fmt_date(l, tz)));
+    }
+    match (sc.next_due, sc.every_days) {
+        (Some(t), Some(d)) => parts.push(format!("next {} (every {d} days)", fmt_time(t, tz))),
+        (Some(t), None) => parts.push(format!("next {}", fmt_time(t, tz))),
+        (None, Some(d)) => parts.push(format!("every {d} days at {}", sc.at)),
+        (None, None) => {}
+    }
+    // The helper's text already says "scheduled calibration waiting: …".
+    if let Some(w) = &sc.waiting {
+        parts.push(w.clone());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
 
 fn line(out: &mut String, label: &str, text: &str) {
     out.push_str(&format!("{:<10}{}\n", label, text));
@@ -19,10 +86,12 @@ fn activity_text(s: &Status) -> String {
         Activity::Charging { to } => format!("Charging to {to}%"),
         Activity::Holding => format!("Holding at {}%", s.percent),
         Activity::Discharging { to } => format!("Discharging to {to}%"),
+        Activity::Calibrating { step } => format!("Calibrating: step {}/4", step.number()),
         Activity::OnBattery => "On battery".to_string(),
         Activity::LidClosed if s.mode == ControlMode::Hold => {
-            let to = match s.override_ {
-                Override::DischargeTo(n) => n,
+            let to = match (&s.calibration, s.override_) {
+                (Some(c), _) if c.step == CalStep::Discharge => CAL_LOW,
+                (_, Override::DischargeTo(n)) => n,
                 _ => s.settings.upper,
             };
             format!("Lid closed: holding at {}%, discharges to {to}% when the lid opens", s.percent)
@@ -43,6 +112,13 @@ fn health_text(s: &Status) -> String {
 }
 
 pub fn render_status(s: &Status) -> String {
+    render_status_tz(s, &Local)
+}
+
+pub fn render_status_tz<Tz: TimeZone>(s: &Status, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
     let mut out = String::new();
     if !s.health.is_ok() {
         out.push_str(&format!("NOT LIMITING: {}\n", health_text(s)));
@@ -70,7 +146,10 @@ pub fn render_status(s: &Status) -> String {
         }
     };
     line(&mut out, "Limit", &limit_text);
-    line(&mut out, "State", &activity_text(s));
+    match &s.calibration {
+        Some(c) => line(&mut out, "State", &calibration_text(s, c)),
+        None => line(&mut out, "State", &activity_text(s)),
+    }
     let light = match (s.mode, s.light_supported) {
         (ControlMode::Native, _) => "macOS",
         (_, true) => "yes",
@@ -81,6 +160,10 @@ pub fn render_status(s: &Status) -> String {
         Override::None => {}
         Override::FullCharge => line(&mut out, "Override", "charge to 100% until unplugged"),
         Override::DischargeTo(p) => line(&mut out, "Override", &format!("discharge to {p}%")),
+        Override::Calibrate(_) => {}
+    }
+    if let Some(t) = s.schedule.as_ref().and_then(|sc| schedule_text(sc, tz)) {
+        line(&mut out, "Calibrate", &t);
     }
     for w in &s.warnings {
         line(&mut out, "Warning", w);
@@ -148,7 +231,66 @@ mod tests {
             light_supported: true,
             warnings: vec![],
             version: "0.1.0".into(),
+            calibration: None,
+            schedule: None,
         }
+    }
+
+    fn cal(step: CalStep, held_secs: u64, waiting: Option<CalWait>, native_limit: Option<u8>) -> CalibrationStatus {
+        CalibrationStatus { step, held_secs, waiting, scheduled: false, started_at: 0, native_limit }
+    }
+
+    fn state_line(s: &Status) -> String {
+        render_status_tz(s, &chrono::Utc).lines().find(|l| l.starts_with("State")).unwrap().to_string()
+    }
+
+    #[test]
+    fn renders_calibration_steps() {
+        let s = Status { percent: 42, calibration: Some(cal(CalStep::Discharge, 0, None, Some(80))), ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 1/4, discharging to 15% (now 42%)");
+        let s = Status { percent: 63, calibration: Some(cal(CalStep::Charge, 0, None, None)), ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 2/4, charging to 100% (now 63%)");
+        let s = Status { percent: 100, calibration: Some(cal(CalStep::Hold, 35 * 60 + 20, None, None)), ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 3/4, holding at 100% (35 of 60 min)");
+        let s = Status { calibration: Some(cal(CalStep::Charge, 0, Some(CalWait::PlugIn), None)), activity: Activity::OnBattery, ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 2/4, paused: plug in to continue");
+        let s = Status { calibration: Some(cal(CalStep::Charge, 0, Some(CalWait::LidClosed), Some(80))), activity: Activity::LidClosed, ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 2/4, paused: lid closed, macOS may charge up to 80% meanwhile");
+        let s = Status { calibration: Some(cal(CalStep::Charge, 0, Some(CalWait::LidClosed), None)), activity: Activity::LidClosed, ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 2/4, paused: lid closed");
+        let s = Status { calibration: Some(cal(CalStep::Hold, 0, Some(CalWait::Fault), None)), ..st() };
+        assert_eq!(state_line(&s), "State     Calibrating: step 3/4, paused: eighty isn't limiting (see above)");
+    }
+
+    #[test]
+    fn lid_closed_discharge_step_says_15() {
+        let s = Status { percent: 50, activity: Activity::LidClosed, calibration: None, ..st() };
+        assert!(render_status(&s).contains("discharges to 80% when"));
+        // Direct activity text (the calibration line normally takes over the State line).
+        let s = Status { calibration: Some(cal(CalStep::Discharge, 0, None, None)), ..s };
+        assert!(activity_text(&s).contains("discharges to 15% when the lid opens"));
+    }
+
+    #[test]
+    fn renders_schedule_line() {
+        let sc = ScheduleStatus {
+            every_days: Some(30),
+            at: "10:00".into(),
+            next_due: Some(1_797_933_600), // 2026-12-22 10:00 UTC
+            last_calibrated: Some(1_795_348_800), // 2026-11-22
+            waiting: None,
+        };
+        let s = Status { schedule: Some(sc.clone()), ..st() };
+        let out = render_status_tz(&s, &chrono::Utc);
+        assert!(out.contains("Calibrate Last calibrated 2026-11-22 · next 2026-12-22 10:00 (every 30 days)\n"), "{out}");
+        let s = Status {
+            schedule: Some(ScheduleStatus { last_calibrated: None, waiting: Some("scheduled calibration waiting: charge full or discharge is running".into()), ..sc }),
+            ..st()
+        };
+        let out = render_status_tz(&s, &chrono::Utc);
+        assert!(out.contains("Calibrate next 2026-12-22 10:00 (every 30 days) · scheduled calibration waiting: charge full or discharge is running\n"), "{out}");
+        let s = Status { schedule: Some(ScheduleStatus { every_days: None, at: "10:00".into(), next_due: None, last_calibrated: None, waiting: None }), ..st() };
+        assert!(!render_status_tz(&s, &chrono::Utc).contains("Calibrate"));
     }
 
     #[test]

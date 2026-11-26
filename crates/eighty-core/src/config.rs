@@ -1,4 +1,5 @@
 //! User settings and the on-disk config file schema.
+use crate::schedule::CalibrationConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -98,6 +99,8 @@ pub struct Config {
     /// The macOS Charge Limit found before eighty first changed it.
     #[serde(default)]
     pub native_original: Option<u8>,
+    #[serde(default)]
+    pub calibration: CalibrationConfig,
 }
 
 #[cfg(test)]

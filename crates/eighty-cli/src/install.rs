@@ -2,7 +2,7 @@
 use crate::client::call;
 use crate::render::render_status;
 use anyhow::{anyhow, bail, Context, Result};
-use eighty_core::paths::{CONFIG_DIR, HELPER_INSTALL_PATH, LABEL, LOG_PATH, PLIST_PATH, SOCKET_PATH};
+use eighty_core::paths::{CALIBRATION_FILE, CONFIG_DIR, HELPER_INSTALL_PATH, LABEL, LOG_PATH, PLIST_PATH, SOCKET_PATH};
 use eighty_core::proto::{Request, Response};
 use std::fs;
 use std::os::unix::fs::{chown, PermissionsExt};
@@ -11,6 +11,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
+/// Files uninstall always removes (besides the helper binary, which may be kept).
+const UNINSTALL_FILES: &[&str] = &[PLIST_PATH, SOCKET_PATH, CALIBRATION_FILE];
 const HELPER_NAME: &str = "eighty-helper";
 
 /// The launchd plist for the helper daemon.
@@ -214,11 +216,12 @@ pub fn uninstall(purge: bool) -> Result<()> {
         eprintln!("{w}");
     }
     println!("removing files…");
-    remove_file(PLIST_PATH);
+    for f in UNINSTALL_FILES {
+        remove_file(f);
+    }
     if !outcome.keep_helper {
         remove_file(HELPER_INSTALL_PATH);
     }
-    remove_file(SOCKET_PATH);
     if purge {
         remove_dir(Path::new(CONFIG_DIR));
         if let Some(dir) = Path::new(LOG_PATH).parent() {
@@ -236,6 +239,11 @@ pub fn uninstall(purge: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninstall_paths_include_calibration_file() {
+        assert!(UNINSTALL_FILES.contains(&CALIBRATION_FILE));
+    }
 
     #[test]
     fn plist_has_label_program_and_keepalive() {

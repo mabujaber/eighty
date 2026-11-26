@@ -55,6 +55,7 @@ pub fn parse_snapshot(props: &HashMap<String, Prop>) -> Result<BatterySnapshot, 
             .map(|t| t as f32 / 100.0),
         cycle_count: int(props, "CycleCount").ok().map(|c| c as u32),
         update_time: int(props, "UpdateTime").ok().and_then(|t| u64::try_from(t).ok()),
+        fully_charged: boolean(props, "FullyCharged").ok(),
     })
 }
 
@@ -92,7 +93,8 @@ mod tests {
                 amperage_ma: -100,
                 temperature_c: Some(30.5),
                 cycle_count: Some(42),
-                update_time: None
+                update_time: None,
+                fully_charged: None
             }
         );
     }
@@ -157,6 +159,18 @@ mod tests {
     fn pack_temperature_none_without_readings() {
         assert_eq!(pack_temperature(&[]), None);
         assert_eq!(pack_temperature(&[props(&[("CycleCount", Prop::Int(1))])]), None);
+    }
+
+    #[test]
+    fn fully_charged_is_read() {
+        let mut p = base(100, 100, 0);
+        p.insert("FullyCharged".into(), Prop::Bool(true));
+        assert_eq!(parse_snapshot(&p).unwrap().fully_charged, Some(true));
+    }
+
+    #[test]
+    fn fully_charged_missing_is_none() {
+        assert_eq!(parse_snapshot(&base(100, 100, 0)).unwrap().fully_charged, None);
     }
 
     #[test]
