@@ -6,9 +6,11 @@ use eighty_core::calibration::{
     advance, waiting, CalInputs, CalOutcome, CalStep, CalWait, Calibration, CAL_GIVE_UP_SECS, CAL_LOW,
 };
 use eighty_core::config::{Config, Settings};
+use eighty_core::overheat::{apply_heat, heat_step, HeatInputs, HeatNote, HeatState, OverheatConfig};
 use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
 use eighty_core::proto::{
-    CalibrationStatus, DoctorReport, Health, NativeState, Request, Response, ScheduleStatus, Status,
+    CalibrationStatus, DoctorReport, Health, NativeState, OverheatStatus, Request, Response, ScheduleStatus,
+    Status,
 };
 use eighty_core::schedule::{next_due, CalibrationConfig};
 use eighty_core::{HARD_FLOOR, SETTLE_SECS, TICK_SECS, WATCHDOG_STRIKES};
@@ -149,6 +151,10 @@ pub struct Engine<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> {
     /// The user's limit `fault_restore_native` failed to set back and keeps retrying (so
     /// it logs only the first attempt).
     native_fault_restore: Option<u8>,
+    /// The overheat latch, saved to `heat.toml` on every change so it survives a restart.
+    heat: HeatState,
+    /// What the heat pause did to the last decision, shown in `status`; `None` in a fault.
+    heat_note: Option<HeatNote>,
 }
 
 impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y, N> {
@@ -161,6 +167,13 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         let (calibration, cal_warning) = store.load_calibration();
         if let Some(w) = &cal_warning {
             log(w);
+        }
+        let (heat, heat_warning) = store.load_heat();
+        if let Some(w) = &heat_warning {
+            log(w);
+        }
+        if heat.paused {
+            log("overheat: resuming the pause from before the restart");
         }
         let calibration = calibration.map(|mut c| {
             // Time while the helper wasn't running never counts.
@@ -214,6 +227,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             cal_notice: None,
             cal_schedule_wait: None,
             native_fault_restore: None,
+            heat,
+            heat_note: None,
         };
         e.bring_up();
         e.tick();
@@ -437,7 +452,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     settled: !self.reading_stale()
                         && (self.detection.mode != ControlMode::Native || self.native_reading_settled(s)),
                     faulted,
-                    heat_paused: false,
+                    // A fault already pauses the calibration (and nothing heat-related is
+                    // written then), so the 24 h give-up keeps counting.
+                    heat_paused: !faulted && self.heat.paused && s.external_connected,
                 };
                 let out = advance(&mut c, &i);
                 self.cal_wait = waiting(&c, &i);
@@ -705,6 +722,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 .chain(self.discharge_warning.iter().cloned())
                 .chain(self.restore_failures.iter().cloned())
                 .chain(self.cal_notice.iter().cloned())
+                .chain(self.overheat_testing_warning())
                 .collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             calibration: self.calibration.as_ref().map(|c| CalibrationStatus {
@@ -716,8 +734,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 native_limit: (self.detection.mode == ControlMode::Native).then(|| self.native_wanted()),
             }),
             schedule: self.schedule_status(),
-            temperature_c: None,
-            overheat: None,
+            temperature_c: s.and_then(|s| s.temperature_c),
+            overheat: Some(OverheatStatus { config: self.config.overheat, note: self.heat_note }),
         }
     }
 
@@ -769,8 +787,23 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             self.cal_notice = None;
         }
         match req {
-            Request::SetOverheat { .. } | Request::SetOverheatThresholds { .. } => {
-                return Response::Error("not implemented yet".into())
+            Request::SetOverheat { on } => {
+                let overheat = OverheatConfig { enabled: on, ..self.config.overheat };
+                if let Err(m) = overheat.validate() {
+                    return Response::Error(m);
+                }
+                if let Err(m) = self.apply_overheat(overheat) {
+                    return Response::Error(m);
+                }
+            }
+            Request::SetOverheatThresholds { pause_c, resume_c, testing } => {
+                let overheat = match self.config.overheat.with_thresholds(pause_c, resume_c, testing) {
+                    Ok(o) => o,
+                    Err(m) => return Response::Error(m),
+                };
+                if let Err(m) = self.apply_overheat(overheat) {
+                    return Response::Error(m);
+                }
             }
             Request::Status => return Response::Status(self.status()),
             Request::Doctor => {
@@ -925,6 +958,63 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             }
         }
         Response::Status(self.status())
+    }
+
+    /// Save new overheat settings, then apply them at once: the latch is stepped right
+    /// away (so `overheat off` ends a pause even in a fault), then a tick writes it.
+    fn apply_overheat(&mut self, overheat: OverheatConfig) -> Result<(), String> {
+        self.save(Config { overheat, ..self.config.clone() })?;
+        let snap = self.snapshot.clone();
+        self.step_heat(snap.as_ref());
+        self.tick();
+        Ok(())
+    }
+
+    /// Advance the overheat latch by one reading; log and save it when it changes.
+    fn step_heat(&mut self, snap: Option<&BatterySnapshot>) {
+        let cfg = self.config.overheat;
+        let temp = snap.and_then(|s| s.temperature_c);
+        let i = HeatInputs {
+            temperature_c: temp,
+            percent: snap.map_or(100, |s| s.percent),
+            external: snap.is_some_and(|s| s.external_connected),
+            charging: snap.is_some_and(|s| s.is_charging),
+            mode: self.detection.mode,
+        };
+        let prev = self.heat;
+        let next = heat_step(&cfg, prev, &i);
+        if next == prev {
+            return;
+        }
+        let msg = match (prev.paused, next.paused, temp) {
+            (false, true, Some(t)) => Some(format!("overheat: paused at {t:.1} °C")),
+            (true, false, _) if next.floor_hit => {
+                Some(format!("overheat: charge reached {}%, charging while hot", i.percent))
+            }
+            (true, false, _) if !cfg.enabled => Some("overheat: off".to_string()),
+            (true, false, Some(t)) => Some(format!("overheat: resumed at {t:.1} °C")),
+            (true, false, None) => Some("overheat: resumed: no battery temperature reported".to_string()),
+            _ => None,
+        };
+        if let Some(m) = msg {
+            log(&m);
+        }
+        self.heat = next;
+        if let Err(e) = self.store.save_heat(&next) {
+            log(&format!("overheat: couldn't save the pause state: {e}"));
+        }
+    }
+
+    /// Shown while the hidden test thresholds are in use, so they aren't left on by accident.
+    fn overheat_testing_warning(&self) -> Option<String> {
+        let o = &self.config.overheat;
+        o.testing.then(|| {
+            format!(
+                "overheat test thresholds in use (pause {} °C); run `eighty overheat {}` to return to normal",
+                o.pause_c,
+                OverheatConfig::default().pause_c
+            )
+        })
     }
 
     /// Persist `c` and adopt it; on failure nothing changes, so memory matches disk.
@@ -1194,6 +1284,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
     }
 
     fn tick(&mut self) {
+        // Set again only once this tick reaches a decision: a fault shows no heat note.
+        self.heat_note = None;
         if let Some((_, Some(until))) = self.native_notice {
             if (self.clock)() >= until {
                 self.native_notice = None;
@@ -1309,6 +1401,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             }
         }
 
+        // `snap.external_connected` is the latched value while our CHIE is on.
+        self.step_heat(Some(&snap));
         self.maybe_start_scheduled();
         self.advance_calibration(Some(&snap), false);
         let inputs = Inputs {
@@ -1319,11 +1413,20 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             native_lowest: self.native_lowest(),
         };
         let ov = self.calibration.as_ref().map(|c| Override::Calibrate(c.step)).unwrap_or(self.override_);
-        let mut d = decide(&self.settings(), ov, &inputs, &self.prev);
+        let d = decide(&self.settings(), ov, &inputs, &self.prev);
         if d.clear_override {
             log(&format!("override {:?} finished", self.override_));
             self.override_ = Override::None;
         }
+        // Before the sleep rule below, so a heat pause never discharges while asleep.
+        let (mut d, heat_note) = apply_heat(
+            d,
+            self.heat,
+            self.detection.mode,
+            inputs.external,
+            inputs.lid_closed,
+            self.control.can_discharge(),
+        );
         if self.sleeping && d.outputs.discharge {
             // Nothing watches the floor while asleep: stop discharging. Hold mode keeps
             // inhibit (a true hold); Native mode's Charge Limit holds on its own.
@@ -1383,6 +1486,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         self.prev = d.outputs;
         self.note_prev_change(old);
         self.set_activity(d.activity);
+        self.heat_note = heat_note;
     }
 
     /// Call after changing `prev` from `old`: remember when charging changed, and when
@@ -1517,7 +1621,9 @@ fn unavailable(e: NativeError) -> Health {
 mod tests {
     use super::*;
     use crate::system::FakeSystem;
-    use eighty_core::calibration::{CalStep, Calibration};
+    use eighty_core::calibration::{CalStep, CalWait, Calibration};
+    use eighty_core::overheat::{HeatNote, OverheatConfig};
+    use eighty_core::proto::OverheatStatus;
     use eighty_core::policy::{Activity, ControlMode};
     use eighty_core::proto::{Health, KeyState, NativeState};
     use eighty_hw::battery::fake::FakeBattery;
@@ -1604,6 +1710,9 @@ mod tests {
             s.external_connected = external;
             s.amperage_ma = amp;
             s.update_time = update_time;
+        }
+        fn set_temp(&self, t: Option<f32>) {
+            self.snap.borrow_mut().temperature_c = t;
         }
         fn engine(&self) -> TestEngine {
             let snap = self.snap.clone();
@@ -3165,5 +3274,152 @@ mod tests {
         let logged = crate::log::take_captured();
         assert!(logged.iter().any(|l| l == "calibration: charging hasn't started; still waiting"), "{logged:?}");
         assert!(!logged.iter().any(|l| l.contains("asking macOS again")), "{logged:?}");
+    }
+
+    // Plan 4 Task 5: overheat protection.
+
+    /// Native rig at 60% charging on the charger, paused for heat at 36 °C.
+    fn heat_paused_native() -> (Rig, TestEngine) {
+        let r = Rig::native(); r.set(60, true, true, 1500, Some(900));
+        let mut e = r.engine();
+        r.set_temp(Some(36.0)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        (r, e)
+    }
+    fn heat_note(e: &TestEngine) -> Option<HeatNote> {
+        e.status().overheat.expect("overheat status").note
+    }
+    #[test] fn engine_heat_native_sets_chie() {
+        let r = Rig::native(); r.set(60, true, true, 1500, Some(900));
+        let mut e = r.engine();
+        crate::log::take_captured();
+        r.set_temp(Some(36.0)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert_eq!(heat_note(&e), Some(HeatNote::Paused));
+        assert_eq!(e.status().temperature_c, Some(36.0));
+        let logged = crate::log::take_captured();
+        assert!(logged.iter().any(|l| l.starts_with("overheat: paused")), "{logged:?}");
+        assert!(r.store.load_heat().0.paused);
+    }
+    #[test] fn engine_heat_hold_inhibits() {
+        let r = Rig::hold(); r.set(60, true, true, 1500, Some(900)); r.set_temp(Some(36.0));
+        let e = r.engine();
+        assert_eq!((r.smc.value("CHTE"), r.smc.value("CHIE")), (Some(vec![1, 0, 0, 0]), Some(vec![0])));
+        assert_eq!(heat_note(&e), Some(HeatNote::Paused));
+    }
+    #[test] fn engine_heat_resumes() {
+        let (r, mut e) = heat_paused_native();
+        crate::log::take_captured();
+        r.set_temp(Some(32.0)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(heat_note(&e), None);
+        let logged = crate::log::take_captured();
+        assert!(logged.iter().any(|l| l.starts_with("overheat: resumed")), "{logged:?}");
+        assert!(!r.store.load_heat().0.paused);
+    }
+    #[test] fn engine_hot_at_limit_does_nothing() {
+        let r = Rig::native(); r.set(80, false, true, 0, Some(900)); r.set_temp(Some(40.0));
+        let mut e = r.engine(); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(heat_note(&e), None);
+    }
+    #[test] fn engine_heat_latch_survives_restart() {
+        let (r, e) = heat_paused_native();
+        drop(e);
+        r.set_temp(Some(33.0));
+        let mut e = r.engine(); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert!(r.store.load_heat().0.paused);
+    }
+    #[test] fn engine_heat_floor() {
+        let (r, mut e) = heat_paused_native();
+        r.set(20, false, true, -500, Some(960)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(heat_note(&e), Some(HeatNote::ChargingAtFloor));
+        r.set(25, true, true, 1500, Some(1_020)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        r.set(30, true, true, 1500, Some(1_080)); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+    }
+    #[test] fn engine_heat_not_while_asleep() {
+        let (r, mut e) = heat_paused_native();
+        sleep(&mut e);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+    }
+    #[test] fn engine_heat_pauses_charge_full() {
+        let r = Rig::native(); r.set(90, true, true, 1500, Some(900));
+        let mut e = r.engine();
+        assert!(matches!(req(&mut e, 501, Request::ChargeFull), Response::Status(_)));
+        assert_eq!(r.native.limit_now(), 100);
+        r.set_temp(Some(36.0)); e.handle(Event::Tick);
+        assert_eq!(r.native.limit_now(), 100);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert_eq!(e.status().override_, Override::FullCharge);
+    }
+    #[test] fn engine_heat_not_during_conflict() {
+        let (r, mut e) = heat_paused_native();
+        r.smc.insert("CHIE", "ui8 ", &[0x10], WriteMode::Accept); // another writer owns CHIE now
+        let n = r.smc.writes().len();
+        e.handle(Event::Tick); e.handle(Event::Tick);
+        assert!(matches!(e.status().health, Health::Conflict { .. }));
+        assert!(!r.smc.writes()[n..].iter().any(|(k, _)| k == "CHIE"), "{:?}", &r.smc.writes()[n..]);
+        assert_eq!(heat_note(&e), None);
+    }
+    #[test] fn engine_missing_temperature_ends_pause() {
+        let (r, mut e) = heat_paused_native();
+        r.set_temp(None); e.handle(Event::Tick);
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(e.status().temperature_c, None);
+    }
+    #[test] fn overheat_off_ends_pause() {
+        let (r, mut e) = heat_paused_native();
+        crate::log::take_captured();
+        assert!(matches!(req(&mut e, 501, Request::SetOverheat { on: false }), Response::Status(_)));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert!(!r.store.load().0.overheat.enabled);
+        assert!(!e.status().overheat.unwrap().config.enabled);
+        assert!(!r.store.load_heat().0.paused);
+        assert!(crate::log::take_captured().iter().any(|l| l == "overheat: off"));
+    }
+    #[test] fn overheat_thresholds_request_validates() {
+        let r = Rig::native(); r.set(60, true, true, 1500, Some(900));
+        let mut e = r.engine();
+        let bad = Request::SetOverheatThresholds { pause_c: 29, resume_c: None, testing: false };
+        assert!(matches!(req(&mut e, 501, bad), Response::Error(_)));
+        assert_eq!(r.store.load().0.overheat, OverheatConfig::default());
+        let ok = Request::SetOverheatThresholds { pause_c: 22, resume_c: Some(20), testing: true };
+        let Response::Status(s) = req(&mut e, 501, ok) else { panic!() };
+        let want = OverheatConfig { enabled: true, pause_c: 22, resume_c: 20, testing: true };
+        assert_eq!(r.store.load().0.overheat, want);
+        assert_eq!(s.overheat.unwrap().config, want);
+        let w = "overheat test thresholds in use (pause 22 °C); run `eighty overheat 35` to return to normal";
+        assert!(s.warnings.iter().any(|x| x == w), "{:?}", s.warnings);
+    }
+    #[test] fn overheat_thresholds_apply_at_once() {
+        let r = Rig::native(); r.set(60, true, true, 1500, Some(900)); r.set_temp(Some(30.0));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        req(&mut e, 501, Request::SetOverheatThresholds { pause_c: 25, resume_c: None, testing: true });
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+    }
+    #[test] fn calibration_hold_frozen_by_heat() {
+        let r = Rig::native(); r.set(100, true, true, 300, Some(900)); set_full(&r, Some(false));
+        save_cal_step(&r, CalStep::Hold);
+        r.set_temp(Some(36.0));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        let held = e.status().calibration.unwrap().held_secs;
+        let mut t = 1_000;
+        for _ in 0..120 {
+            t += 60; r.clock.set(t); r.set(100, true, true, 300, Some(t - 10)); e.handle(Event::Tick);
+        }
+        let c = e.status().calibration.expect("calibration still running");
+        assert_eq!((c.step, c.held_secs, c.waiting), (CalStep::Hold, held, Some(CalWait::Heat)));
+    }
+    #[test] fn heat_status_without_reading_is_present() {
+        let r = Rig::hold(); r.set(60, true, true, 1500, Some(900));
+        let s = r.engine().status();
+        assert_eq!(s.temperature_c, None);
+        assert_eq!(s.overheat, Some(OverheatStatus { config: OverheatConfig::default(), note: None }));
     }
 }

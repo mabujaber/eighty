@@ -90,16 +90,22 @@ impl Store {
         self.dir.join("heat.toml")
     }
 
-    /// Missing: default. Unreadable or invalid: the file is deleted and the default returned.
-    pub fn load_heat(&self) -> HeatState {
+    /// Missing: default, no warning. Unreadable: default plus a warning. Invalid: the
+    /// file is deleted, and the default plus a warning returned.
+    pub fn load_heat(&self) -> (HeatState, Option<String>) {
         let path = self.heat_file();
-        match fs::read_to_string(&path).map(|t| toml::from_str::<HeatState>(&t)) {
-            Ok(Ok(h)) => h,
-            Ok(Err(_)) => {
+        let warn = |reason: &str| Some(format!("overheat: ignoring {}: {}; pause state reset", path.display(), reason.trim()));
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return (HeatState::default(), None),
+            Err(e) => return (HeatState::default(), warn(&e.to_string())),
+        };
+        match toml::from_str::<HeatState>(&text) {
+            Ok(h) => (h, None),
+            Err(e) => {
                 let _ = fs::remove_file(&path);
-                HeatState::default()
+                (HeatState::default(), warn(&e.to_string()))
             }
-            Err(_) => HeatState::default(),
         }
     }
 
@@ -151,17 +157,19 @@ mod tests {
     fn heat_state_roundtrip() {
         let d = tempfile::tempdir().unwrap();
         let st = Store::new(d.path().join("eighty"));
-        assert_eq!(st.load_heat(), HeatState::default());
+        assert_eq!(st.load_heat(), (HeatState::default(), None));
         let h = HeatState { paused: true, floor_hit: false };
         st.save_heat(&h).unwrap();
-        assert_eq!(st.load_heat(), h);
+        assert_eq!(st.load_heat(), (h, None));
     }
     #[test]
     fn invalid_heat_file_is_default() {
         let d = tempfile::tempdir().unwrap();
         let st = Store::new(d.path().into());
         std::fs::write(d.path().join("heat.toml"), "garbage = [").unwrap();
-        assert_eq!(st.load_heat(), HeatState::default());
+        let (h, w) = st.load_heat();
+        assert_eq!(h, HeatState::default());
+        assert!(w.unwrap().starts_with("overheat: ignoring"));
         assert!(!d.path().join("heat.toml").exists());
     }
     #[test]
