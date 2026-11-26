@@ -8,8 +8,9 @@ pub const HEAT_FLOOR: u8 = 20;
 pub const HEAT_REARM: u8 = 30;
 /// Whether a heat pause may force discharge (CHIE) in native mode with the lid closed.
 /// Set by the owner's lid-closed CHIE soak check (docs/testing/plan4-acceptance.md,
-/// "Lid-closed CHIE check"). `false` is the safe rule: no forced discharge with the lid closed.
-pub const HEAT_PAUSE_LID_CLOSED: bool = false;
+/// "Lid-closed CHIE check"). On the M5 Pro / macOS 27.2.1 with external displays (2026-11-26),
+/// `CHIE=08` with the lid closed kept "Using AC" and caused no sleep beyond normal idle sleep.
+pub const HEAT_PAUSE_LID_CLOSED: bool = true;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(default)]

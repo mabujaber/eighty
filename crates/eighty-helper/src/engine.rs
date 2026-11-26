@@ -1631,7 +1631,7 @@ mod tests {
     use super::*;
     use crate::system::FakeSystem;
     use eighty_core::calibration::{CalStep, CalWait, Calibration};
-    use eighty_core::overheat::{HeatNote, OverheatConfig};
+    use eighty_core::overheat::{HeatNote, OverheatConfig, HEAT_PAUSE_LID_CLOSED};
     use eighty_core::proto::OverheatStatus;
     use eighty_core::policy::{Activity, ControlMode};
     use eighty_core::proto::{Health, KeyState, NativeState};
@@ -3437,18 +3437,24 @@ mod tests {
         assert_ne!(c.waiting, Some(CalWait::Heat));
         (held, c.held_secs)
     }
-    #[test] fn calibration_hold_counts_when_lid_closed_blocks_heat_pause() {
+    #[test] fn heat_pause_applies_with_lid_closed() {
+        // HEAT_PAUSE_LID_CLOSED: the lid-closed soak showed CHIE=08 is safe in clamshell.
+        const { assert!(HEAT_PAUSE_LID_CLOSED) };
         let r = Rig::native(); r.set(100, true, true, 300, Some(900)); set_full(&r, Some(false));
         r.sys.0.borrow_mut().lid_closed = true;
         save_cal_step(&r, CalStep::Hold);
         r.set_temp(Some(36.0));
         let mut e = r.engine();
-        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
-        assert_eq!(heat_note(&e), Some(HeatNote::LidClosed));
-        let (before, after) = hot_hold_ticks(&r, &mut e);
-        assert!(after >= before + 29 * 60, "held_secs {before} -> {after}");
-        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
-        assert_eq!(heat_note(&e), Some(HeatNote::LidClosed));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
+        assert_eq!(heat_note(&e), Some(HeatNote::Paused));
+        let held = e.status().calibration.unwrap().held_secs;
+        let mut t = 1_000;
+        for _ in 0..30 {
+            t += 60; r.clock.set(t); r.set(100, false, true, -300, Some(t - 10)); e.handle(Event::Tick);
+        }
+        let c = e.status().calibration.expect("calibration still running");
+        assert_eq!((c.held_secs, c.waiting), (held, Some(CalWait::Heat)));
+        assert_eq!(r.smc.value("CHIE"), Some(vec![8]));
     }
     #[test] fn calibration_hold_counts_when_native_lacks_chie() {
         let s = FakeSmc::new();

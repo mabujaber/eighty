@@ -20,11 +20,27 @@ Each line shows time (UTC), charge, ExternalConnected, amperage, `CHIE` and lid 
 
 | Date | Mac | Result | Decision |
 |---|---|---|---|
-| | | | |
+| 2026-11-26 | M5 Pro (Mac17,8), macOS 27.2.1, 2 LG displays, lid closed | PASS (the one gap was normal idle sleep, not CHIE) | `HEAT_PAUSE_LID_CLOSED = true` |
 
 ```
-(paste output here)
+09:04:18Z charge=87% external=Yes amperage=-104mA CHIE=08 lid=closed
+09:04:49Z charge=87% external=Yes amperage=-379mA CHIE=08 lid=closed
+09:05:19Z charge=87% external=Yes amperage=-379mA CHIE=08 lid=closed
+09:05:49Z charge=87% external=Yes amperage=-317mA CHIE=08 lid=closed
+09:06:19Z charge=87% external=Yes amperage=-317mA CHIE=08 lid=closed
+09:06:49Z charge=87% external=Yes amperage=-322mA CHIE=08 lid=closed
+09:07:19Z charge=87% external=Yes amperage=-322mA CHIE=08 lid=closed
+09:07:49Z charge=87% external=Yes amperage=-302mA CHIE=08 lid=closed
+09:10:51Z charge=87% external=Yes amperage=-1654mA CHIE=08 lid=closed
+09:11:21Z charge=87% external=Yes amperage=-1654mA CHIE=08 lid=closed
+09:11:49Z charge=87% external=Yes amperage=-463mA CHIE=00 lid=closed
 ```
+
+Notes:
+- The 3-minute gap (09:07:49 → 09:10:51Z) was macOS **idle sleep**. In `pmset -g log`: display off at 12:07:25 local (no input since 12:03:31), then `Entering Sleep state due to 'Idle Sleep' … Using AC (Charge:87%)` at 12:08:06, then a keyboard wake at 12:10:40. The same idle sleep happened at 11:52 and 12:02, before the test, with no `CHIE`. AC settings: `displaysleep 10`, `sleep 1`.
+- macOS reported "Using AC" and `external=Yes` throughout with `CHIE=08`. The adapter was never seen as gone, so `CHIE` didn't trigger a sleep.
+- `CHIE` stayed `08` across the sleep and was restored to `00` at the end.
+- Limitation: `eighty uninstall` had put the Charge Limit back to 80% (the value before eighty), so at 87% macOS was already draining. The negative amperage is therefore not proof that `CHIE` stopped charging. Checks 2 and 7 below test the pause itself.
 
 ## Checklist
 
@@ -52,7 +68,7 @@ Task 7 of Plan 4. Design: [overheat design](../superpowers/specs/2026-11-26-eigh
 | 4 | At the limit and not charging (charge at the limit, `not charging`), run a testing pause as in check 2 | | No pause starts and there is no drain: `CHIE=00`, `Battery` stays `not charging`, no `overheat: paused` line (a pause needs the battery to report charging). Then `eighty overheat 35` |
 | 5 | Restart during a pause. Start a pause as in check 2, then `sudo launchctl kickstart -k system/io.github.mabujaber.eighty.helper` | | After the restart the log has `eighty-helper <version> starting` and `overheat: resuming the pause from before the restart`, and the State line still reads `Paused: battery hot (...)`. `heat.toml` was there across the restart. `CHIE=08` again within about 2 min. Then `eighty overheat 35` |
 | 6 | Sleep during a pause. Start a pause, then close the lid (or `pmset sleepnow`) and wake the Mac | | Log has `sleep` and `wake`. After wake the State line reads `Paused: battery hot (...)` again and `CHIE=08`. No `CHIE` write while asleep. Then `eighty overheat 35` |
-| 7 | Lid closed with external displays during a testing pause. Start a pause as in check 2, then close the lid with the displays connected | | Depends on `HEAT_PAUSE_LID_CLOSED` (currently `false`). `true`: the pause stays on, `CHIE=08`, the displays stay on and the Mac stays awake. `false`: the pause is not held, `CHIE=00`, charging carries on, and the State line reads `Battery hot (36.1 °C), can't pause charging with the lid closed` |
+| 7 | Lid closed with external displays during a testing pause. Start a pause as in check 2, then close the lid with the displays connected | | Depends on `HEAT_PAUSE_LID_CLOSED` (now `true`, set 2026-11-26). `true`: the pause stays on, `CHIE=08`, the displays stay on and the Mac stays awake. `false`: the pause is not held, `CHIE=00`, charging carries on, and the State line reads `Battery hot (36.1 °C), can't pause charging with the lid closed` |
 | 8 | `eighty overheat off` during a pause | | The pause ends at once: `CHIE=00`, State line no longer says `Paused`, doctor shows `Overheat  off`. Then `eighty overheat on` |
 | 9 | `sudo eighty uninstall` during a pause | | `CHIE=00`, macOS's Charge Limit is back to what it was before eighty, `heat.toml` is gone (`ls "/Library/Application Support/eighty/"`) |
 
