@@ -56,7 +56,7 @@ Task 7 of Plan 4. Design: [overheat design](../superpowers/specs/2026-11-26-eigh
 
 | Mac | macOS | Mode | Status |
 |---|---|---|---|
-| M5 Pro (Mac17,8) | | native | |
+| M5 Pro (Mac17,8) | 27.2.1 | native | PASS 2026-11-26 (after the lid-closed fix) |
 | M2 Max (Mac14,6) | | native | |
 
 ### Setup
@@ -70,23 +70,37 @@ Task 7 of Plan 4. Design: [overheat design](../superpowers/specs/2026-11-26-eigh
 
 | # | Check | Result | Evidence |
 |---|---|---|---|
-| 1 | `eighty status` and `eighty doctor` | | Status has a `Temp` line such as `Temp      31.4 °C` (right under `Battery`). Doctor has `Overheat  on · pause 35 °C · resume 32 °C`. If the Mac reports no temperature, status shows `Temp      n/a` and doctor warns `no battery temperature reported; overheat protection is inactive on this Mac` |
-| 2 | Testing pause. On AC with the battery charging below the limit, run `eighty overheat <current> <current-2> --testing` (current = the whole °C in `Temp`, rounded down, e.g. `31 29` at 31.4 °C) | | Within about 2 min, the State line reads `Paused: battery hot (36.1 °C), resumes at N °C` (with the real values). `Battery` shows `discharging N mA`. `CHIE=08`. Log has `overheat: paused`. Status warns `overheat test thresholds in use (pause 31 °C); run `eighty overheat 35` to return to normal` |
-| 3 | Resume. Run `eighty overheat 35` | | Within one tick, `CHIE=00` and charging resumes (`Battery` shows `charging N mA`). The `Paused` State line is gone and doctor shows the default `pause 35 °C · resume 32 °C` again. Log has `overheat: resumed`. The test-thresholds warning is gone. Note: with resume 32, the pause ends only if the battery is at or below 32 °C. If it is warmer, use `eighty overheat off` to end it (or `eighty overheat 35 33`) |
-| 4 | At the limit and not charging (charge at the limit, `not charging`), run a testing pause as in check 2 | | No pause starts and there is no drain: `CHIE=00`, `Battery` stays `not charging`, no `overheat: paused` line (a pause needs the battery to report charging). Then `eighty overheat 35` |
-| 5 | Restart during a pause. Start a pause as in check 2, then `sudo launchctl kickstart -k system/io.github.mabujaber.eighty.helper` | | After the restart the log has `eighty-helper <version> starting` and `overheat: resuming the pause from before the restart`, and the State line still reads `Paused: battery hot (...)`. `heat.toml` was there across the restart. `CHIE=08` again within about 2 min. Then `eighty overheat 35` |
-| 6 | Sleep during a pause. Start a pause, then close the lid (or `pmset sleepnow`) and wake the Mac | | Log has `sleep` and `wake`. After wake the State line reads `Paused: battery hot (...)` again and `CHIE=08`. No `CHIE` write while asleep. Then `eighty overheat 35` |
-| 7 | Lid closed with external displays during a testing pause. Start a pause as in check 2, then close the lid with the displays connected | | Depends on `HEAT_PAUSE_LID_CLOSED` (`false`, see the correction above). `true`: the pause stays on, `CHIE=08`, the displays stay on and the Mac stays awake. `false`: the pause is not held, `CHIE=00`, charging carries on, and the State line reads `Battery hot (36.1 °C), can't pause charging with the lid closed` |
-| 8 | `eighty overheat off` during a pause | | The pause ends at once: `CHIE=00`, State line no longer says `Paused`, doctor shows `Overheat  off`. Then `eighty overheat on` |
-| 9 | `sudo eighty uninstall` during a pause | | `CHIE=00`, macOS's Charge Limit is back to what it was before eighty, `heat.toml` is gone (`ls "/Library/Application Support/eighty/"`) |
+| 1 | `eighty status` and `eighty doctor` | PASS | Status has a `Temp` line such as `Temp      31.4 °C` (right under `Battery`). Doctor has `Overheat  on · pause 35 °C · resume 32 °C`. If the Mac reports no temperature, status shows `Temp      n/a` and doctor warns `no battery temperature reported; overheat protection is inactive on this Mac` |
+| 2 | Testing pause. On AC with the battery charging below the limit, run `eighty overheat <current> <current-2> --testing` (current = the whole °C in `Temp`, rounded down, e.g. `31 29` at 31.4 °C) | PASS | Within about 2 min, the State line reads `Paused: battery hot (36.1 °C), resumes at N °C` (with the real values). `Battery` shows `discharging N mA`. `CHIE=08`. Log has `overheat: paused`. Status warns `overheat test thresholds in use (pause 31 °C); run `eighty overheat 35` to return to normal` |
+| 3 | Resume. Run `eighty overheat 35` | PASS | Within one tick, `CHIE=00` and charging resumes (`Battery` shows `charging N mA`). The `Paused` State line is gone and doctor shows the default `pause 35 °C · resume 32 °C` again. Log has `overheat: resumed`. The test-thresholds warning is gone. Note: with resume 32, the pause ends only if the battery is at or below 32 °C. If it is warmer, use `eighty overheat off` to end it (or `eighty overheat 35 33`) |
+| 4 | At the limit and not charging (charge at the limit, `not charging`), run a testing pause as in check 2 | PASS | No pause starts and there is no drain: `CHIE=00`, `Battery` stays `not charging`, no `overheat: paused` line (a pause needs the battery to report charging). Then `eighty overheat 35` |
+| 5 | Restart during a pause. Start a pause as in check 2, then `sudo launchctl kickstart -k system/io.github.mabujaber.eighty.helper` | PASS | After the restart the log has `eighty-helper <version> starting` and `overheat: resuming the pause from before the restart`, and the State line still reads `Paused: battery hot (...)`. `heat.toml` was there across the restart. `CHIE=08` again within about 2 min. Then `eighty overheat 35` |
+| 6 | Sleep during a pause. Start a pause, then close the lid (or `pmset sleepnow`) and wake the Mac | PASS | Log has `sleep` and `wake`. After wake the State line reads `Paused: battery hot (...)` again and `CHIE=08`. No `CHIE` write while asleep. Then `eighty overheat 35` |
+| 7 | Lid closed with external displays during a testing pause. Start a pause as in check 2, then close the lid with the displays connected | PASS (after fix; FAIL with `true`) | Depends on `HEAT_PAUSE_LID_CLOSED` (`false`, see the correction above). `true`: the pause stays on, `CHIE=08`, the displays stay on and the Mac stays awake. `false`: the pause is not held, `CHIE=00`, charging carries on, and the State line reads `Battery hot (36.1 °C), can't pause charging with the lid closed` |
+| 8 | `eighty overheat off` during a pause | PASS | The pause ends at once: `CHIE=00`, State line no longer says `Paused`, doctor shows `Overheat  off`. Then `eighty overheat on` |
+| 9 | `sudo eighty uninstall` during a pause | PASS | `CHIE=00`, macOS's Charge Limit is back to what it was before eighty, `heat.toml` is gone (`ls "/Library/Application Support/eighty/"`) |
 
 ### Extra checks (do if time allows)
 
 | Check | Result | Evidence |
 |---|---|---|
-| Native floor: start a testing pause at a charge a few points above 20%, let it drain | | At 20% the pause ends. State line reads `Battery hot, charging anyway: charge reached 20%`. No new pause until the charge reaches 30% or the temperature is at or below resume |
-| `eighty overheat 50`, `eighty overheat 38 37` | | Refused, with the allowed range. Settings unchanged |
+| Native floor: start a testing pause at a charge a few points above 20%, let it drain | not run (M5 was at 85–97%; covered by unit and engine tests) | At 20% the pause ends. State line reads `Battery hot, charging anyway: charge reached 20%`. No new pause until the charge reaches 30% or the temperature is at or below resume |
+| `eighty overheat 50`, `eighty overheat 38 37` | not run on hardware (covered by tests) | Refused, with the allowed range. Settings unchanged |
 
 ### Results
 
 Record each Mac's result here, with the build commit, the date and anything that needed a fix.
+
+**M5 Pro (Mac17,8), macOS 27.2.1, 2026-11-26, builds 7f8e06b then 1007009. Checks run 09:34–10:19Z by Claude from the CLI; the owner did sudo and lid steps.**
+
+- 1: `Temp      26.8 °C`; doctor `Overheat  on · pause 35 °C · resume 32 °C`.
+- 2: `charge full` made the battery charge (85%, +1826 mA), then `eighty overheat 26 24 --testing` at 26.7 °C. It went straight to `Paused: battery hot (26.7 °C), resumes at 24 °C` with the testing warning, and was discharging within about 10 s (raw `Amperage` about −2.7 A, `IsCharging=0`). Log: `overheat: paused at 26.7 °C`. JSON `overheat.note = paused`. `charge full` stayed in place, so heat won over it. Raw IORegistry showed `ExternalConnected = No` while `CHIE` was on, and eighty's latch kept "on AC".
+- 3: `eighty overheat 35` → `overheat: resumed at 26.9 °C`, the warning disappeared, and the battery was charging again.
+- 4: under `charge auto` at 85% (macOS draining toward 80%, not charging), `eighty overheat 27 25 --testing` at 27.4 °C → no pause over 2 ticks; State stayed `Discharging to 80%`.
+- 5: `launchctl kickstart -k` during a pause → `overheat: resuming the pause from before the restart`.
+- 6: during the build with lid-closed protection on, the helper log shows `sleep:` → `discharge=false` and `wake:` → `discharge=true` about 10 times.
+- 7: with `HEAT_PAUSE_LID_CLOSED = true` (7f8e06b), every pause with the lid closed caused `Clamshell Sleep` (see the correction above). With `false` (1007009), closing the lid during a pause: `CHIE` went off, the State line read `Battery hot (28.3 °C), can't pause charging with the lid closed`, the battery kept charging, and there was no sleep (only the normal display switch at lid close).
+- 8: `eighty overheat off` during a pause → `overheat: off`, then `discharge=false` in the same second; doctor `Overheat  off`.
+- 9: `sudo eighty uninstall` during a pause → `CHIE=00`, Charge Limit back to 80% (the value before eighty), `heat.toml` gone, helper gone.
+- Note: `config.toml` still holds the testing thresholds (pause 28, `testing = true`) after uninstall without `--purge`. Run `eighty overheat 35` after the next install.
+
