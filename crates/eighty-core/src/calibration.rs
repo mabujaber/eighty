@@ -38,6 +38,7 @@ pub enum CalWait {
     PlugIn,
     LidClosed,
     Fault,
+    Heat,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -88,6 +89,8 @@ pub struct CalInputs {
     pub lid_closed: bool,
     pub settled: bool,
     pub faulted: bool,
+    /// A heat pause is holding charging off: not the user's or the calibration's doing.
+    pub heat_paused: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -109,6 +112,15 @@ fn is_full(i: &CalInputs) -> bool {
 }
 
 pub fn advance(c: &mut Calibration, i: &CalInputs) -> CalOutcome {
+    // A heat pause stands the clocks still: the time neither counts toward the
+    // hold nor toward the give-up, and no kick is attempted.
+    if i.heat_paused && c.step != CalStep::Discharge {
+        if let Some((t, _)) = c.last_tick {
+            c.last_progress_at += i.now.saturating_sub(t);
+        }
+        c.last_tick = Some((i.now, i.external));
+        return CalOutcome::Continue;
+    }
     // Hold clock: only AC-to-AC time between consecutive ticks counts.
     if c.step == CalStep::Hold && i.external && !i.faulted {
         if let Some((t, true)) = c.last_tick {
@@ -170,6 +182,7 @@ pub fn advance(c: &mut Calibration, i: &CalInputs) -> CalOutcome {
             Some(CalWait::PlugIn) => ": waiting for the charger",
             Some(CalWait::LidClosed) => ": lid closed",
             Some(CalWait::Fault) => ": eighty is in a fault",
+            Some(CalWait::Heat) => ": waiting for the battery to cool",
             None => "",
         };
         out = CalOutcome::Abandoned(format!(
@@ -185,6 +198,8 @@ pub fn advance(c: &mut Calibration, i: &CalInputs) -> CalOutcome {
 pub fn waiting(c: &Calibration, i: &CalInputs) -> Option<CalWait> {
     if i.faulted {
         Some(CalWait::Fault)
+    } else if i.heat_paused && matches!(c.step, CalStep::Charge | CalStep::Hold) {
+        Some(CalWait::Heat)
     } else if !i.external && matches!(c.step, CalStep::Charge | CalStep::Hold) {
         Some(CalWait::PlugIn)
     } else if i.lid_closed && i.external && c.step == CalStep::Discharge {
@@ -208,6 +223,7 @@ mod tests {
             lid_closed: false,
             settled: true,
             faulted: false,
+            heat_paused: false,
         }
     }
 
@@ -338,6 +354,51 @@ mod tests {
             advance(&mut c, &i),
             CalOutcome::Abandoned("no progress in step 1/4 for 24 h: eighty is in a fault".into())
         );
+    }
+
+    #[test]
+    fn heat_pause_freezes_hold_and_give_up() {
+        let t = 10_000;
+        let mut c = in_step(CalStep::Hold, t, 100);
+        c.held_secs = 600;
+        c.last_tick = Some((t, true));
+        let before = c.last_progress_at;
+        let mut i = at(t + 90_000, 100, true);
+        i.heat_paused = true;
+        assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
+        assert_eq!(c.held_secs, 600);
+        assert_eq!(c.last_progress_at, before + 90_000);
+    }
+
+    #[test]
+    fn heat_pause_no_kick_in_charge_step() {
+        let mut c = in_step(CalStep::Charge, 1000, 60);
+        c.last_tick = Some((1000, true));
+        let before = c.last_progress_at;
+        let mut i = at(1600, 60, true);
+        i.heat_paused = true;
+        assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
+        assert_eq!(c.last_kick_at, None);
+        assert_eq!(c.last_progress_at, before + 600);
+    }
+
+    #[test]
+    fn heat_pause_in_discharge_step_is_ignored() {
+        let mut c = Calibration::new(1000, 60, false);
+        let mut i = at(1060, 50, false);
+        i.heat_paused = true;
+        assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
+        assert_eq!(c.best_percent, 50);
+        assert_eq!(c.last_progress_at, 1060);
+    }
+
+    #[test]
+    fn waiting_reports_heat() {
+        let mut i = at(1060, 60, true);
+        i.heat_paused = true;
+        assert_eq!(waiting(&in_step(CalStep::Charge, 1000, 60), &i), Some(CalWait::Heat));
+        assert_eq!(waiting(&in_step(CalStep::Hold, 1000, 100), &i), Some(CalWait::Heat));
+        assert_eq!(waiting(&in_step(CalStep::Discharge, 1000, 60), &i), None);
     }
 
     #[test]

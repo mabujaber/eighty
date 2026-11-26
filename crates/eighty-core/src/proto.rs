@@ -1,6 +1,7 @@
 //! IPC protocol between the CLI and the helper: one JSON message per line.
 use crate::calibration::{CalStep, CalWait};
 use crate::config::Settings;
+use crate::overheat::{HeatNote, OverheatConfig};
 use crate::policy::{Activity, ControlMode, Override};
 use eighty_hw::machine::MachineInfo;
 use serde::de::DeserializeOwned;
@@ -25,6 +26,9 @@ pub enum Request {
     CalibrateCancel,
     /// `every_days: None` turns the schedule off.
     SetCalibrationSchedule { every_days: Option<u16>, at: Option<String> },
+    SetOverheat { on: bool },
+    /// `resume_c: None` derives the resume temperature from `pause_c`.
+    SetOverheatThresholds { pause_c: u8, resume_c: Option<u8>, testing: bool },
 }
 
 impl Request {
@@ -101,6 +105,16 @@ pub struct Status {
     pub calibration: Option<CalibrationStatus>,
     #[serde(default)]
     pub schedule: Option<ScheduleStatus>,
+    #[serde(default)]
+    pub temperature_c: Option<f32>,
+    #[serde(default)]
+    pub overheat: Option<OverheatStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct OverheatStatus {
+    pub config: OverheatConfig,
+    pub note: Option<HeatNote>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -215,13 +229,33 @@ mod tests {
             percent: 80, external: true, charging: false, amperage_ma: 0, amperage_stale: false,
             mode: ControlMode::Hold, activity: Activity::Holding, health: Health::Ok,
             settings: Settings::default(), override_: Override::None, light_supported: true,
-            warnings: vec![], version: "0.1.0".into(), calibration: None, schedule: None,
+            warnings: vec![], version: "0.1.0".into(), calibration: None, schedule: None, temperature_c: None, overheat: None,
         };
         let mut v = serde_json::to_value(&s).unwrap();
         v.as_object_mut().unwrap().remove("calibration");
         v.as_object_mut().unwrap().remove("schedule");
         let back: Status = serde_json::from_value(v).unwrap();
         assert!(back.calibration.is_none() && back.schedule.is_none());
+    }
+    #[test]
+    fn status_without_overheat_fields_parses() {
+        let s = Status {
+            percent: 80, external: true, charging: false, amperage_ma: 0, amperage_stale: false,
+            mode: ControlMode::Hold, activity: Activity::Holding, health: Health::Ok,
+            settings: Settings::default(), override_: Override::None, light_supported: true,
+            warnings: vec![], version: "0.1.0".into(), calibration: None, schedule: None,
+            temperature_c: Some(31.4), overheat: None,
+        };
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("temperature_c");
+        v.as_object_mut().unwrap().remove("overheat");
+        let back: Status = serde_json::from_value(v).unwrap();
+        assert!(back.temperature_c.is_none() && back.overheat.is_none());
+    }
+    #[test]
+    fn overheat_requests_are_mutating() {
+        assert!(Request::SetOverheat { on: true }.is_mutating());
+        assert!(Request::SetOverheatThresholds { pause_c: 35, resume_c: None, testing: false }.is_mutating());
     }
     #[test]
     fn calibration_requests_are_mutating() {
@@ -247,6 +281,8 @@ mod tests {
             version: "0.1.0".into(),
             calibration: None,
             schedule: None,
+            temperature_c: None,
+            overheat: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["override"], serde_json::json!({ "DischargeTo": 50 }));

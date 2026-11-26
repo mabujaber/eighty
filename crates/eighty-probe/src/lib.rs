@@ -4,3 +4,4 @@ pub mod reads;
 pub mod guard;
 pub mod writes;
 pub mod report;
+pub mod soak;

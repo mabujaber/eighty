@@ -1,6 +1,7 @@
 //! Plain-text rendering of status and doctor output.
 use chrono::{Local, TimeZone};
 use eighty_core::calibration::{CalStep, CalWait, CAL_HOLD_SECS, CAL_LOW};
+use eighty_core::overheat::{HeatNote, HEAT_FLOOR};
 use eighty_core::policy::{Activity, ControlMode, Override};
 use eighty_core::proto::{CalibrationStatus, DoctorReport, KeyState, NativeState, ScheduleStatus, Status};
 use std::fmt::Display;
@@ -33,6 +34,7 @@ fn calibration_text(s: &Status, c: &CalibrationStatus) -> String {
             None => "paused: lid closed".to_string(),
         },
         Some(CalWait::Fault) => "paused: eighty isn't limiting (see above)".to_string(),
+        Some(CalWait::Heat) => "waiting for the battery to cool".to_string(),
         None => match c.step {
             CalStep::Discharge => format!("discharging to {CAL_LOW}% (now {}%)", s.percent),
             CalStep::Charge => format!("charging to 100% (now {}%)", s.percent),
@@ -42,6 +44,17 @@ fn calibration_text(s: &Status, c: &CalibrationStatus) -> String {
         },
     };
     format!("Calibrating: step {n}/4, {tail}")
+}
+
+/// The heat note's State text.
+fn heat_text(note: HeatNote, s: &Status, resume_c: u8) -> String {
+    let t = s.temperature_c.map_or("n/a".to_string(), |t| format!("{t:.1}"));
+    match note {
+        HeatNote::Paused => format!("Paused: battery hot ({t} °C), resumes at {resume_c} °C"),
+        HeatNote::LidClosed => format!("Battery hot ({t} °C), can't pause charging with the lid closed"),
+        HeatNote::Unable => format!("Battery hot ({t} °C), can't pause charging on this Mac"),
+        HeatNote::ChargingAtFloor => format!("Battery hot, charging anyway: charge reached {HEAT_FLOOR}%"),
+    }
 }
 
 fn schedule_text<Tz: TimeZone>(sc: &ScheduleStatus, tz: &Tz) -> Option<String>
@@ -134,6 +147,10 @@ where
     };
     let power = if s.external { "on AC" } else { "on battery" };
     line(&mut out, "Battery", &format!("{}% · {} · {}", s.percent, charging_part, power));
+    if s.overheat.is_some() {
+        let t = s.temperature_c.map_or("n/a".to_string(), |t| format!("{t:.1} °C"));
+        line(&mut out, "Temp", &t);
+    }
     let limit_text = match s.mode {
         // `charge full` sets macOS's limit to 100% until unplugged; the setting stays.
         ControlMode::Native if s.override_ == Override::FullCharge => {
@@ -146,9 +163,15 @@ where
         }
     };
     line(&mut out, "Limit", &limit_text);
-    match &s.calibration {
-        Some(c) => line(&mut out, "State", &calibration_text(s, c)),
-        None => line(&mut out, "State", &activity_text(s)),
+    let heat = s.overheat.as_ref().and_then(|o| o.note.map(|n| (n, o.config.resume_c)));
+    match (&s.calibration, heat) {
+        (Some(c), Some((HeatNote::Paused, _))) => {
+            let t = s.temperature_c.map_or("n/a".to_string(), |t| format!("{t:.1}"));
+            line(&mut out, "State", &format!("{}, paused: battery hot ({t} °C)", calibration_text(s, c)));
+        }
+        (Some(c), _) => line(&mut out, "State", &calibration_text(s, c)),
+        (None, Some((n, resume))) => line(&mut out, "State", &heat_text(n, s, resume)),
+        (None, None) => line(&mut out, "State", &activity_text(s)),
     }
     let light = match (s.mode, s.light_supported) {
         (ControlMode::Native, _) => "macOS",
@@ -202,9 +225,21 @@ pub fn render_doctor(d: &DoctorReport) -> String {
     if let Some(n) = &d.native {
         line(&mut out, "Native", &native_text(n));
     }
+    if let Some(o) = &d.status.overheat {
+        let c = &o.config;
+        let text = if c.enabled {
+            format!("on · pause {} °C · resume {} °C", c.pause_c, c.resume_c)
+        } else {
+            "off".to_string()
+        };
+        line(&mut out, "Overheat", &text);
+    }
     line(&mut out, "Health", &health_text(&d.status));
     out.push('\n');
     out.push_str(&render_status(&d.status));
+    if d.status.overheat.as_ref().is_some_and(|o| o.config.enabled) && d.status.temperature_c.is_none() {
+        line(&mut out, "Warning", "no battery temperature reported; overheat protection is inactive on this Mac");
+    }
     out
 }
 
@@ -212,7 +247,9 @@ pub fn render_doctor(d: &DoctorReport) -> String {
 mod tests {
     use super::*;
     use eighty_core::policy::{Activity, ControlMode, Override};
-    use eighty_core::proto::{DoctorReport, Health, KeyState, NativeState, Status};
+    use eighty_core::overheat::{OverheatConfig, HEAT_FLOOR};
+    use eighty_core::proto::{DoctorReport, Health, KeyState, NativeState, OverheatStatus, Status};
+    use eighty_core::overheat::HeatNote;
     use eighty_core::Settings;
     use eighty_hw::machine::MachineInfo;
 
@@ -233,6 +270,8 @@ mod tests {
             version: "0.1.0".into(),
             calibration: None,
             schedule: None,
+            temperature_c: None,
+            overheat: None,
         }
     }
 
@@ -483,5 +522,88 @@ mod tests {
         assert!(out.contains("  ACLC  blocked\n"));
         assert!(out.contains("Limiters  AlDente, BCLM\n"));
         assert!(out.contains("Health    this Mac has no SMC key"));
+    }
+
+    fn heat(note: Option<HeatNote>, enabled: bool) -> Option<OverheatStatus> {
+        Some(OverheatStatus { config: OverheatConfig { enabled, ..OverheatConfig::default() }, note })
+    }
+
+    fn hot(note: HeatNote) -> Status {
+        Status { temperature_c: Some(36.1), overheat: heat(Some(note), true), ..st() }
+    }
+
+    #[test]
+    fn temp_line() {
+        let s = Status { temperature_c: Some(31.44), overheat: heat(None, true), ..st() };
+        let out = render_status(&s);
+        assert!(out.contains("Temp      31.4 °C\n"), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("Battery") && lines[1].starts_with("Temp"), "{out}");
+        let s = Status { temperature_c: None, overheat: heat(None, true), ..st() };
+        assert!(render_status(&s).contains("Temp      n/a\n"));
+    }
+
+    #[test]
+    fn heat_paused_state_line() {
+        assert_eq!(state_line(&hot(HeatNote::Paused)), "State     Paused: battery hot (36.1 °C), resumes at 32 °C");
+    }
+
+    #[test]
+    fn heat_lid_closed_line() {
+        assert_eq!(
+            state_line(&hot(HeatNote::LidClosed)),
+            "State     Battery hot (36.1 °C), can't pause charging with the lid closed"
+        );
+    }
+
+    #[test]
+    fn heat_unable_line() {
+        assert_eq!(state_line(&hot(HeatNote::Unable)), "State     Battery hot (36.1 °C), can't pause charging on this Mac");
+    }
+
+    #[test]
+    fn heat_floor_line() {
+        assert_eq!(
+            state_line(&hot(HeatNote::ChargingAtFloor)),
+            format!("State     Battery hot, charging anyway: charge reached {HEAT_FLOOR}%")
+        );
+    }
+
+    #[test]
+    fn heat_during_calibration_appends() {
+        let s = Status { calibration: Some(cal(CalStep::Charge, 0, None, None)), ..hot(HeatNote::Paused) };
+        let l = state_line(&s);
+        assert!(l.starts_with("State     Calibrating: step 2/4"), "{l}");
+        assert!(l.ends_with(", paused: battery hot (36.1 °C)"), "{l}");
+    }
+
+    fn doctor_with(status: Status) -> String {
+        render_doctor(&DoctorReport {
+            machine: MachineInfo { model: "m".into(), chip: "c".into(), macos: "v".into(), build: "b".into() },
+            keys: vec![],
+            status,
+            other_limiters: vec![],
+            native: None,
+        })
+    }
+
+    #[test]
+    fn doctor_overheat_line_and_warning() {
+        let on = doctor_with(Status { overheat: heat(None, true), temperature_c: None, ..st() });
+        assert!(on.contains("Overheat  on · pause 35 °C · resume 32 °C"), "{on}");
+        assert!(on.contains("no battery temperature reported; overheat protection is inactive on this Mac"), "{on}");
+        let with_temp = doctor_with(Status { overheat: heat(None, true), temperature_c: Some(30.0), ..st() });
+        assert!(!with_temp.contains("no battery temperature"), "{with_temp}");
+        let off = doctor_with(Status { overheat: heat(None, false), temperature_c: None, ..st() });
+        assert!(off.contains("Overheat  off"), "{off}");
+        assert!(!off.contains("no battery temperature"), "{off}");
+    }
+
+    #[test]
+    fn older_helper_without_overheat_renders() {
+        let out = render_status(&st());
+        assert!(!out.contains("Temp"), "{out}");
+        let d = doctor_with(st());
+        assert!(!d.contains("Overheat"), "{d}");
     }
 }

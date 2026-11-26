@@ -2,6 +2,7 @@
 pub mod calibration;
 pub mod config;
 pub mod limiters;
+pub mod overheat;
 pub mod paths;
 pub mod policy;
 pub mod proto;

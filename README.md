@@ -49,6 +49,8 @@ Mode      hold (CHTE) · MagSafe light: yes
 | `eighty calibrate cancel` | Stop a calibration and go back to your limit |
 | `eighty calibrate schedule every <N> days [at HH:MM]` | Run a calibration every N days (7–90) at that time (default 10:00). The first run is N days after you turn it on, or after the last calibration if that is later. While `charge full` or `discharge` runs, a due run waits for it |
 | `eighty calibrate schedule off` | Turn the schedule off |
+| `eighty overheat on\|off` | Turn overheat protection on or off (on by default). When the battery reaches the pause temperature while charging on AC, eighty pauses charging, and it resumes when the battery cools. In native mode this runs the Mac from battery meanwhile, down to a 20% floor |
+| `eighty overheat <pause> [resume]` | Set the temperatures in °C. Pause 30–45 (default 35), resume 25 up to pause − 2 (default pause − 3, so 32). `eighty status` shows `Temp` and, while paused, why |
 | `eighty doctor [--retry]` | Check SMC support and helper health. `--retry` clears a recorded fault |
 | `eighty logs` | The last lines of the helper log |
 | `sudo eighty uninstall [--purge]` | Stop the helper, restore normal charging and remove it. `--purge` also deletes settings and logs |
@@ -90,6 +92,7 @@ Files:
 
 - Settings: `/Library/Application Support/eighty/config.toml`
 - Running calibration: `/Library/Application Support/eighty/calibration.toml` (only while one runs)
+- Overheat settings: `/Library/Application Support/eighty/heat.toml`
 - Log: `/Library/Logs/eighty/helper.log`
 - Socket: `/var/run/eighty.sock`
 

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use eighty_core::calibration::Calibration;
 use eighty_core::config::Config;
+use eighty_core::overheat::HeatState;
 
 pub struct Store {
     dir: PathBuf,
@@ -30,7 +31,7 @@ impl Store {
         };
         let parsed = toml::from_str::<Config>(&text)
             .map_err(|e| e.to_string())
-            .and_then(|c| c.settings.validate().and_then(|_| c.calibration.validate()).map(|_| c));
+            .and_then(|c| c.settings.validate().and_then(|_| c.calibration.validate()).and_then(|_| c.overheat.validate()).map(|_| c));
         match parsed {
             Ok(c) => (c, None),
             Err(reason) => (Config::default(), Some(Self::warn(&path, &reason))),
@@ -85,6 +86,34 @@ impl Store {
         self.write_atomic("calibration.toml", &text)
     }
 
+    fn heat_file(&self) -> PathBuf {
+        self.dir.join("heat.toml")
+    }
+
+    /// Missing: default, no warning. Unreadable: default plus a warning. Invalid: the
+    /// file is deleted, and the default plus a warning returned.
+    pub fn load_heat(&self) -> (HeatState, Option<String>) {
+        let path = self.heat_file();
+        let warn = |reason: &str| Some(format!("overheat: ignoring {}: {}; pause state reset", path.display(), reason.trim()));
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return (HeatState::default(), None),
+            Err(e) => return (HeatState::default(), warn(&e.to_string())),
+        };
+        match toml::from_str::<HeatState>(&text) {
+            Ok(h) => (h, None),
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                (HeatState::default(), warn(&e.to_string()))
+            }
+        }
+    }
+
+    pub fn save_heat(&self, h: &HeatState) -> io::Result<()> {
+        let text = toml::to_string_pretty(h).map_err(io::Error::other)?;
+        self.write_atomic("heat.toml", &text)
+    }
+
     pub fn clear_calibration(&self) {
         let _ = fs::remove_file(self.calibration_file());
     }
@@ -123,6 +152,33 @@ mod tests {
         assert_eq!(c, None);
         assert!(w.unwrap().contains("calibration.toml"));
         assert!(!d.path().join("calibration.toml").exists());
+    }
+    #[test]
+    fn heat_state_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::new(d.path().join("eighty"));
+        assert_eq!(st.load_heat(), (HeatState::default(), None));
+        let h = HeatState { paused: true, floor_hit: false };
+        st.save_heat(&h).unwrap();
+        assert_eq!(st.load_heat(), (h, None));
+    }
+    #[test]
+    fn invalid_heat_file_is_default() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::new(d.path().into());
+        std::fs::write(d.path().join("heat.toml"), "garbage = [").unwrap();
+        let (h, w) = st.load_heat();
+        assert_eq!(h, HeatState::default());
+        assert!(w.unwrap().starts_with("overheat: ignoring"));
+        assert!(!d.path().join("heat.toml").exists());
+    }
+    #[test]
+    fn invalid_overheat_config_falls_back_with_warning() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "[overheat]\npause_c = 5\n").unwrap();
+        let (c, w) = Store::new(d.path().into()).load();
+        assert_eq!(c, Config::default());
+        assert!(w.unwrap().contains("config.toml"));
     }
     #[test]
     fn missing_config_is_defaults_without_warning() {

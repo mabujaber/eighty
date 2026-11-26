@@ -56,6 +56,7 @@ pub struct Inputs {
     pub native_lowest: u8,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Decision {
     pub outputs: Outputs,
     pub activity: Activity,

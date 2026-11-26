@@ -1,6 +1,7 @@
 //! eighty: command-line client for the eighty charge-limit helper.
 use clap::{Parser, Subcommand, ValueEnum};
 use eighty_cli::install;
+use eighty_cli::overheat_args::parse_overheat;
 use eighty_cli::schedule_args::parse_schedule;
 use eighty_cli::client::{call, ClientError};
 use eighty_cli::render::{render_doctor, render_status};
@@ -59,6 +60,13 @@ enum Cmd {
     Calibrate {
         #[command(subcommand)]
         action: Option<CalAction>,
+    },
+    /// Pause charging when the battery is hot: on | off | <PAUSE °C> [RESUME °C]
+    Overheat {
+        #[arg(required = true)]
+        words: Vec<String>,
+        #[arg(long, hide = true)]
+        testing: bool,
     },
     /// Diagnose SMC support and helper health.
     Doctor {
@@ -213,6 +221,13 @@ fn main() -> ExitCode {
         Cmd::Calibrate { action: None } => expect_status(Request::Calibrate),
         Cmd::Calibrate { action: Some(CalAction::Cancel) } => expect_status(Request::CalibrateCancel),
         Cmd::Calibrate { action: Some(CalAction::Schedule { words }) } => match parse_schedule(&words) {
+            Ok(req) => expect_status(req),
+            Err(m) => {
+                eprintln!("{m}");
+                ExitCode::from(2)
+            }
+        },
+        Cmd::Overheat { words, testing } => match parse_overheat(&words, testing) {
             Ok(req) => expect_status(req),
             Err(m) => {
                 eprintln!("{m}");
