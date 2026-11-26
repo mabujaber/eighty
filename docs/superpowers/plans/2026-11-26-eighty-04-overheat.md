@@ -286,7 +286,7 @@ docs/superpowers/specs/*.md               notes
 
 - [ ] **Step 1: Write the checklist** in `plan4-acceptance.md`. Each check states the exact command and the expected `status` output. Use `./target/release/eighty` and `sudo ./target/release/eighty install`.
   1. `status` shows `Temp xx.x °C`, and `doctor` shows the overheat line.
-  2. Testing pause: on AC, charging below the limit, run `eighty overheat <current+1> <current-1> --testing`. Within about 2 min, `status` shows the `Paused` line, the battery shows `discharging` (native) or `not charging` (hold), and the log has `overheat: paused`.
+  2. Testing pause: on AC, charging below the limit, run `eighty overheat <current> <current-2> --testing` (pause at or below the reading, rounded down; a pause starts only when temp ≥ pause). Within about 2 min, `status` shows the `Paused` line, the battery shows `discharging` (native) or `not charging` (hold), and the log has `overheat: paused`.
   3. Resume: `eighty overheat 35`. Within one tick, `CHIE` is off, charging resumes and the testing warning is gone.
   4. At the limit and not charging: the testing pause causes no drain.
   5. Restart during a pause: `sudo launchctl kickstart -k system/io.github.mabujaber.eighty.helper` → the pause continues.
