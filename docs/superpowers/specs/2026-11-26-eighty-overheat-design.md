@@ -105,6 +105,7 @@ Heat wins over everything that would charge:
 
 - `status`: one new line, `Temp 31.4 °C` (one decimal), or `Temp n/a`. When paused for heat, the activity line reads `Paused: battery hot (36.1 °C), resumes at 32 °C`.
 - `status --json`: `temperature_c` (number or null), `overheat` settings, and `heat_paused`. New fields use `#[serde(default)]` so older CLIs and helpers keep working.
+  *Update (2026-11-26):* `--json` reports the pause as `overheat.note` (`paused`, `lid_closed`, `unable`, `charging_at_floor`) instead of a separate `heat_paused` field.
 - `doctor`: shows the temperature and the settings (`Overheat: on, pause 35 °C, resume 32 °C`). If no temperature is reported, it warns: `no battery temperature reported; overheat protection is inactive on this Mac`.
 
 ### 6.7 Restore and persistence
