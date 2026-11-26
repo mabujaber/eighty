@@ -373,9 +373,13 @@ mod tests {
     #[test]
     fn heat_pause_no_kick_in_charge_step() {
         let mut c = in_step(CalStep::Charge, 1000, 60);
+        c.last_tick = Some((1000, true));
+        let before = c.last_progress_at;
         let mut i = at(1600, 60, true);
         i.heat_paused = true;
-        assert_ne!(advance(&mut c, &i), CalOutcome::KickCharging);
+        assert_eq!(advance(&mut c, &i), CalOutcome::Continue);
+        assert_eq!(c.last_kick_at, None);
+        assert_eq!(c.last_progress_at, before + 600);
     }
 
     #[test]

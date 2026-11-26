@@ -6,7 +6,9 @@ use eighty_core::calibration::{
     advance, waiting, CalInputs, CalOutcome, CalStep, CalWait, Calibration, CAL_GIVE_UP_SECS, CAL_LOW,
 };
 use eighty_core::config::{Config, Settings};
-use eighty_core::overheat::{apply_heat, heat_step, HeatInputs, HeatNote, HeatState, OverheatConfig};
+use eighty_core::overheat::{
+    apply_heat, heat_step, pause_in_effect, HeatEnv, HeatInputs, HeatNote, HeatState, OverheatConfig,
+};
 use eighty_core::policy::{decide, Activity, ControlMode, Inputs, Outputs, Override};
 use eighty_core::proto::{
     CalibrationStatus, DoctorReport, Health, NativeState, OverheatStatus, Request, Response, ScheduleStatus,
@@ -453,8 +455,10 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                         && (self.detection.mode != ControlMode::Native || self.native_reading_settled(s)),
                     faulted,
                     // A fault already pauses the calibration (and nothing heat-related is
-                    // written then), so the 24 h give-up keeps counting.
-                    heat_paused: !faulted && self.heat.paused && s.external_connected,
+                    // written then), so the 24 h give-up keeps counting. A pause that can't
+                    // stop charging (lid closed, no CHIE, asleep, at the floor) doesn't
+                    // freeze the clocks either.
+                    heat_paused: !faulted && pause_in_effect(self.heat, &self.heat_env(s)),
                 };
                 let out = advance(&mut c, &i);
                 self.cal_wait = waiting(&c, &i);
@@ -970,6 +974,18 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         Ok(())
     }
 
+    /// What a heat pause can act on for this reading.
+    fn heat_env(&mut self, s: &BatterySnapshot) -> HeatEnv {
+        HeatEnv {
+            mode: self.detection.mode,
+            external: s.external_connected,
+            lid_closed: self.system.lid_closed(),
+            can_discharge: self.control.can_discharge(),
+            sleeping: self.sleeping,
+            percent: s.percent,
+        }
+    }
+
     /// Advance the overheat latch by one reading; log and save it when it changes.
     fn step_heat(&mut self, snap: Option<&BatterySnapshot>) {
         let cfg = self.config.overheat;
@@ -988,7 +1004,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
         }
         let msg = match (prev.paused, next.paused, temp) {
             (false, true, Some(t)) => Some(format!("overheat: paused at {t:.1} °C")),
-            (true, false, _) if next.floor_hit => {
+            (_, false, _) if next.floor_hit && !prev.floor_hit => {
                 Some(format!("overheat: charge reached {}%, charging while hot", i.percent))
             }
             (true, false, _) if !cfg.enabled => Some("overheat: off".to_string()),
@@ -1419,14 +1435,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             self.override_ = Override::None;
         }
         // Before the sleep rule below, so a heat pause never discharges while asleep.
-        let (mut d, heat_note) = apply_heat(
-            d,
-            self.heat,
-            self.detection.mode,
-            inputs.external,
-            inputs.lid_closed,
-            self.control.can_discharge(),
-        );
+        let (mut d, heat_note) = apply_heat(d, self.heat, &self.heat_env(&snap));
         if self.sleeping && d.outputs.discharge {
             // Nothing watches the floor while asleep: stop discharging. Hold mode keeps
             // inhibit (a true hold); Native mode's Charge Limit holds on its own.
@@ -3415,6 +3424,61 @@ mod tests {
         }
         let c = e.status().calibration.expect("calibration still running");
         assert_eq!((c.step, c.held_secs, c.waiting), (CalStep::Hold, held, Some(CalWait::Heat)));
+    }
+    /// Runs 30 one-minute ticks at 100%, charging and hot; returns (held before, held after).
+    fn hot_hold_ticks(r: &Rig, e: &mut TestEngine) -> (u64, u64) {
+        let held = e.status().calibration.unwrap().held_secs;
+        let mut t = 1_000;
+        for _ in 0..30 {
+            t += 60; r.clock.set(t); r.set(100, true, true, 300, Some(t - 10)); e.handle(Event::Tick);
+        }
+        let c = e.status().calibration.expect("calibration still running");
+        assert_eq!(c.step, CalStep::Hold);
+        assert_ne!(c.waiting, Some(CalWait::Heat));
+        (held, c.held_secs)
+    }
+    #[test] fn calibration_hold_counts_when_lid_closed_blocks_heat_pause() {
+        let r = Rig::native(); r.set(100, true, true, 300, Some(900)); set_full(&r, Some(false));
+        r.sys.0.borrow_mut().lid_closed = true;
+        save_cal_step(&r, CalStep::Hold);
+        r.set_temp(Some(36.0));
+        let mut e = r.engine();
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(heat_note(&e), Some(HeatNote::LidClosed));
+        let (before, after) = hot_hold_ticks(&r, &mut e);
+        assert!(after >= before + 29 * 60, "held_secs {before} -> {after}");
+        assert_eq!(r.smc.value("CHIE"), Some(vec![0]));
+        assert_eq!(heat_note(&e), Some(HeatNote::LidClosed));
+    }
+    #[test] fn calibration_hold_counts_when_native_lacks_chie() {
+        let s = FakeSmc::new();
+        s.insert("ACLC", "ui8 ", &[0], WriteMode::Accept);
+        let r = Rig { native: FakeNative::new(&[80, 85, 90, 95, 100], 100), ..Rig::with(s) };
+        r.set(100, true, true, 300, Some(900)); set_full(&r, Some(false));
+        save_cal_step(&r, CalStep::Hold);
+        r.set_temp(Some(36.0));
+        let mut e = r.engine();
+        assert_eq!(e.status().mode, ControlMode::Native);
+        assert_eq!(heat_note(&e), Some(HeatNote::Unable));
+        let (before, after) = hot_hold_ticks(&r, &mut e);
+        assert!(after >= before + 29 * 60, "held_secs {before} -> {after}");
+        assert!(!r.smc.writes().iter().any(|(k, _)| k == "CHIE"), "{:?}", r.smc.writes());
+        assert_eq!(heat_note(&e), Some(HeatNote::Unable));
+    }
+    #[test] fn engine_heat_never_pauses_at_floor() {
+        // Calibration step 2 starts at 15%: charging a hot battery there must not discharge.
+        let r = Rig::native(); r.set(15, true, true, 1500, Some(900));
+        save_cal_step(&r, CalStep::Charge);
+        r.set_temp(Some(36.0));
+        let e = r.engine();
+        assert!(!r.smc.writes().iter().any(|(k, v)| k == "CHIE" && v == &vec![8]), "{:?}", r.smc.writes());
+        assert_eq!(heat_note(&e), Some(HeatNote::ChargingAtFloor));
+        assert_eq!(r.store.load_heat().0, HeatState { paused: false, floor_hit: true });
+    }
+    #[test] fn engine_heat_note_cleared_while_asleep() {
+        let (_r, mut e) = heat_paused_native();
+        sleep(&mut e);
+        assert_eq!(heat_note(&e), None);
     }
     #[test] fn heat_status_without_reading_is_present() {
         let r = Rig::hold(); r.set(60, true, true, 1500, Some(900));
