@@ -437,6 +437,7 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                     settled: !self.reading_stale()
                         && (self.detection.mode != ControlMode::Native || self.native_reading_settled(s)),
                     faulted,
+                    heat_paused: false,
                 };
                 let out = advance(&mut c, &i);
                 self.cal_wait = waiting(&c, &i);

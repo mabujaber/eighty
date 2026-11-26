@@ -33,6 +33,7 @@ fn calibration_text(s: &Status, c: &CalibrationStatus) -> String {
             None => "paused: lid closed".to_string(),
         },
         Some(CalWait::Fault) => "paused: eighty isn't limiting (see above)".to_string(),
+        Some(CalWait::Heat) => "waiting for the battery to cool".to_string(),
         None => match c.step {
             CalStep::Discharge => format!("discharging to {CAL_LOW}% (now {}%)", s.percent),
             CalStep::Charge => format!("charging to 100% (now {}%)", s.percent),
