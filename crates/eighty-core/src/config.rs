@@ -101,6 +101,8 @@ pub struct Config {
     pub native_original: Option<u8>,
     #[serde(default)]
     pub calibration: CalibrationConfig,
+    #[serde(default)]
+    pub overheat: crate::overheat::OverheatConfig,
 }
 
 #[cfg(test)]
