@@ -2,7 +2,7 @@
 use crate::client::call;
 use crate::render::render_status;
 use anyhow::{anyhow, bail, Context, Result};
-use eighty_core::paths::{CALIBRATION_FILE, CONFIG_DIR, HELPER_INSTALL_PATH, LABEL, LOG_PATH, PLIST_PATH, SOCKET_PATH};
+use eighty_core::paths::{CALIBRATION_FILE, CONFIG_DIR, HEAT_FILE, HELPER_INSTALL_PATH, LABEL, LOG_PATH, PLIST_PATH, SOCKET_PATH};
 use eighty_core::proto::{Request, Response};
 use std::fs;
 use std::os::unix::fs::{chown, PermissionsExt};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
 /// Files uninstall always removes (besides the helper binary, which may be kept).
-const UNINSTALL_FILES: &[&str] = &[PLIST_PATH, SOCKET_PATH, CALIBRATION_FILE];
+const UNINSTALL_FILES: &[&str] = &[PLIST_PATH, SOCKET_PATH, CALIBRATION_FILE, HEAT_FILE];
 const HELPER_NAME: &str = "eighty-helper";
 
 /// The launchd plist for the helper daemon.
@@ -243,6 +243,11 @@ mod tests {
     #[test]
     fn uninstall_paths_include_calibration_file() {
         assert!(UNINSTALL_FILES.contains(&CALIBRATION_FILE));
+    }
+
+    #[test]
+    fn uninstall_removes_heat_file() {
+        assert!(UNINSTALL_FILES.contains(&HEAT_FILE));
     }
 
     #[test]

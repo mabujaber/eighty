@@ -716,6 +716,8 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
                 native_limit: (self.detection.mode == ControlMode::Native).then(|| self.native_wanted()),
             }),
             schedule: self.schedule_status(),
+            temperature_c: None,
+            overheat: None,
         }
     }
 
@@ -767,6 +769,9 @@ impl<S: SmcIo, B: BatterySource, Y: SystemProbe, N: NativeLimit> Engine<S, B, Y,
             self.cal_notice = None;
         }
         match req {
+            Request::SetOverheat { .. } | Request::SetOverheatThresholds { .. } => {
+                return Response::Error("not implemented yet".into())
+            }
             Request::Status => return Response::Status(self.status()),
             Request::Doctor => {
                 return Response::Doctor(Box::new(DoctorReport {

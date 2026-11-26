@@ -234,6 +234,8 @@ mod tests {
             version: "0.1.0".into(),
             calibration: None,
             schedule: None,
+            temperature_c: None,
+            overheat: None,
         }
     }
 
