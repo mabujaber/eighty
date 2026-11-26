@@ -87,7 +87,7 @@ Today eighty never forces `CHIE` with the lid closed, because cutting the adapte
 - **Mac stays awake:** the overheat pause also applies with the lid closed. Only the heat pause gets this exception. `discharge <n>`, auto-discharge and calibration step 1 keep today's lid-closed rule.
 - **Mac sleeps:** no heat pause with the lid closed in native mode. `status` shows `battery hot (36.1 °C), can't pause charging with the lid closed`. Hold mode isn't affected either way, because `CHTE` doesn't cut the adapter.
 - The result goes in the acceptance doc and in this spec as a dated note. The code keeps the choice in one place (a constant or a mode-specific rule), not spread across the policy.
-- *Update (2026-11-26):* the check passed on the M5 Pro / macOS 27.2.1 with 2 LG displays. macOS kept "Using AC" with `CHIE=08` and the lid closed; the only sleep was normal idle sleep, the same as without `CHIE`. So `HEAT_PAUSE_LID_CLOSED = true`: the heat pause also applies with the lid closed. Details in `docs/testing/plan4-acceptance.md`.
+- *Update (2026-11-26):* **Mac sleeps → `HEAT_PAUSE_LID_CLOSED = false`.** The soak alone looked fine, because macOS was already running from the battery then. But real heat pauses during the acceptance run (battery charging, lid closed, 2 LG displays, M5 Pro / macOS 27.2.1) made macOS report `ExternalConnected = No` and enter `Clamshell Sleep` within about 20 s, on every wake. Lid-closed heat protection waits for clamshell levels (keeping the Mac awake), the next plan. Details in `docs/testing/plan4-acceptance.md`.
 
 ### 6.5 Overrides and calibration
 
